@@ -14,9 +14,10 @@ from datetime import datetime, timezone
 import redis.asyncio as aioredis
 from fastapi import APIRouter, HTTPException
 
-from ..anomaly_detector import get_anomalies, get_findings
+from ..anomaly_detector import get_anomalies, get_findings, score
 from ..client_cache import get_client_cache, refresh_client_cache
-from ..event_collector import EVENT_CATEGORIES
+from ..event_collector import EVENT_CATEGORIES, collect
+from ..feature_engineer import build_features
 
 log = logging.getLogger(__name__)
 
@@ -172,6 +173,67 @@ async def trigger_client_refresh(site_id: str):
     except Exception as exc:
         log.exception(f"Manual client refresh failed for site {site_id}")
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.post("/sites/{site_id}/flush")
+async def flush_site_redis(site_id: str):
+    """Delete all sasquatch Redis keys for a site (events, features, anomalies, findings)."""
+    keys = [
+        f"sasquatch:events:{site_id}",
+        f"sasquatch:features:{site_id}",
+        f"sasquatch:anomalies:{site_id}",
+        f"sasquatch:findings:{site_id}",
+        f"sasquatch:unknown_event_types:{site_id}",
+    ]
+    client = aioredis.from_url(REDIS_URL, decode_responses=True)
+    try:
+        deleted = await client.delete(*keys)
+    finally:
+        await client.aclose()
+    log.info(f"Flushed {deleted} Redis keys for site {site_id}")
+    return {
+        "site_id": site_id,
+        "status": "ok",
+        "keys_deleted": deleted,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+@router.post("/sites/{site_id}/run")
+async def trigger_full_detection_run(site_id: str):
+    """
+    Pull 24hr events, build features, score anomalies, and populate findings.
+    Runs the full detection pipeline synchronously — same steps as the scheduler job.
+    Returns a summary of what was produced.
+    """
+    try:
+        event_count = await collect(site_id)
+    except Exception as exc:
+        log.exception(f"Event collection failed for site {site_id}")
+        raise HTTPException(status_code=500, detail=f"Event collection failed: {exc}")
+
+    try:
+        mac_count = await build_features(site_id)
+    except Exception as exc:
+        log.exception(f"Feature engineering failed for site {site_id}")
+        raise HTTPException(status_code=500, detail=f"Feature engineering failed: {exc}")
+
+    try:
+        scored = await score(site_id)
+    except Exception as exc:
+        log.exception(f"Anomaly scoring failed for site {site_id}")
+        raise HTTPException(status_code=500, detail=f"Anomaly scoring failed: {exc}")
+
+    findings = await get_findings(site_id)
+    return {
+        "site_id": site_id,
+        "status": "ok",
+        "events_collected": event_count,
+        "macs_with_features": mac_count,
+        "macs_scored": scored,
+        "findings_generated": len(findings),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 @router.get("/sites/{site_id}/status")
