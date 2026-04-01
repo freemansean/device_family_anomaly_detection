@@ -153,16 +153,20 @@ def _classify_probable_pattern(posthoc: dict) -> str:
     )
     top_frac = posthoc.get("top_event_fraction", 0.0)
     dns_dhcp_ratio = posthoc.get("dns_to_dhcp_xid_ratio", 1.0)
-    cat_dhcp = posthoc.get("cat_ratio_dhcp_success", 0.0) + posthoc.get(
-        "cat_ratio_dhcp_failure", 0.0
-    )
     cat_roam_fail = posthoc.get("cat_ratio_roam_failure", 0.0)
     cat_auth_fail = posthoc.get("cat_ratio_auth_failure", 0.0)
     cat_dns_fail = posthoc.get("cat_ratio_dns_failure", 0.0)
     cat_dhcp_fail = posthoc.get("cat_ratio_dhcp_failure", 0.0)
     auth_recovery = posthoc.get("auth_fail_recovery_ratio", 1.0)
 
-    if top_frac > 0.5 and cat_dhcp > 0.4 and dns_dhcp_ratio < 0.2:
+    # DHCP discard loop requires a temporal burst, not just a high ratio.
+    # A client renewing every 8 hours passes the ratio test but has burst=1 and a
+    # large median gap — that is normal lease behaviour, not a storm.
+    # Require: 3+ CLIENT_IP_ASSIGNED in any 5-minute window AND median gap < 10 minutes.
+    dhcp_burst = posthoc.get("dhcp_max_burst_5min", 0)
+    dhcp_gap = posthoc.get("dhcp_median_gap_seconds", -1)
+    is_dhcp_storm = dhcp_burst >= 3 and 0 <= dhcp_gap < 600
+    if is_dhcp_storm and top_frac > 0.3 and dns_dhcp_ratio < 0.2:
         return "dhcp_discard_loop"
     if pmkid_ratio > 0.1:
         return "pmkid_stale"

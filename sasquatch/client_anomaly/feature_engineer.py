@@ -253,6 +253,36 @@ def build_posthoc_features(mac_events: list[dict]) -> dict:
     }
     dhcp_unique_xid_count = len(dhcp_xids)
 
+    # DHCP burst detection — distinguishes a storm from routine IP renewal.
+    # A client getting an IP every 8 hours is normal lease renewal behaviour.
+    # A client getting 10 IPs in 3 minutes is a discard loop.
+    #
+    # dhcp_max_burst_5min: max CLIENT_IP_ASSIGNED events in any 5-minute sliding window.
+    # dhcp_median_gap_seconds: median time between consecutive CLIENT_IP_ASSIGNED events.
+    #   -1 sentinel means fewer than 2 events (can't compute gap — not a storm by definition).
+    dhcp_success_timestamps = sorted(
+        e.get("timestamp", 0)
+        for e in mac_events
+        if e.get("type") in DHCP_SUCCESS_TYPES
+    )
+    dhcp_success_count = len(dhcp_success_timestamps)
+
+    BURST_WINDOW = 300  # 5 minutes in seconds
+    dhcp_max_burst_5min = 0
+    for i, t_start in enumerate(dhcp_success_timestamps):
+        burst = sum(1 for t in dhcp_success_timestamps[i:] if t - t_start <= BURST_WINDOW)
+        if burst > dhcp_max_burst_5min:
+            dhcp_max_burst_5min = burst
+
+    if dhcp_success_count >= 2:
+        gaps = [
+            dhcp_success_timestamps[i + 1] - dhcp_success_timestamps[i]
+            for i in range(dhcp_success_count - 1)
+        ]
+        dhcp_median_gap_seconds = statistics.median(gaps)
+    else:
+        dhcp_median_gap_seconds = -1  # sentinel: not enough events to measure cadence
+
     # DNS to unique DHCP XID ratio — collapses toward 0 in DHCP discard pattern
     dns_ok_count = type_counts.get("CLIENT_DNS_OK", 0)
     dns_to_dhcp_xid_ratio = (
@@ -304,6 +334,8 @@ def build_posthoc_features(mac_events: list[dict]) -> dict:
         "pmkid_failure_count": pmkid_failure_count,
         "gas_timeout_count": gas_timeout_count,
         "dhcp_unique_xid_count": dhcp_unique_xid_count,
+        "dhcp_max_burst_5min": dhcp_max_burst_5min,
+        "dhcp_median_gap_seconds": dhcp_median_gap_seconds,
         "dns_to_dhcp_xid_ratio": dns_to_dhcp_xid_ratio,
         "roam_failure_types": list(roam_failure_types_seen),
         "top_event_type": top_event_type,
