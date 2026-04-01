@@ -244,7 +244,7 @@ async def score(site_id: str) -> int:
                 "is_if_outlier": is_if,
                 "dbscan_label": dbscan_results[mac]["dbscan_label"],
                 "is_dbscan_outlier": is_db,
-                "is_outlier": is_if or is_db,
+                "is_outlier": is_if and is_db,
                 "device_family": features[mac].get("device_family", "Unknown"),
                 "event_count": features[mac].get("event_count", 0),
                 "random_mac": features[mac].get("random_mac", False),
