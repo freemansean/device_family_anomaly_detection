@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# Environment — never commit secrets
+.env
+
+# Node
+node_modules/
+sasquatch/frontend/dist/
+
+# OS
+.DS_Store
