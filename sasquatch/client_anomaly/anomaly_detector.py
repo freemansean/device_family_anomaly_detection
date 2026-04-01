@@ -244,7 +244,7 @@ async def score(site_id: str) -> int:
                 "is_if_outlier": is_if,
                 "dbscan_label": dbscan_results[mac]["dbscan_label"],
                 "is_dbscan_outlier": is_db,
-                "is_outlier": is_if and is_db,
+                "is_outlier": is_if or is_db,
                 "device_family": features[mac].get("device_family", "Unknown"),
                 "event_count": features[mac].get("event_count", 0),
                 "random_mac": features[mac].get("random_mac", False),
@@ -264,6 +264,14 @@ async def score(site_id: str) -> int:
 
             if outlier_ratio < 0.1:
                 continue  # Below INFO threshold
+
+            # DBSCAN-specific rollup (used by Site Overview severity badge)
+            dbscan_outlier_macs = [m for m in family_macs if anomalies[m]["is_dbscan_outlier"]]
+            dbscan_outlier_count = len(dbscan_outlier_macs)
+            dbscan_outlier_ratio = dbscan_outlier_count / total if total > 0 else 0.0
+
+            # IF-specific outlier MACs (used by family drilldown view)
+            if_outlier_macs = [m for m in family_macs if anomalies[m]["is_if_outlier"]]
 
             # Identify top contributing features vs baseline
             outlier_vecs = [features[m]["vector"] for m in outlier_macs]
@@ -287,6 +295,13 @@ async def score(site_id: str) -> int:
                 "outlier_ratio": round(outlier_ratio, 4),
                 "affected_mac_count": outlier_count,
                 "total_mac_count": total,
+                # DBSCAN-only severity — used by Site Overview heatmap badge
+                "dbscan_severity": _severity(dbscan_outlier_ratio) if dbscan_outlier_count > 0 else None,
+                "dbscan_outlier_ratio": round(dbscan_outlier_ratio, 4),
+                "dbscan_outlier_count": dbscan_outlier_count,
+                # IF outlier MACs — used by family drilldown view
+                "if_outlier_macs": if_outlier_macs,
+                "if_outlier_count": len(if_outlier_macs),
                 "example_macs": outlier_macs[:5],
                 "top_features": top_features,
                 "probable_pattern": probable_pattern,

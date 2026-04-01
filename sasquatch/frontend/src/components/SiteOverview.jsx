@@ -19,7 +19,7 @@ function ratioColor(ratio) {
   return `rgb(${Math.round(200)}, ${Math.round(168 - t * 118)}, ${Math.round(32 - t * 32)})`;
 }
 
-export default function SiteOverview({ siteId, apiBase, onMacSelect }) {
+export default function SiteOverview({ siteId, apiBase, onMacSelect, onFamilySelect }) {
   const [summary, setSummary] = useState(null);
   const [findings, setFindings] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -88,10 +88,25 @@ export default function SiteOverview({ siteId, apiBase, onMacSelect }) {
             {families.map((family) => {
               const familyData = summary.families[family] || {};
               const finding = findingsByFamily[family];
-              const severity = finding?.severity;
+              // Site Overview shows DBSCAN-only severity — IF deviations are in the family drilldown
+              const severity = finding?.dbscan_severity ?? null;
+              const hasIfOutliers = (finding?.if_outlier_count ?? 0) > 0;
               return (
                 <tr key={family}>
-                  <td style={{ ...tdStyle, whiteSpace: "nowrap", color: "#ccc" }}>{family}</td>
+                  <td style={{ ...tdStyle, whiteSpace: "nowrap" }}>
+                    <span
+                      onClick={() => onFamilySelect(family)}
+                      style={{
+                        color: hasIfOutliers ? "#7ec8e3" : "#ccc",
+                        cursor: "pointer",
+                        textDecoration: hasIfOutliers ? "underline" : "none",
+                        textUnderlineOffset: "2px",
+                      }}
+                      title={hasIfOutliers ? `View ${finding.if_outlier_count} Isolation Forest deviation(s) in ${family}` : family}
+                    >
+                      {family}
+                    </span>
+                  </td>
                   <td style={{ ...tdStyle, textAlign: "center" }}>
                     {severity ? (
                       <span style={{
@@ -144,7 +159,7 @@ export default function SiteOverview({ siteId, apiBase, onMacSelect }) {
       </div>
 
       <div style={{ marginTop: "8px", fontSize: "11px", color: "#444" }}>
-        Failure columns highlighted red/yellow. Green cells = success events. Click a failure cell to drill into an affected MAC.
+        Severity badge reflects DBSCAN site-wide anomalies only. Click a device family name to see Isolation Forest deviations within that family.
       </div>
     </div>
   );

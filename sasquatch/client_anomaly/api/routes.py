@@ -116,6 +116,50 @@ async def get_events_summary(site_id: str):
     }
 
 
+@router.get("/sites/{site_id}/families/{family}/if-outliers")
+async def get_family_if_outliers(site_id: str, family: str):
+    """
+    MACs within a device family that triggered an Isolation Forest deviation.
+    Used by the Family Drilldown view. Sorted by IF score ascending (most anomalous first).
+    """
+    anomalies = await get_anomalies(site_id)
+    if not anomalies:
+        raise HTTPException(status_code=404, detail="No anomaly data found. Run detection first.")
+
+    client_cache = await get_client_cache(site_id)
+
+    family_macs = [
+        mac for mac, data in anomalies.items()
+        if data.get("device_family") == family
+    ]
+    if not family_macs:
+        raise HTTPException(status_code=404, detail=f"No clients found for family '{family}'.")
+
+    if_outliers = [
+        {
+            "mac": mac,
+            "if_score": anomalies[mac].get("if_score"),
+            "is_dbscan_outlier": anomalies[mac].get("is_dbscan_outlier", False),
+            "event_count": anomalies[mac].get("event_count", 0),
+            "random_mac": anomalies[mac].get("random_mac", False),
+            "client_metadata": client_cache.get(mac, {}),
+        }
+        for mac in family_macs
+        if anomalies[mac].get("is_if_outlier")
+    ]
+
+    # Sort by IF score ascending — most anomalous (most negative) first
+    if_outliers.sort(key=lambda x: (x["if_score"] is None, x["if_score"] or 0))
+
+    return {
+        "site_id": site_id,
+        "family": family,
+        "total_family_count": len(family_macs),
+        "if_outlier_count": len(if_outliers),
+        "outliers": if_outliers,
+    }
+
+
 @router.get("/sites/{site_id}/anomalies/{mac}")
 async def get_mac_anomaly(site_id: str, mac: str):
     """
