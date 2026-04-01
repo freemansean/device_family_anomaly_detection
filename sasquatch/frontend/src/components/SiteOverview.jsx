@@ -34,7 +34,7 @@ export default function SiteOverview({ siteId, apiBase, onMacSelect, onFamilySel
       apiFetch(`${apiBase}/api/v1/sites/${siteId}/findings`).then((r) => r.json()),
     ])
       .then(([s, f]) => {
-        setSummary(s);
+        setSummary({ ...s, family_client_counts: s.family_client_counts || {} });
         setFindings(f.findings || []);
         setLastRefresh(new Date().toLocaleTimeString());
         setError(null);
@@ -88,6 +88,7 @@ export default function SiteOverview({ siteId, apiBase, onMacSelect, onFamilySel
           <tbody>
             {families.map((family) => {
               const familyData = summary.families[family] || {};
+              const clientCount = summary.family_client_counts?.[family] ?? 0;
               const finding = findingsByFamily[family];
               // Site Overview shows DBSCAN-only severity — IF deviations are in the family drilldown
               const severity = finding?.dbscan_severity ?? null;
@@ -107,6 +108,11 @@ export default function SiteOverview({ siteId, apiBase, onMacSelect, onFamilySel
                     >
                       {family}
                     </span>
+                    {clientCount > 0 && (
+                      <span style={{ color: "#444", fontSize: "11px", marginLeft: "6px" }}>
+                        ({clientCount})
+                      </span>
+                    )}
                   </td>
                   <td style={{ ...tdStyle, textAlign: "center" }}>
                     {severity ? (

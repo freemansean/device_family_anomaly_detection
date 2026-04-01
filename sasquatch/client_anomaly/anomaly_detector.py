@@ -29,6 +29,7 @@ MIN_PEERS = int(os.getenv("ANOMALY_MIN_PEERS", "5"))
 IF_CONTAMINATION = float(os.getenv("ANOMALY_IF_CONTAMINATION", "0.1"))
 DBSCAN_EPS = float(os.getenv("ANOMALY_DBSCAN_EPS", "0.5"))
 DBSCAN_MIN_SAMPLES = int(os.getenv("ANOMALY_DBSCAN_MIN_SAMPLES", "5"))
+DBSCAN_MIN_FAMILY_SIZE = int(os.getenv("ANOMALY_DBSCAN_MIN_FAMILY_SIZE", "5"))
 FINDING_THRESHOLD = float(os.getenv("ANOMALY_FINDING_THRESHOLD", "0.3"))
 
 
@@ -230,13 +231,33 @@ async def score(site_id: str) -> int:
                 log.info(f"IF [{family}]: skipped (only {n} MACs, need {MIN_PEERS})")
 
         # --- Stage 2: DBSCAN site-wide ---
-        all_macs = list(features.keys())
-        all_records = [features[m] for m in all_macs]
-        dbscan_results = _run_dbscan(all_macs, all_records)
+        # Only include MACs from families large enough to contribute meaningful signal.
+        # Small families (IoT singletons, etc.) are excluded so they don't pollute
+        # the site-wide clustering and don't receive spurious DBSCAN outlier labels.
+        dbscan_eligible_macs = [
+            mac for mac in features
+            if len(family_groups.get(features[mac].get("device_family", "Unknown"), [])) >= DBSCAN_MIN_FAMILY_SIZE
+        ]
+        excluded_from_dbscan = set(features.keys()) - set(dbscan_eligible_macs)
+
+        dbscan_eligible_records = [features[m] for m in dbscan_eligible_macs]
+        dbscan_results_eligible = _run_dbscan(dbscan_eligible_macs, dbscan_eligible_records)
+
+        # Merge: excluded families get is_dbscan_outlier=False (not scored, not flagged)
+        dbscan_results = {**dbscan_results_eligible}
+        for mac in excluded_from_dbscan:
+            dbscan_results[mac] = {"dbscan_label": None, "is_dbscan_outlier": False}
+
+        if excluded_from_dbscan:
+            excluded_families = {features[m].get("device_family", "Unknown") for m in excluded_from_dbscan}
+            log.info(
+                f"DBSCAN: excluded {len(excluded_from_dbscan)} MACs from {len(excluded_families)} "
+                f"small families (< {DBSCAN_MIN_FAMILY_SIZE} clients): {excluded_families}"
+            )
 
         # --- Merge per-MAC results ---
         anomalies: dict[str, dict] = {}
-        for mac in all_macs:
+        for mac in features:
             is_if = if_results[mac]["is_if_outlier"]
             is_db = dbscan_results[mac]["is_dbscan_outlier"]
             anomalies[mac] = {

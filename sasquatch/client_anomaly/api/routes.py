@@ -87,15 +87,19 @@ async def get_events_summary(site_id: str):
 
     events: list[dict] = json.loads(raw)
 
-    # Build nested counts: family → category → count
+    # Build nested counts: family → category → count; track unique MACs per family
     summary: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
     family_totals: Counter = Counter()
+    family_macs: dict[str, set] = defaultdict(set)
 
     for event in events:
         family = event.get("device_family", "Unknown")
         category = event.get("event_category", "OTHER")
         summary[family][category] += 1
         family_totals[family] += 1
+        mac = (event.get("mac") or "").replace(":", "").lower()
+        if mac:
+            family_macs[family].add(mac)
 
     # Compute failure ratios per family × category
     result = {}
@@ -113,6 +117,7 @@ async def get_events_summary(site_id: str):
         "site_id": site_id,
         "total_events": len(events),
         "families": result,
+        "family_client_counts": {fam: len(macs) for fam, macs in family_macs.items()},
         "categories": list(EVENT_CATEGORIES.keys()),
     }
 
