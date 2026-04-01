@@ -1,4 +1,5 @@
 import { useState, useEffect } from "react";
+import { apiFetch } from "../api";
 
 const SEVERITY_COLOR = { CRITICAL: "#e05555", WARNING: "#e0a835", INFO: "#4ea8c4" };
 
@@ -21,7 +22,7 @@ export default function FamilyDrilldown({ siteId, family, apiBase, onMacSelect, 
   useEffect(() => {
     setLoading(true);
     setError(null);
-    fetch(`${apiBase}/api/v1/sites/${siteId}/families/${encodeURIComponent(family)}/if-outliers`)
+    apiFetch(`${apiBase}/api/v1/sites/${siteId}/families/${encodeURIComponent(family)}/if-outliers`)
       .then((r) => {
         if (!r.ok) return r.json().then((e) => Promise.reject(e.detail || r.statusText));
         return r.json();

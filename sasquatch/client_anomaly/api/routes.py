@@ -12,16 +12,17 @@ from collections import Counter, defaultdict
 from datetime import datetime, timezone
 
 import redis.asyncio as aioredis
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 
 from ..anomaly_detector import get_anomalies, get_findings, score
 from ..client_cache import get_client_cache, refresh_client_cache
 from ..event_collector import EVENT_CATEGORIES, collect
 from ..feature_engineer import build_features
+from .auth import require_auth
 
 log = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/api/v1")
+router = APIRouter(prefix="/api/v1", dependencies=[Depends(require_auth)])
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 SITE_ID = os.getenv("MIST_SITE_ID", "")

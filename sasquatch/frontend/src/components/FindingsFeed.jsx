@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback } from "react";
+import { apiFetch } from "../api";
 
 const SEVERITY_COLOR = { CRITICAL: "#e05555", WARNING: "#e0a835", INFO: "#4ea8c4" };
 const SEVERITY_BG = { CRITICAL: "#2a1515", WARNING: "#2a2015", INFO: "#152030" };
@@ -22,7 +23,7 @@ export default function FindingsFeed({ siteId, apiBase, onMacSelect }) {
   const [expanded, setExpanded] = useState({});
 
   const load = useCallback(() => {
-    fetch(`${apiBase}/api/v1/sites/${siteId}/findings`)
+    apiFetch(`${apiBase}/api/v1/sites/${siteId}/findings`)
       .then((r) => r.json())
       .then((data) => {
         setFindings(data.findings || []);

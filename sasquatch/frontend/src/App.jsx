@@ -3,25 +3,47 @@ import SiteOverview from "./components/SiteOverview";
 import FindingsFeed from "./components/FindingsFeed";
 import MacDrilldown from "./components/MacDrilldown";
 import FamilyDrilldown from "./components/FamilyDrilldown";
+import Login from "./components/Login";
+import { apiFetch, getToken, setToken, clearToken } from "./api";
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL || "http://localhost:8000";
 
 export default function App() {
+  const [token, setTokenState] = useState(() => getToken());
   const [sites, setSites] = useState([]);
   const [selectedSite, setSelectedSite] = useState(null);
   const [selectedMac, setSelectedMac] = useState(null);
   const [selectedFamily, setSelectedFamily] = useState(null);
   const [view, setView] = useState("overview"); // "overview" | "findings" | "family" | "mac"
 
+  // Handle token expiry from any component via custom event
   useEffect(() => {
-    fetch(`${API_BASE}/api/v1/sites`)
+    function handleUnauthorized() {
+      setTokenState(null);
+    }
+    window.addEventListener("sasquatch:unauthorized", handleUnauthorized);
+    return () => window.removeEventListener("sasquatch:unauthorized", handleUnauthorized);
+  }, []);
+
+  useEffect(() => {
+    if (!token) return;
+    apiFetch(`${API_BASE}/api/v1/sites`)
       .then((r) => r.json())
       .then((data) => {
         setSites(data.sites || []);
         if (data.sites?.length > 0) setSelectedSite(data.sites[0]);
       })
       .catch(console.error);
-  }, []);
+  }, [token]);
+
+  function handleLogin(newToken) {
+    setToken(newToken);
+    setTokenState(newToken);
+  }
+
+  if (!token) {
+    return <Login apiBase={API_BASE} onLogin={handleLogin} />;
+  }
 
   function handleMacSelect(mac) {
     setSelectedMac(mac);
@@ -67,6 +89,21 @@ export default function App() {
               </button>
             ))}
           </nav>
+          <button
+            onClick={() => { clearToken(); setTokenState(null); }}
+            style={{
+              marginLeft: "auto",
+              background: "transparent",
+              color: "#555",
+              border: "1px solid #2a2a2a",
+              padding: "4px 10px",
+              borderRadius: "4px",
+              cursor: "pointer",
+              fontSize: "12px",
+            }}
+          >
+            Sign out
+          </button>
         </div>
       </header>
 

@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback } from "react";
+import { apiFetch } from "../api";
 
 const CATEGORIES = [
   "DHCP_SUCCESS", "DHCP_FAILURE", "DNS_SUCCESS", "DNS_FAILURE",
@@ -29,8 +30,8 @@ export default function SiteOverview({ siteId, apiBase, onMacSelect, onFamilySel
   const load = useCallback(() => {
     setLoading(true);
     Promise.all([
-      fetch(`${apiBase}/api/v1/sites/${siteId}/events/summary`).then((r) => r.json()),
-      fetch(`${apiBase}/api/v1/sites/${siteId}/findings`).then((r) => r.json()),
+      apiFetch(`${apiBase}/api/v1/sites/${siteId}/events/summary`).then((r) => r.json()),
+      apiFetch(`${apiBase}/api/v1/sites/${siteId}/findings`).then((r) => r.json()),
     ])
       .then(([s, f]) => {
         setSummary(s);

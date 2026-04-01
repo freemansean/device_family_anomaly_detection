@@ -1,4 +1,5 @@
 import { useState, useEffect } from "react";
+import { apiFetch } from "../api";
 
 const EVENT_COLOR = {
   DHCP_SUCCESS: "#2d7a4f",
@@ -98,7 +99,7 @@ export default function MacDrilldown({ siteId, mac, apiBase, onBack }) {
 
   useEffect(() => {
     setLoading(true);
-    fetch(`${apiBase}/api/v1/sites/${siteId}/anomalies/${mac}`)
+    apiFetch(`${apiBase}/api/v1/sites/${siteId}/anomalies/${mac}`)
       .then((r) => {
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
         return r.json();
