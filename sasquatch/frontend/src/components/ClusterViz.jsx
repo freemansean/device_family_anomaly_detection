@@ -57,7 +57,8 @@ export default function ClusterViz({ siteId, apiBase, onMacSelect }) {
     <div style={{ color: "#444", fontSize: "12px", padding: "12px 0" }}>No cluster data yet</div>
   );
 
-  const scaled = scaleCoords(data.points);
+  const HIDDEN_FAMILIES = new Set(["Unknown", "IoT (Unknown)"]);
+  const scaled = scaleCoords(data.points.filter((p) => !HIDDEN_FAMILIES.has(p.device_family)));
 
   // Unique families sorted for legend
   const families = [...new Set(scaled.map((p) => p.device_family))].sort();
@@ -161,6 +162,20 @@ export default function ClusterViz({ siteId, apiBase, onMacSelect }) {
 
       {/* Legend — click to toggle family visibility */}
       <div style={{ marginTop: "8px", display: "flex", flexWrap: "wrap", gap: "6px 12px" }}>
+        <div
+          onClick={() => setHiddenFamilies(new Set(families))}
+          style={{
+            fontSize: "10px",
+            color: "#555",
+            cursor: "pointer",
+            padding: "0 4px",
+            borderRight: "1px solid #333",
+            marginRight: "4px",
+            lineHeight: "16px",
+          }}
+        >
+          deselect all
+        </div>
         {families.map((family) => {
           const hidden = hiddenFamilies.has(family);
           const color = familyColor(family);

@@ -55,7 +55,8 @@ export default function SiteOverview({ siteId, apiBase, onMacSelect, onFamilySel
   if (error) return <div style={{ color: "#e05555" }}>Error: {error}</div>;
   if (!summary) return null;
 
-  const families = Object.keys(summary.families || {}).sort();
+  const HIDDEN_FAMILIES = new Set(["Unknown", "IoT (Unknown)"]);
+  const families = Object.keys(summary.families || {}).filter((f) => !HIDDEN_FAMILIES.has(f)).sort();
 
   // Build findings map: family → finding
   const findingsByFamily = {};

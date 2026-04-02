@@ -65,9 +65,12 @@ def classify_family(client: dict) -> str:
     if "printer" in combined or "print" in combined:
         return "Printer"
     # Use OS type if available; fall back to manufacturer name.
+    # Skip generic IoT/embedded markers that Mist uses as placeholder OS labels —
+    # they add no information over the manufacturer name.
     # Normalize to first 12 chars so minor variants (punctuation, trailing text)
     # collapse into the same family group.
-    if os_str:
+    _GENERIC_OS = {"iot", "iot device", "embedded", "other"}
+    if os_str and os_str.lower() not in _GENERIC_OS:
         return _normalize_family(os_str)
     if mfg:
         return _normalize_family(mfg)
