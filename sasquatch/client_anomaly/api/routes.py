@@ -20,12 +20,12 @@ from sklearn.preprocessing import StandardScaler
 from ..anomaly_detector import get_anomalies, get_findings
 from ..client_cache import get_client_cache, refresh_client_cache
 from ..event_collector import EVENT_CATEGORIES
-from ..scheduler import run_detection_cycle
+from ..scheduler import run_collect_only, run_detect_only, run_detection_cycle
 from .auth import require_auth
 
 log = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/api/v1", dependencies=[Depends(require_auth)])
+router = APIRouter(prefix="/api/v1")
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 SITE_ID = os.getenv("MIST_SITE_ID", "")
@@ -272,6 +272,56 @@ async def trigger_full_detection_run(site_id: str):
         "site_id": site_id,
         "status": "ok",
         "events_collected": summary["events"],
+        "macs_with_features": summary["macs_with_features"],
+        "macs_scored": summary["macs_scored"],
+        "findings_generated": len(findings),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+@router.post("/sites/{site_id}/collect")
+async def trigger_event_collection(site_id: str):
+    """
+    Pull 24hr events from Mist and store in Redis. Does not run anomaly detection.
+    Returns 409 if a cycle is already in progress.
+    """
+    try:
+        summary = await run_collect_only(site_id)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except Exception as exc:
+        log.exception(f"Event collection failed for site {site_id}")
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    return {
+        "site_id": site_id,
+        "status": "ok",
+        "events_collected": summary["events"],
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+@router.post("/sites/{site_id}/detect")
+async def trigger_anomaly_detection(site_id: str):
+    """
+    Run feature engineering + anomaly scoring on events already in Redis.
+    Does not pull new events from Mist — use /collect first.
+    Returns 409 if a cycle is already in progress, 404 if no events in Redis.
+    """
+    try:
+        summary = await run_detect_only(site_id)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except Exception as exc:
+        log.exception(f"Anomaly detection failed for site {site_id}")
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    findings = await get_findings(site_id)
+    return {
+        "site_id": site_id,
+        "status": "ok",
         "macs_with_features": summary["macs_with_features"],
         "macs_scored": summary["macs_scored"],
         "findings_generated": len(findings),

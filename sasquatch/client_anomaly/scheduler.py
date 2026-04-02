@@ -99,6 +99,59 @@ async def run_detection_cycle(site_id: str, full_refresh: bool = False) -> dict:
         await _release_lock(redis_client, site_id)
 
 
+async def run_collect_only(site_id: str) -> dict:
+    """
+    Collect events from Mist and store in Redis — no scoring.
+    Acquires the same per-site lock as run_detection_cycle to prevent overlap.
+    Raises RuntimeError if a cycle is already in progress.
+    """
+    redis_client, acquired = await _acquire_lock(site_id)
+    if not acquired:
+        await redis_client.aclose()
+        raise RuntimeError(f"Detection cycle already running for site {site_id} — skipping")
+
+    try:
+        event_count = await collect_full(site_id)
+        log.info(f"[collect] Events collected: {event_count}")
+        return {"events": event_count}
+    finally:
+        await _release_lock(redis_client, site_id)
+
+
+async def run_detect_only(site_id: str) -> dict:
+    """
+    Run feature engineering + anomaly scoring on events already in Redis.
+    Does NOT pull new events from Mist.
+    Acquires the same per-site lock as run_detection_cycle to prevent overlap.
+    Raises RuntimeError if a cycle is already in progress.
+    Raises ValueError if no events are found in Redis.
+    """
+    redis_client, acquired = await _acquire_lock(site_id)
+    if not acquired:
+        await redis_client.aclose()
+        raise RuntimeError(f"Detection cycle already running for site {site_id} — skipping")
+
+    try:
+        exists = await redis_client.exists(f"sasquatch:events:{site_id}")
+        if not exists:
+            raise ValueError(f"No events in Redis for site {site_id} — run /collect first")
+
+        mac_count = await build_features(site_id)
+        log.info(f"[detect] Features built for {mac_count} MACs")
+
+        scored = await score(site_id)
+        log.info(f"[detect] Anomaly scoring complete: {scored} MACs")
+
+        try:
+            await evaluate_and_dispatch(site_id)
+        except Exception:
+            log.exception("[detect] webhook_dispatcher failed (non-fatal)")
+
+        return {"macs_with_features": mac_count, "macs_scored": scored}
+    finally:
+        await _release_lock(redis_client, site_id)
+
+
 async def event_and_detect_job():
     """Scheduled wrapper — delegates to run_detection_cycle with lock protection."""
     if not SITE_ID:
