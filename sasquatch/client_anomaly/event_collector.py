@@ -1,10 +1,14 @@
 """
-event_collector.py — Pull 24hr client events, enrich with device metadata, store in Redis.
+event_collector.py — Pull client events, enrich with device metadata, store in Redis.
+
+Scheduled runs fetch only the last hour and append to the rolling 24hr dataset.
+A full 24hr backfill is only performed when explicitly requested via the API.
 """
 
 import json
 import logging
 import os
+import time
 from typing import Optional
 
 import httpx
@@ -220,10 +224,10 @@ async def ensure_event_type_index(redis_client) -> list[str]:
     return types
 
 
-async def fetch_all_events(site_id: str) -> list[dict]:
+async def fetch_all_events(site_id: str, duration: str = "1h") -> list[dict]:
     url = (
         f"https://{MIST_CLOUD_HOST}/api/v1/sites/{site_id}/clients/events"
-        f"?limit=1000&duration=1d"
+        f"?limit=1000&duration={duration}"
     )
     all_events = []
     page = 0
@@ -266,15 +270,28 @@ def _enrich_event(event: dict, client_cache: dict[str, dict]) -> dict:
     return enriched
 
 
+def _enrich_batch(events: list[dict], client_cache: dict) -> tuple[list[dict], set[str]]:
+    """Enrich a batch of raw events. Returns (enriched_events, unknown_types)."""
+    known_types = set(MIST_CLIENT_EVENT_TYPES)
+    unknown_types: set[str] = set()
+    enriched = []
+    for event in events:
+        event_type = event.get("type", "")
+        if event_type and event_type not in known_types:
+            unknown_types.add(event_type)
+        enriched.append(_enrich_event(event, client_cache))
+    return enriched, unknown_types
+
+
 async def collect(site_id: str) -> int:
     """
-    Pull 24hr events from Mist, enrich with client cache, store in Redis.
-    Fails fast if client cache is missing — does NOT make a redundant client list call.
-    Returns count of events stored.
+    Incremental collect: pull last 1hr of events from Mist, append to the existing
+    rolling dataset in Redis, and age out events older than 24hr.
+    Used by the scheduler. Fails fast if client cache is missing.
+    Returns total count of events in the dataset after the update.
     """
     redis_client = aioredis.from_url(REDIS_URL, decode_responses=True)
     try:
-        # Fail fast if client cache is missing
         client_cache = await get_client_cache(site_id)
         if not client_cache:
             raise RuntimeError(
@@ -282,32 +299,79 @@ async def collect(site_id: str) -> int:
                 "Run client_cache.refresh_client_cache() first."
             )
 
-        events = await fetch_all_events(site_id)
+        new_raw = await fetch_all_events(site_id, duration="1h")
+        if not new_raw:
+            log.info(f"No new events in last 1hr for site {site_id}")
+            new_raw = []
+
+        new_enriched, unknown_types = _enrich_batch(new_raw, client_cache)
+
+        if unknown_types:
+            await redis_client.sadd(f"sasquatch:unknown_event_types:{site_id}", *unknown_types)
+            log.warning(f"Unknown event types found: {unknown_types}")
+
+        # Load existing dataset
+        key = f"sasquatch:events:{site_id}"
+        existing_raw = await redis_client.get(key)
+        existing: list[dict] = json.loads(existing_raw) if existing_raw else []
+
+        # Deduplicate incoming events against what's already stored
+        existing_keys = {
+            (e.get("timestamp"), e.get("mac"), e.get("type"))
+            for e in existing
+        }
+        truly_new = [
+            e for e in new_enriched
+            if (e.get("timestamp"), e.get("mac"), e.get("type")) not in existing_keys
+        ]
+
+        # Age out events older than 24hr, then append new ones
+        cutoff = time.time() - EVENTS_TTL
+        merged = [e for e in existing if (e.get("timestamp") or 0) >= cutoff]
+        merged.extend(truly_new)
+
+        await redis_client.set(key, json.dumps(merged), ex=EVENTS_TTL)
+        log.info(
+            f"Incremental collect: +{len(truly_new)} new events "
+            f"({len(new_enriched) - len(truly_new)} dupes skipped), "
+            f"{len(merged)} total in dataset → {key}"
+        )
+        return len(merged)
+
+    finally:
+        await redis_client.aclose()
+
+
+async def collect_full(site_id: str) -> int:
+    """
+    Full collect: pull last 24hr of events from Mist and replace the Redis
+    dataset entirely. Used by manual API trigger only.
+    Returns count of events stored.
+    """
+    redis_client = aioredis.from_url(REDIS_URL, decode_responses=True)
+    try:
+        client_cache = await get_client_cache(site_id)
+        if not client_cache:
+            raise RuntimeError(
+                f"Client cache missing for site {site_id}. "
+                "Run client_cache.refresh_client_cache() first."
+            )
+
+        events = await fetch_all_events(site_id, duration="1d")
         if not events:
             log.warning(f"No events returned for site {site_id}")
             return 0
 
-        # Track unknown event types
-        known_types = set(MIST_CLIENT_EVENT_TYPES)
-        unknown_types: set[str] = set()
+        enriched, unknown_types = _enrich_batch(events, client_cache)
 
-        enriched_events = []
-        for event in events:
-            event_type = event.get("type", "")
-            if event_type and event_type not in known_types:
-                unknown_types.add(event_type)
-            enriched_events.append(_enrich_event(event, client_cache))
-
-        # Log unknown event types to Redis for review
         if unknown_types:
-            unk_key = f"sasquatch:unknown_event_types:{site_id}"
-            await redis_client.sadd(unk_key, *unknown_types)
+            await redis_client.sadd(f"sasquatch:unknown_event_types:{site_id}", *unknown_types)
             log.warning(f"Unknown event types found: {unknown_types}")
 
         key = f"sasquatch:events:{site_id}"
-        await redis_client.set(key, json.dumps(enriched_events), ex=EVENTS_TTL)
-        log.info(f"Stored {len(enriched_events)} events → {key}")
-        return len(enriched_events)
+        await redis_client.set(key, json.dumps(enriched), ex=EVENTS_TTL)
+        log.info(f"Full collect: stored {len(enriched)} events → {key}")
+        return len(enriched)
 
     finally:
         await redis_client.aclose()

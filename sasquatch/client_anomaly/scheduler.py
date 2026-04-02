@@ -14,7 +14,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from .anomaly_detector import score
 from .client_cache import refresh_client_cache
-from .event_collector import collect
+from .event_collector import collect, collect_full
 from .feature_engineer import build_features
 from .webhook_dispatcher import evaluate_and_dispatch
 
@@ -59,11 +59,15 @@ async def client_refresh_job():
         log.exception("client_refresh_job failed")
 
 
-async def run_detection_cycle(site_id: str) -> dict:
+async def run_detection_cycle(site_id: str, full_refresh: bool = False) -> dict:
     """
     Core detection pipeline: collect → features → score → dispatch.
     Acquires a Redis lock so only one run proceeds at a time regardless of
     whether the trigger came from the scheduler or a manual /run API call.
+
+    full_refresh=False (default, scheduler): incremental 1hr append + 24hr age-out.
+    full_refresh=True (API trigger): full 24hr backfill, replaces dataset entirely.
+
     Returns a summary dict; raises RuntimeError if the lock is already held.
     """
     redis_client, acquired = await _acquire_lock(site_id)
@@ -72,7 +76,10 @@ async def run_detection_cycle(site_id: str) -> dict:
         raise RuntimeError(f"Detection cycle already running for site {site_id} — skipping")
 
     try:
-        event_count = await collect(site_id)
+        if full_refresh:
+            event_count = await collect_full(site_id)
+        else:
+            event_count = await collect(site_id)
         log.info(f"[cycle] Events collected: {event_count}")
 
         mac_count = await build_features(site_id)

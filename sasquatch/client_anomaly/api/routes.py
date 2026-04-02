@@ -260,7 +260,7 @@ async def trigger_full_detection_run(site_id: str):
     Returns 409 if a cycle is already in progress.
     """
     try:
-        summary = await run_detection_cycle(site_id)
+        summary = await run_detection_cycle(site_id, full_refresh=True)
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
     except Exception as exc:

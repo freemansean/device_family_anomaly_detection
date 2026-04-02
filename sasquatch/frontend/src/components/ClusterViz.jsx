@@ -24,11 +24,12 @@ function scaleCoords(points) {
   }));
 }
 
-export default function ClusterViz({ siteId, apiBase }) {
+export default function ClusterViz({ siteId, apiBase, onMacSelect }) {
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [tooltip, setTooltip] = useState(null);
+  const [hiddenFamilies, setHiddenFamilies] = useState(new Set());
   const svgRef = useRef(null);
 
   const load = useCallback(() => {
@@ -66,6 +67,21 @@ export default function ClusterViz({ siteId, apiBase }) {
 
   const [ev0, ev1] = data.explained_variance || [];
 
+  function toggleFamily(family) {
+    setHiddenFamilies((prev) => {
+      const next = new Set(prev);
+      if (next.has(family)) next.delete(family);
+      else next.add(family);
+      return next;
+    });
+  }
+
+  const visiblePoints = scaled.filter((p) => !hiddenFamilies.has(p.device_family));
+
+  function handleDotClick(point) {
+    if (onMacSelect) onMacSelect(point.mac);
+  }
+
   return (
     <div style={{ userSelect: "none", width: `${W}px` }}>
       <div style={{ fontSize: "12px", color: "#666", marginBottom: "6px" }}>
@@ -90,13 +106,14 @@ export default function ClusterViz({ siteId, apiBase }) {
 
         {/* Points — normal first, outliers on top */}
         {[false, true].map((outlierPass) =>
-          scaled
+          visiblePoints
             .filter((p) => p.is_outlier === outlierPass)
             .map((p, i) => {
               const color = familyColor(p.device_family);
               const r = p.is_outlier ? 5 : 3.5;
+              const clickable = !!onMacSelect;
               return (
-                <g key={`${outlierPass}-${i}`}>
+                <g key={`${outlierPass}-${i}`} style={{ cursor: clickable ? "pointer" : "default" }} onClick={() => handleDotClick(p)}>
                   {p.is_outlier && (
                     <circle cx={p.sx} cy={p.sy} r={r + 3} fill="none" stroke={color} strokeWidth={1} opacity={0.5} />
                   )}
@@ -106,7 +123,6 @@ export default function ClusterViz({ siteId, apiBase }) {
                     r={r}
                     fill={color}
                     opacity={p.is_outlier ? 1.0 : 0.7}
-                    style={{ cursor: "pointer" }}
                     onMouseEnter={(e) => {
                       const rect = svgRef.current?.getBoundingClientRect();
                       setTooltip({
@@ -115,6 +131,7 @@ export default function ClusterViz({ siteId, apiBase }) {
                         point: p,
                       });
                     }}
+                    onMouseLeave={() => setTooltip(null)}
                   />
                 </g>
               );
@@ -125,28 +142,55 @@ export default function ClusterViz({ siteId, apiBase }) {
         {tooltip && (() => {
           const { x, y, point } = tooltip;
           const bx = Math.min(x + 10, W - 160);
-          const by = Math.min(y - 10, H - 56);
+          const by = Math.min(y - 10, H - 68);
           return (
-            <g>
-              <rect x={bx} y={by} width={150} height={48} rx={3} fill="#1a1a1a" stroke="#333" strokeWidth={1} />
+            <g style={{ pointerEvents: "none" }}>
+              <rect x={bx} y={by} width={150} height={point.is_outlier ? 60 : 48} rx={3} fill="#1a1a1a" stroke="#333" strokeWidth={1} />
               <text x={bx + 8} y={by + 15} fontSize={10} fill="#aaa">{point.device_family}</text>
               <text x={bx + 8} y={by + 28} fontSize={9} fill="#555">{point.mac}</text>
               {point.is_outlier && (
-                <text x={bx + 8} y={by + 40} fontSize={9} fill="#e05555">⚠ outlier</text>
+                <text x={bx + 8} y={by + 41} fontSize={9} fill="#e05555">⚠ outlier</text>
+              )}
+              {onMacSelect && (
+                <text x={bx + 8} y={by + (point.is_outlier ? 54 : 41)} fontSize={9} fill="#4a90c4">click to open →</text>
               )}
             </g>
           );
         })()}
       </svg>
 
-      {/* Legend */}
+      {/* Legend — click to toggle family visibility */}
       <div style={{ marginTop: "8px", display: "flex", flexWrap: "wrap", gap: "6px 12px" }}>
-        {families.map((family) => (
-          <div key={family} style={{ display: "flex", alignItems: "center", gap: "4px", fontSize: "10px", color: "#888" }}>
-            <div style={{ width: 8, height: 8, borderRadius: "50%", background: familyColor(family), flexShrink: 0 }} />
-            {family}
-          </div>
-        ))}
+        {families.map((family) => {
+          const hidden = hiddenFamilies.has(family);
+          const color = familyColor(family);
+          return (
+            <div
+              key={family}
+              onClick={() => toggleFamily(family)}
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: "4px",
+                fontSize: "10px",
+                color: hidden ? "#444" : "#888",
+                cursor: "pointer",
+                opacity: hidden ? 0.5 : 1,
+                transition: "opacity 0.15s, color 0.15s",
+              }}
+            >
+              <div style={{
+                width: 8,
+                height: 8,
+                borderRadius: "50%",
+                background: hidden ? "#333" : color,
+                flexShrink: 0,
+                transition: "background 0.15s",
+              }} />
+              {family}
+            </div>
+          );
+        })}
         <div style={{ display: "flex", alignItems: "center", gap: "4px", fontSize: "10px", color: "#888" }}>
           <div style={{ width: 8, height: 8, borderRadius: "50%", border: "1.5px solid #e05555", flexShrink: 0 }} />
           outlier

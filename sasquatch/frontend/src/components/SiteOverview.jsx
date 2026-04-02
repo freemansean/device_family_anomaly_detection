@@ -175,7 +175,7 @@ export default function SiteOverview({ siteId, apiBase, onMacSelect, onFamilySel
         </div>
 
         <div style={{ flex: "0 0 380px", width: "380px" }}>
-          <ClusterViz siteId={siteId} apiBase={apiBase} />
+          <ClusterViz siteId={siteId} apiBase={apiBase} onMacSelect={onMacSelect} />
         </div>
       </div>
 
