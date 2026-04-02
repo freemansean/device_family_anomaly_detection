@@ -25,6 +25,17 @@ def _auth_headers() -> dict:
     return {"Authorization": f"Token {MIST_API_TOKEN}"}
 
 
+def _normalize_family(name: str) -> str:
+    """
+    Normalize a dynamic (non-hardcoded) family name for consistent grouping.
+    Strips trailing punctuation/whitespace then truncates to 12 characters so that
+    variants like "Zebra Technologies Inc" and "Zebra Technologies Inc." map to the
+    same family label.
+    """
+    cleaned = name.rstrip(".,; ").strip()
+    return cleaned[:12].strip() if len(cleaned) > 12 else cleaned
+
+
 def classify_family(client: dict) -> str:
     model = (client.get("last_model") or "").strip()
     device = (client.get("last_device") or "").strip()
@@ -53,8 +64,13 @@ def classify_family(client: dict) -> str:
         return "Linux"
     if "printer" in combined or "print" in combined:
         return "Printer"
-    if mfg and model == "" and os_str == "":
-        return f"IoT ({mfg})"
+    # Use OS type if available; fall back to manufacturer name.
+    # Normalize to first 12 chars so minor variants (punctuation, trailing text)
+    # collapse into the same family group.
+    if os_str:
+        return _normalize_family(os_str)
+    if mfg:
+        return _normalize_family(mfg)
     return "Unknown"
 
 

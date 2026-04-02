@@ -1,5 +1,7 @@
 import { useState, useEffect, useCallback } from "react";
 import { apiFetch } from "../api";
+import { familyColor } from "./familyColors";
+import ClusterViz from "./ClusterViz";
 
 const CATEGORIES = [
   "DHCP_SUCCESS", "DHCP_FAILURE", "DNS_SUCCESS", "DNS_FAILURE",
@@ -72,7 +74,8 @@ export default function SiteOverview({ siteId, apiBase, onMacSelect, onFamilySel
         </span>
       </div>
 
-      <div style={{ overflowX: "auto" }}>
+      <div style={{ display: "flex", gap: "28px", alignItems: "flex-start" }}>
+        <div style={{ overflowX: "auto", flex: "1 1 auto", minWidth: 0 }}>
         <table style={{ borderCollapse: "collapse", fontSize: "12px", width: "100%" }}>
           <thead>
             <tr>
@@ -93,9 +96,15 @@ export default function SiteOverview({ siteId, apiBase, onMacSelect, onFamilySel
               // Site Overview shows DBSCAN-only severity — IF deviations are in the family drilldown
               const severity = finding?.dbscan_severity ?? null;
               const hasIfOutliers = (finding?.if_outlier_count ?? 0) > 0;
+              const color = familyColor(family);
               return (
                 <tr key={family}>
                   <td style={{ ...tdStyle, whiteSpace: "nowrap" }}>
+                    <span style={{
+                      display: "inline-block", width: 8, height: 8,
+                      borderRadius: "50%", background: color,
+                      marginRight: "6px", verticalAlign: "middle", flexShrink: 0,
+                    }} />
                     <span
                       onClick={() => onFamilySelect(family)}
                       style={{
@@ -163,6 +172,11 @@ export default function SiteOverview({ siteId, apiBase, onMacSelect, onFamilySel
             })}
           </tbody>
         </table>
+        </div>
+
+        <div style={{ flex: "0 0 auto" }}>
+          <ClusterViz siteId={siteId} apiBase={apiBase} />
+        </div>
       </div>
 
       <div style={{ marginTop: "8px", fontSize: "11px", color: "#444" }}>

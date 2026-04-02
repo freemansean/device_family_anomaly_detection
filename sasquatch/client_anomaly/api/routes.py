@@ -11,8 +11,11 @@ import os
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
 
+import numpy as np
 import redis.asyncio as aioredis
 from fastapi import APIRouter, Depends, HTTPException
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
 
 from ..anomaly_detector import get_anomalies, get_findings, score
 from ..client_cache import get_client_cache, refresh_client_cache
@@ -283,6 +286,59 @@ async def trigger_full_detection_run(site_id: str):
         "macs_scored": scored,
         "findings_generated": len(findings),
         "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+@router.get("/sites/{site_id}/cluster-viz")
+async def get_cluster_viz(site_id: str):
+    """
+    PCA 2D projection of all MAC feature vectors for the cluster scatter plot.
+    Returns one point per MAC with x/y coordinates, device family, and outlier status.
+    """
+    raw_features = await _redis_get(f"sasquatch:features:{site_id}")
+    if not raw_features:
+        raise HTTPException(status_code=404, detail="No features found. Run detection first.")
+
+    features: dict = json.loads(raw_features)
+    if len(features) < 3:
+        return {"site_id": site_id, "points": [], "explained_variance": []}
+
+    raw_anomalies = await _redis_get(f"sasquatch:anomalies:{site_id}")
+    anomalies: dict = json.loads(raw_anomalies) if raw_anomalies else {}
+
+    macs = list(features.keys())
+    vec_keys = list(features[macs[0]]["vector"].keys())
+    X = np.array([[features[m]["vector"].get(k, 0.0) for k in vec_keys] for m in macs])
+
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+
+    n_components = min(2, X_scaled.shape[0], X_scaled.shape[1])
+    pca = PCA(n_components=n_components, random_state=42)
+    coords = pca.fit_transform(X_scaled)
+
+    # Pad to 2 columns if PCA could only produce 1 component
+    if coords.shape[1] == 1:
+        coords = np.hstack([coords, np.zeros((coords.shape[0], 1))])
+
+    points = []
+    for i, mac in enumerate(macs):
+        anom = anomalies.get(mac, {})
+        points.append({
+            "mac": mac,
+            "x": float(coords[i, 0]),
+            "y": float(coords[i, 1]),
+            "device_family": features[mac].get("device_family", "Unknown"),
+            "is_outlier": anom.get("is_outlier", False),
+            "is_dbscan_outlier": anom.get("is_dbscan_outlier", False),
+            "dbscan_label": anom.get("dbscan_label"),
+        })
+
+    return {
+        "site_id": site_id,
+        "points": points,
+        "explained_variance": [round(v, 4) for v in pca.explained_variance_ratio_.tolist()],
+        "total_points": len(points),
     }
 
 
