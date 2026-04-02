@@ -9,7 +9,8 @@ import os
 import secrets
 
 import redis.asyncio as aioredis
-from fastapi import APIRouter, Header, HTTPException
+from fastapi import APIRouter, HTTPException, Security
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
@@ -39,15 +40,12 @@ async def login(body: LoginRequest):
     return {"token": token}
 
 
-async def require_auth(authorization: str = Header(default="")) -> str:
+_bearer = HTTPBearer()
+
+
+async def require_auth(credentials: HTTPAuthorizationCredentials = Security(_bearer)) -> str:
     """FastAPI dependency — validates Bearer token against Redis."""
-    if not authorization.startswith("Bearer "):
-        raise HTTPException(
-            status_code=401,
-            detail="Missing or invalid Authorization header",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    token = authorization[7:]
+    token = credentials.credentials
     client = aioredis.from_url(REDIS_URL, decode_responses=True)
     try:
         user = await client.get(f"sasquatch:auth:{token}")
