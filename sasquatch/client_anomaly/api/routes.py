@@ -17,10 +17,10 @@ from fastapi import APIRouter, Depends, HTTPException
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 
-from ..anomaly_detector import get_anomalies, get_findings, score
+from ..anomaly_detector import get_anomalies, get_findings
 from ..client_cache import get_client_cache, refresh_client_cache
-from ..event_collector import EVENT_CATEGORIES, collect
-from ..feature_engineer import build_features
+from ..event_collector import EVENT_CATEGORIES
+from ..scheduler import run_detection_cycle
 from .auth import require_auth
 
 log = logging.getLogger(__name__)
@@ -256,34 +256,24 @@ async def flush_site_redis(site_id: str):
 async def trigger_full_detection_run(site_id: str):
     """
     Pull 24hr events, build features, score anomalies, and populate findings.
-    Runs the full detection pipeline synchronously — same steps as the scheduler job.
-    Returns a summary of what was produced.
+    Runs the full detection pipeline — same steps as the scheduler job.
+    Returns 409 if a cycle is already in progress.
     """
     try:
-        event_count = await collect(site_id)
+        summary = await run_detection_cycle(site_id)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
     except Exception as exc:
-        log.exception(f"Event collection failed for site {site_id}")
-        raise HTTPException(status_code=500, detail=f"Event collection failed: {exc}")
-
-    try:
-        mac_count = await build_features(site_id)
-    except Exception as exc:
-        log.exception(f"Feature engineering failed for site {site_id}")
-        raise HTTPException(status_code=500, detail=f"Feature engineering failed: {exc}")
-
-    try:
-        scored = await score(site_id)
-    except Exception as exc:
-        log.exception(f"Anomaly scoring failed for site {site_id}")
-        raise HTTPException(status_code=500, detail=f"Anomaly scoring failed: {exc}")
+        log.exception(f"Detection cycle failed for site {site_id}")
+        raise HTTPException(status_code=500, detail=str(exc))
 
     findings = await get_findings(site_id)
     return {
         "site_id": site_id,
         "status": "ok",
-        "events_collected": event_count,
-        "macs_with_features": mac_count,
-        "macs_scored": scored,
+        "events_collected": summary["events"],
+        "macs_with_features": summary["macs_with_features"],
+        "macs_scored": summary["macs_scored"],
         "findings_generated": len(findings),
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }

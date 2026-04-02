@@ -9,6 +9,7 @@ Jobs:
 import logging
 import os
 
+import redis.asyncio as aioredis
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from .anomaly_detector import score
@@ -21,6 +22,29 @@ log = logging.getLogger(__name__)
 
 SITE_ID = os.getenv("MIST_SITE_ID", "")
 DETECTION_INTERVAL_MINUTES = int(os.getenv("DETECTION_INTERVAL_MINUTES", "15"))
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
+
+# Lock TTL: generous upper bound for a full collection + scoring cycle.
+# If a run dies without releasing the lock, it will auto-expire.
+_LOCK_TTL_SECONDS = 45 * 60  # 45 minutes
+
+
+async def _acquire_lock(site_id: str) -> tuple[aioredis.Redis, bool]:
+    """
+    Try to acquire the per-site detection lock via Redis SETNX.
+    Returns (redis_client, acquired). Caller must release the client regardless.
+    """
+    client = aioredis.from_url(REDIS_URL, decode_responses=True)
+    key = f"sasquatch:lock:detection:{site_id}"
+    acquired = await client.set(key, "1", nx=True, ex=_LOCK_TTL_SECONDS)
+    return client, bool(acquired)
+
+
+async def _release_lock(redis_client: aioredis.Redis, site_id: str) -> None:
+    try:
+        await redis_client.delete(f"sasquatch:lock:detection:{site_id}")
+    finally:
+        await redis_client.aclose()
 
 
 async def client_refresh_job():
@@ -35,42 +59,50 @@ async def client_refresh_job():
         log.exception("client_refresh_job failed")
 
 
+async def run_detection_cycle(site_id: str) -> dict:
+    """
+    Core detection pipeline: collect → features → score → dispatch.
+    Acquires a Redis lock so only one run proceeds at a time regardless of
+    whether the trigger came from the scheduler or a manual /run API call.
+    Returns a summary dict; raises RuntimeError if the lock is already held.
+    """
+    redis_client, acquired = await _acquire_lock(site_id)
+    if not acquired:
+        await redis_client.aclose()
+        raise RuntimeError(f"Detection cycle already running for site {site_id} — skipping")
+
+    try:
+        event_count = await collect(site_id)
+        log.info(f"[cycle] Events collected: {event_count}")
+
+        mac_count = await build_features(site_id)
+        log.info(f"[cycle] Features built for {mac_count} MACs")
+
+        scored = await score(site_id)
+        log.info(f"[cycle] Anomaly scoring complete: {scored} MACs")
+
+        try:
+            await evaluate_and_dispatch(site_id)
+        except Exception:
+            log.exception("[cycle] webhook_dispatcher failed (non-fatal)")
+
+        return {"events": event_count, "macs_with_features": mac_count, "macs_scored": scored}
+
+    finally:
+        await _release_lock(redis_client, site_id)
+
+
 async def event_and_detect_job():
-    """
-    Periodic job: collect events → build features → score anomalies → dispatch webhook.
-    If any step raises, log and abort remaining steps.
-    Does NOT corrupt Redis state from the previous good cycle on failure.
-    """
+    """Scheduled wrapper — delegates to run_detection_cycle with lock protection."""
     if not SITE_ID:
         log.error("MIST_SITE_ID not configured — skipping detection cycle")
         return
-
     try:
-        event_count = await collect(SITE_ID)
-        log.info(f"[cycle] Events collected: {event_count}")
+        await run_detection_cycle(SITE_ID)
+    except RuntimeError as exc:
+        log.warning(str(exc))  # Lock contention — not an error
     except Exception:
-        log.exception("[cycle] event_collector.collect() failed — aborting cycle")
-        return
-
-    try:
-        mac_count = await build_features(SITE_ID)
-        log.info(f"[cycle] Features built for {mac_count} MACs")
-    except Exception:
-        log.exception("[cycle] feature_engineer.build_features() failed — aborting cycle")
-        return
-
-    try:
-        scored = await score(SITE_ID)
-        log.info(f"[cycle] Anomaly scoring complete: {scored} MACs")
-    except Exception:
-        log.exception("[cycle] anomaly_detector.score() failed — aborting cycle")
-        return
-
-    try:
-        await evaluate_and_dispatch(SITE_ID)
-    except Exception:
-        log.exception("[cycle] webhook_dispatcher.evaluate_and_dispatch() failed")
-        # Don't abort — detection already succeeded
+        log.exception("[cycle] detection cycle failed")
 
 
 def create_scheduler() -> AsyncIOScheduler:
