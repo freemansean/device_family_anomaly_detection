@@ -76,7 +76,7 @@ export default function SiteOverview({ siteId, apiBase, onMacSelect, onFamilySel
 
       <div style={{ display: "flex", gap: "28px", alignItems: "flex-start" }}>
         <div style={{ overflowX: "auto", flex: "1 1 auto", minWidth: 0 }}>
-        <table style={{ borderCollapse: "collapse", fontSize: "12px", width: "100%" }}>
+        <table style={{ borderCollapse: "collapse", fontSize: "12px" }}>
           <thead>
             <tr>
               <th style={thStyle}>Device Family</th>
