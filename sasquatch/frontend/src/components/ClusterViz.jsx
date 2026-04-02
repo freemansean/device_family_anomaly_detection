@@ -67,7 +67,7 @@ export default function ClusterViz({ siteId, apiBase }) {
   const [ev0, ev1] = data.explained_variance || [];
 
   return (
-    <div style={{ userSelect: "none" }}>
+    <div style={{ userSelect: "none", width: `${W}px` }}>
       <div style={{ fontSize: "12px", color: "#666", marginBottom: "6px" }}>
         PCA Cluster View
         {ev0 != null && (
