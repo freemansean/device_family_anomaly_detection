@@ -1,8 +1,8 @@
 import { useState, useEffect, useCallback } from "react";
 import { apiFetch } from "../api";
 
-const SEVERITY_COLOR = { CRITICAL: "#e05555", WARNING: "#e0a835", INFO: "#4ea8c4" };
-const SEVERITY_BG = { CRITICAL: "#2a1515", WARNING: "#2a2015", INFO: "#152030" };
+const SEVERITY_COLOR = { significant: "#e05555", moderate: "#e0a835", minimal: "#4ea8c4" };
+const SEVERITY_BG = { significant: "#2a1515", moderate: "#2a2015", minimal: "#152030" };
 
 const PATTERN_LABELS = {
   dhcp_discard_loop: "DHCP Discard Loop",
@@ -14,6 +14,7 @@ const PATTERN_LABELS = {
   dns_failure: "DNS Failure",
   dhcp_failure: "DHCP Failure",
   behavioral_outlier: "Behavioral Outlier",
+  family_behavioral_outlier: "Family-Wide Outlier",
 };
 
 export default function FindingsFeed({ siteId, apiBase, onMacSelect }) {
@@ -89,6 +90,19 @@ export default function FindingsFeed({ siteId, apiBase, onMacSelect }) {
                   <span style={{ color: "#666", fontSize: "12px", marginLeft: "10px" }}>
                     {PATTERN_LABELS[finding.probable_pattern] || finding.probable_pattern}
                   </span>
+                  {finding.is_family_outlier && (
+                    <span style={{
+                      background: "#2a1a3a",
+                      color: "#b06ad4",
+                      border: "1px solid #6a3a8a",
+                      borderRadius: "3px",
+                      padding: "2px 7px",
+                      fontSize: "10px",
+                      marginLeft: "8px",
+                    }}>
+                      family-wide
+                    </span>
+                  )}
                 </div>
                 <div style={{ textAlign: "right", fontSize: "12px" }}>
                   <span style={{ color: SEVERITY_COLOR[sev], fontWeight: "bold" }}>

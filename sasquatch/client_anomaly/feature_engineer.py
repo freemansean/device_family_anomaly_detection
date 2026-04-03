@@ -2,24 +2,19 @@
 feature_engineer.py — Per-MAC feature vector construction.
 
 DESIGN PRINCIPLE: Volume is not anomaly.
-The ML models receive ratio/entropy/timing features ONLY — not raw counts.
+The ML models receive ratio/timing features ONLY — not raw counts.
 All features are normalized so that active clients are not penalized for being active.
 
-Feature vector (14 dimensions) — domain-decomposed health axes:
-  - 4 domains × 2 directions: {domain}_healthy_ratio, {domain}_unhealthy_ratio
-    Normalized to total MAC events, NOT domain-total. This means:
-      - Zero on both = client has no activity in that domain (e.g. IoT device with no DNS)
-      - Healthy high, unhealthy near zero = normal
-      - Unhealthy high = broken domain
-      - Both nonzero = intermittent failure
+Feature vector — raw event type frequency vector + timing:
+  - N dimensions: one per known event type in MIST_CLIENT_EVENT_TYPES.
+    Value = count of that event type for this MAC / total events for this MAC.
+    Zero-filled for event types not seen by this client.
+    The event type dimensions always sum to 1.0.
   - 2 timing features: median_inter_event_seconds, inter_event_cv
-  - 4 RSSI/SNR features: rssi_mean, rssi_std, rssi_p10, rssi_trend
-    RSSI is tracked independently of event type — pure signal health axis.
-    rssi_trend is the linear regression slope of rssi vs normalized time
-    (positive = improving signal, negative = degrading).
-    Sentinel 0.0 used when no RSSI data available (safe: all real RSSI values are negative).
 
 Post-hoc explainer features are computed separately, only for flagged MACs.
+Event category buckets (DHCP_SUCCESS, AUTH_FAILURE, etc.) are used only for the
+GUI heatmap and post-hoc pattern classification — NOT fed to the ML models.
 """
 
 import json
@@ -28,15 +23,15 @@ import os
 import statistics
 from collections import Counter, defaultdict
 
-import numpy as np
 import redis.asyncio as aioredis
 
-from .event_collector import EVENT_CATEGORIES
+from .event_collector import EVENT_CATEGORIES, MIST_CLIENT_EVENT_TYPES
 
 log = logging.getLogger(__name__)
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 FEATURES_TTL = 24 * 3600
+MIN_MAC_EVENTS = int(os.getenv("ANOMALY_MIN_MAC_EVENTS", "5"))
 
 # For post-hoc explainer
 DHCP_SUCCESS_TYPES = {"CLIENT_IP_ASSIGNED", "CLIENT_IPV6_ASSIGNED"}
@@ -47,74 +42,23 @@ ROAM_FAILURE_TYPES = {
     "MARVIS_EVENT_WLC_FT_KEY_NOT_FOUND",
 }
 
-# ---------------------------------------------------------------------------
-# Domain axis definitions — the principal components of client health.
-# Each axis has a healthy set and an unhealthy set.
-# These become the ML feature dimensions.
-# ---------------------------------------------------------------------------
-DOMAIN_AXES: dict[str, dict[str, set[str]]] = {
-    "auth_roam": {
-        "healthy": {
-            # Initial association
-            "CLIENT_AUTHENTICATED",
-            "CLIENT_AUTH_ASSOCIATION",
-            "CLIENT_AUTH_ASSOCIATION_11R",
-            "CLIENT_AUTH_ASSOCIATION_OKC",
-            "CLIENT_ASSOCIATION",
-            # Fast roam reassociation
-            "CLIENT_AUTH_REASSOCIATION",
-            "CLIENT_AUTH_REASSOCIATION_11R",
-            "CLIENT_AUTH_REASSOCIATION_OKC",
-            "CLIENT_REASSOCIATION",
-            "CLIENT_REASSOCIATION_PMKC",
-        },
-        "unhealthy": {
-            "MARVIS_EVENT_CLIENT_AUTH_FAILURE",
-            "MARVIS_EVENT_CLIENT_AUTH_DENIED",
-            "MARVIS_EVENT_CLIENT_MAC_AUTH_FAILURE",
-            "CLIENT_ASSOCIATION_FAILURE",
-            # Roam failures
-            "MARVIS_EVENT_CLIENT_FBT_FAILURE",
-            "MARVIS_EVENT_CLIENT_AUTH_FAILURE_OKC",
-            "MARVIS_EVENT_CLIENT_AUTH_FAILURE_11R",
-            "MARVIS_EVENT_WLC_FT_KEY_NOT_FOUND",
-        },
-    },
-    "dhcp": {
-        "healthy": {
-            "CLIENT_IP_ASSIGNED",
-            "CLIENT_IPV6_ASSIGNED",
-        },
-        "unhealthy": {
-            "MARVIS_EVENT_CLIENT_DHCP_NAK",
-            "MARVIS_EVENT_CLIENT_DHCPV6_NAK",
-            "MARVIS_EVENT_CLIENT_DHCP_FAILURE",
-            "MARVIS_EVENT_CLIENT_DHCPV6_FAILURE",
-            "MARVIS_EVENT_CLIENT_DHCP_STUCK",
-            "MARVIS_EVENT_CLIENT_DHCPV6_STUCK",
-            "MARVIS_EVENT_CLIENT_FAILED_DHCP_INFORM",
-        },
-    },
-    "dns": {
-        "healthy": {"CLIENT_DNS_OK"},
-        "unhealthy": {"MARVIS_DNS_FAILURE"},
-    },
-    "arp": {
-        "healthy": {"CLIENT_GW_ARP_OK"},
-        "unhealthy": {
-            "CLIENT_GW_ARP_FAILURE",
-            "CLIENT_ARP_FAILURE",
-            "CLIENT_EXCESSIVE_ARPING_GW",
-        },
-    },
-}
+# All failure-class event types — used for failure concentration scoring in the ML vector.
+_FAILURE_EVENT_TYPES: set[str] = set()
+for _cat in ("DHCP_FAILURE", "DNS_FAILURE", "AUTH_FAILURE", "ROAM_FAILURE"):
+    _FAILURE_EVENT_TYPES.update(EVENT_CATEGORIES.get(_cat, []))
+_FAILURE_EVENT_TYPES.update([
+    "CLIENT_ASSOCIATION_FAILURE",
+    "CLIENT_REASSOCIATION_FAILURE",
+    "CLIENT_GW_ARP_FAILURE",
+    "CLIENT_ARP_FAILURE",
+    "CLIENT_EXCESSIVE_ARPING_GW",
+])
 
-# Canonical feature key ordering — used to guarantee vector consistency across MACs and runs.
+# Canonical feature key ordering — guarantees vector consistency across MACs and runs.
+# Event type dimensions first (in MIST_CLIENT_EVENT_TYPES order), then timing and concentration.
 FEATURE_KEYS: list[str] = (
-    [f"{domain}_healthy_ratio" for domain in DOMAIN_AXES]
-    + [f"{domain}_unhealthy_ratio" for domain in DOMAIN_AXES]
-    + ["median_inter_event_seconds", "inter_event_cv"]
-    + ["rssi_mean", "rssi_std", "rssi_p10", "rssi_trend"]
+    list(MIST_CLIENT_EVENT_TYPES)
+    + ["median_inter_event_seconds", "inter_event_cv", "top_event_fraction", "top_failure_event_fraction"]
 )
 
 
@@ -143,51 +87,14 @@ def _inter_event_stats(timestamps: list[float]) -> tuple[float, float]:
     return med, cv
 
 
-def _rssi_features(mac_events: list[dict]) -> dict[str, float]:
-    """
-    Extract signal health features from the rssi field across all events.
-    RSSI is tracked independently of event type — pure RF health axis.
-    Sentinel 0.0 for all features when no RSSI data is present.
-    """
-    # Collect (timestamp, rssi) pairs where rssi is a real number
-    readings = [
-        (e.get("timestamp", 0), e["rssi"])
-        for e in mac_events
-        if isinstance(e.get("rssi"), (int, float)) and e["rssi"] != 0
-    ]
-
-    if not readings:
-        return {"rssi_mean": 0.0, "rssi_std": 0.0, "rssi_p10": 0.0, "rssi_trend": 0.0}
-
-    readings.sort(key=lambda x: x[0])
-    timestamps = np.array([r[0] for r in readings], dtype=float)
-    rssi_vals = np.array([r[1] for r in readings], dtype=float)
-
-    mean = float(np.mean(rssi_vals))
-    std = float(np.std(rssi_vals)) if len(rssi_vals) > 1 else 0.0
-    p10 = float(np.percentile(rssi_vals, 10))
-
-    # Linear trend: slope of rssi vs time normalized to [0,1]
-    # Positive = signal improving over the 24hr window, negative = degrading
-    if len(timestamps) >= 2 and timestamps[-1] > timestamps[0]:
-        t_norm = (timestamps - timestamps[0]) / (timestamps[-1] - timestamps[0])
-        slope, _ = np.polyfit(t_norm, rssi_vals, 1)
-        trend = float(slope)
-    else:
-        trend = 0.0
-
-    return {"rssi_mean": mean, "rssi_std": std, "rssi_p10": p10, "rssi_trend": trend}
-
-
 def build_mac_feature_vector(mac_events: list[dict]) -> dict[str, float]:
     """
-    Build the 14-dimensional ML input feature vector for a single MAC.
+    Build the ML input feature vector for a single MAC.
 
     Dimensions:
-      [0–3]  auth_roam_healthy_ratio, dhcp_healthy_ratio, dns_healthy_ratio, arp_healthy_ratio
-      [4–7]  auth_roam_unhealthy_ratio, dhcp_unhealthy_ratio, dns_unhealthy_ratio, arp_unhealthy_ratio
-      [8–9]  median_inter_event_seconds, inter_event_cv
-      [10–13] rssi_mean, rssi_std, rssi_p10, rssi_trend
+      [0–N-1]  One frequency per known event type: count / total events for this MAC.
+               Zero-filled for types not seen. Dimensions sum to 1.0.
+      [N, N+1] median_inter_event_seconds, inter_event_cv
     """
     if not mac_events:
         return {k: 0.0 for k in FEATURE_KEYS}
@@ -197,13 +104,9 @@ def build_mac_feature_vector(mac_events: list[dict]) -> dict[str, float]:
 
     vec: dict[str, float] = {}
 
-    # Domain health axes — each ratio is normalized to total MAC events (not domain total).
-    # This preserves the "absent from domain" signal (both ratios == 0 for inactive domains).
-    for domain, sets in DOMAIN_AXES.items():
-        healthy_count = sum(type_counts.get(t, 0) for t in sets["healthy"])
-        unhealthy_count = sum(type_counts.get(t, 0) for t in sets["unhealthy"])
-        vec[f"{domain}_healthy_ratio"] = healthy_count / total
-        vec[f"{domain}_unhealthy_ratio"] = unhealthy_count / total
+    # Per-event-type normalized frequency — no domain bucketing, no human-defined groupings.
+    for event_type in MIST_CLIENT_EVENT_TYPES:
+        vec[event_type] = type_counts.get(event_type, 0) / total
 
     # Timing features
     timestamps = sorted(e.get("timestamp", 0) for e in mac_events)
@@ -211,8 +114,15 @@ def build_mac_feature_vector(mac_events: list[dict]) -> dict[str, float]:
     vec["median_inter_event_seconds"] = median_gap
     vec["inter_event_cv"] = cv
 
-    # RSSI / SNR features
-    vec.update(_rssi_features(mac_events))
+    # Concentration features — amplify signal for clients stuck in a single-event loop.
+    # top_event_fraction: how dominated the stream is by any one event type.
+    # top_failure_event_fraction: same, but only counting failure-class event types.
+    # Both are ratios (0–1), consistent with the volume-neutral design principle.
+    vec["top_event_fraction"] = max(vec[t] for t in MIST_CLIENT_EVENT_TYPES)
+    top_failure_count = max(
+        (type_counts.get(t, 0) for t in _FAILURE_EVENT_TYPES), default=0
+    )
+    vec["top_failure_event_fraction"] = top_failure_count / total
 
     return vec
 
@@ -368,7 +278,11 @@ async def build_features(site_id: str) -> int:
 
         # Build feature vector for each MAC
         features: dict[str, dict] = {}
+        skipped = 0
         for mac, evts in mac_events.items():
+            if len(evts) < MIN_MAC_EVENTS:
+                skipped += 1
+                continue
             vec = build_mac_feature_vector(evts)
             device_family = evts[0].get("device_family", "Unknown") if evts else "Unknown"
             features[mac] = {
@@ -380,7 +294,10 @@ async def build_features(site_id: str) -> int:
 
         key = f"sasquatch:features:{site_id}"
         await redis_client.set(key, json.dumps(features), ex=FEATURES_TTL)
-        log.info(f"Built features for {len(features)} MACs → {key}")
+        log.info(
+            f"Built features for {len(features)} MACs → {key} "
+            f"({skipped} skipped with < {MIN_MAC_EVENTS} events)"
+        )
         return len(features)
 
     finally:

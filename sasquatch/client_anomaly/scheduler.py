@@ -47,14 +47,25 @@ async def _release_lock(redis_client: aioredis.Redis, site_id: str) -> None:
         await redis_client.aclose()
 
 
+async def _get_focus_site() -> str:
+    """Return the active focus site: Redis override first, then MIST_SITE_ID env var."""
+    client = aioredis.from_url(REDIS_URL, decode_responses=True)
+    try:
+        override = await client.get("sasquatch:focus_site")
+        return override if override else SITE_ID
+    finally:
+        await client.aclose()
+
+
 async def client_refresh_job():
     """Daily job: refresh the MAC → device metadata cache from Mist API."""
-    if not SITE_ID:
-        log.error("MIST_SITE_ID not configured — skipping client refresh")
+    site_id = await _get_focus_site()
+    if not site_id:
+        log.error("No focus site configured — skipping client refresh")
         return
     try:
-        count = await refresh_client_cache(SITE_ID)
-        log.info(f"Client cache refreshed: {count} devices")
+        count = await refresh_client_cache(site_id)
+        log.info(f"Client cache refreshed for site {site_id}: {count} devices")
     except Exception:
         log.exception("client_refresh_job failed")
 
@@ -154,11 +165,12 @@ async def run_detect_only(site_id: str) -> dict:
 
 async def event_and_detect_job():
     """Scheduled wrapper — delegates to run_detection_cycle with lock protection."""
-    if not SITE_ID:
-        log.error("MIST_SITE_ID not configured — skipping detection cycle")
+    site_id = await _get_focus_site()
+    if not site_id:
+        log.error("No focus site configured — skipping detection cycle")
         return
     try:
-        await run_detection_cycle(SITE_ID)
+        await run_detection_cycle(site_id)
     except RuntimeError as exc:
         log.warning(str(exc))  # Lock contention — not an error
     except Exception:

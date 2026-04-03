@@ -18,13 +18,59 @@ const EVENT_COLOR = {
   OTHER: "#555",
 };
 
-// Domain axis pairs — each rendered as a stacked healthy/unhealthy bar.
+// Domain axis definitions — map human-readable axes to the raw event types in the feature vector.
+// The vector now stores per-event-type frequencies; we sum them here for display only.
 const DOMAIN_AXES = [
-  { key: "auth_roam", label: "Auth / Roaming" },
-  { key: "dhcp",      label: "DHCP" },
-  { key: "dns",       label: "DNS" },
-  { key: "arp",       label: "ARP" },
+  {
+    label: "Auth / Roaming",
+    healthy: [
+      "CLIENT_AUTHENTICATED", "CLIENT_AUTH_ASSOCIATION", "CLIENT_AUTH_ASSOCIATION_11R",
+      "CLIENT_AUTH_ASSOCIATION_OKC", "CLIENT_ASSOCIATION", "CLIENT_AUTH_REASSOCIATION",
+      "CLIENT_AUTH_REASSOCIATION_11R", "CLIENT_AUTH_REASSOCIATION_OKC",
+      "CLIENT_REASSOCIATION", "CLIENT_REASSOCIATION_PMKC",
+    ],
+    unhealthy: [
+      "MARVIS_EVENT_CLIENT_AUTH_FAILURE", "MARVIS_EVENT_CLIENT_AUTH_DENIED",
+      "MARVIS_EVENT_CLIENT_MAC_AUTH_FAILURE", "CLIENT_ASSOCIATION_FAILURE",
+      "MARVIS_EVENT_CLIENT_FBT_FAILURE", "MARVIS_EVENT_CLIENT_AUTH_FAILURE_OKC",
+      "MARVIS_EVENT_CLIENT_AUTH_FAILURE_11R", "MARVIS_EVENT_WLC_FT_KEY_NOT_FOUND",
+    ],
+  },
+  {
+    label: "DHCP",
+    healthy: ["CLIENT_IP_ASSIGNED", "CLIENT_IPV6_ASSIGNED"],
+    unhealthy: [
+      "MARVIS_EVENT_CLIENT_DHCP_NAK", "MARVIS_EVENT_CLIENT_DHCPV6_NAK",
+      "MARVIS_EVENT_CLIENT_DHCP_FAILURE", "MARVIS_EVENT_CLIENT_DHCPV6_FAILURE",
+      "MARVIS_EVENT_CLIENT_DHCP_STUCK", "MARVIS_EVENT_CLIENT_DHCPV6_STUCK",
+      "MARVIS_EVENT_CLIENT_FAILED_DHCP_INFORM",
+    ],
+  },
+  {
+    label: "DNS",
+    healthy: ["CLIENT_DNS_OK"],
+    unhealthy: ["MARVIS_DNS_FAILURE"],
+  },
+  {
+    label: "ARP",
+    healthy: ["CLIENT_GW_ARP_OK"],
+    unhealthy: ["CLIENT_GW_ARP_FAILURE", "CLIENT_ARP_FAILURE", "CLIENT_EXCESSIVE_ARPING_GW"],
+  },
 ];
+
+function domainRatios(events, axis) {
+  const total = events.length;
+  if (total === 0) return { healthyRatio: 0, unhealthyRatio: 0 };
+  const healthySet = new Set(axis.healthy);
+  const unhealthySet = new Set(axis.unhealthy);
+  let healthy = 0;
+  let unhealthy = 0;
+  for (const evt of events) {
+    if (healthySet.has(evt.type)) healthy++;
+    else if (unhealthySet.has(evt.type)) unhealthy++;
+  }
+  return { healthyRatio: healthy / total, unhealthyRatio: unhealthy / total };
+}
 
 function formatTs(ts) {
   return new Date(ts * 1000).toLocaleTimeString();
@@ -75,22 +121,6 @@ function DomainHealthBar({ label, healthyRatio, unhealthyRatio }) {
   );
 }
 
-function RssiBar({ label, value, min, max, isPercent }) {
-  const range = max - min;
-  const pct = range === 0 ? 0 : Math.max(0, Math.min(100, ((value - min) / range) * 100));
-  const color = value < -75 ? "#c83232" : value < -65 ? "#e0a835" : "#2d7a4f";
-  return (
-    <div style={{ display: "flex", alignItems: "center", gap: "10px", marginBottom: "7px" }}>
-      <span style={{ width: "120px", fontSize: "12px", color: "#888", textAlign: "right", flexShrink: 0 }}>{label}</span>
-      <div style={{ flex: 1, position: "relative", height: "16px", background: "#1a1a1a", borderRadius: "3px", overflow: "hidden" }}>
-        <div style={{ position: "absolute", left: 0, top: 0, height: "100%", width: `${pct}%`, background: color, borderRadius: "3px", minWidth: "2px" }} />
-      </div>
-      <span style={{ width: "150px", fontSize: "11px", color, flexShrink: 0 }}>
-        {isPercent ? `${value >= 0 ? "+" : ""}${value.toFixed(1)} dBm/hr` : `${value.toFixed(1)} dBm`}
-      </span>
-    </div>
-  );
-}
 
 export default function MacDrilldown({ siteId, mac, apiBase, onBack }) {
   const [data, setData] = useState(null);
@@ -120,9 +150,6 @@ export default function MacDrilldown({ siteId, mac, apiBase, onBack }) {
 
   const isOutlier = scores.is_outlier;
   const severityColor = isOutlier ? "#e05555" : "#2d7a4f";
-
-  const rssiMean = vector.rssi_mean ?? 0;
-  const hasRssi = rssiMean !== 0;
 
   return (
     <div>
@@ -194,30 +221,18 @@ export default function MacDrilldown({ siteId, mac, apiBase, onBack }) {
           Bars show share of total events that were healthy (green) or unhealthy (red).
           Empty bar = no activity in that domain (not a problem in itself).
         </div>
-        {DOMAIN_AXES.map(({ key, label }) => (
-          <DomainHealthBar
-            key={key}
-            label={label}
-            healthyRatio={vector[`${key}_healthy_ratio`] ?? 0}
-            unhealthyRatio={vector[`${key}_unhealthy_ratio`] ?? 0}
-          />
-        ))}
+        {DOMAIN_AXES.map((axis) => {
+          const { healthyRatio, unhealthyRatio } = domainRatios(events, axis);
+          return (
+            <DomainHealthBar
+              key={axis.label}
+              label={axis.label}
+              healthyRatio={healthyRatio}
+              unhealthyRatio={unhealthyRatio}
+            />
+          );
+        })}
 
-        {hasRssi && (
-          <>
-            <div style={{ borderTop: "1px solid #222", margin: "10px 0 10px 0" }} />
-            <div style={{ fontSize: "11px", color: "#444", marginBottom: "8px" }}>
-              Signal quality (RSSI across all events, independent of type)
-            </div>
-            <RssiBar label="Mean RSSI"   value={rssiMean}              min={-90} max={-30} />
-            <RssiBar label="10th pct"    value={vector.rssi_p10 ?? 0}  min={-90} max={-30} />
-            <RssiBar label="Std dev"     value={-(vector.rssi_std ?? 0)} min={-30} max={0} />
-            <RssiBar label="Trend"       value={vector.rssi_trend ?? 0} min={-20} max={20} isPercent />
-          </>
-        )}
-        {!hasRssi && (
-          <div style={{ color: "#444", fontSize: "12px", marginTop: "8px" }}>RSSI — no signal data in events</div>
-        )}
       </div>
 
       {/* 24hr event timeline */}
@@ -234,7 +249,6 @@ export default function MacDrilldown({ siteId, mac, apiBase, onBack }) {
                   {evt.type}
                 </span>
                 <span style={{ color: "#444", fontSize: "11px" }}>
-                  {evt.rssi ? `rssi:${evt.rssi} ` : ""}
                   {evt.ap ? `AP:${evt.ap.slice(-4)} ` : ""}
                   {evt.ssid ? `SSID:${evt.ssid} ` : ""}
                   {evt.status_code !== undefined && evt.status_code !== 0 ? `status:${evt.status_code} ` : ""}

@@ -313,6 +313,56 @@ async def get_family_if_outliers(site_id: str, family: str):
     }
 
 
+@router.get("/sites/{site_id}/families/{family}/event-counts")
+async def get_family_event_counts(site_id: str, family: str):
+    """
+    Per-MAC event category counts for all clients in a device family.
+    Used by the Family Drilldown Event Counts view.
+    """
+    raw = await _redis_get(f"sasquatch:events:{site_id}")
+    if not raw:
+        raise HTTPException(status_code=404, detail="No events found for site.")
+
+    events: list[dict] = json.loads(raw)
+    client_cache = await get_client_cache(site_id)
+
+    mac_counts: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    mac_total: dict[str, int] = defaultdict(int)
+    family_macs: set[str] = set()
+
+    for event in events:
+        if event.get("device_family") != family:
+            continue
+        mac = (event.get("mac") or "").replace(":", "").lower()
+        if not mac:
+            continue
+        category = event.get("event_category", "OTHER")
+        mac_counts[mac][category] += 1
+        mac_total[mac] += 1
+        family_macs.add(mac)
+
+    if not family_macs:
+        raise HTTPException(status_code=404, detail=f"No clients found for family '{family}'.")
+
+    clients = []
+    for mac in sorted(family_macs):
+        meta = client_cache.get(mac, {})
+        clients.append({
+            "mac": mac,
+            "random_mac": meta.get("random_mac", False),
+            "client_metadata": meta,
+            "categories": {cat: mac_counts[mac].get(cat, 0) for cat in EVENT_CATEGORIES},
+            "total_events": mac_total[mac],
+        })
+
+    return {
+        "site_id": site_id,
+        "family": family,
+        "clients": clients,
+        "category_keys": list(EVENT_CATEGORIES.keys()),
+    }
+
+
 @router.get("/sites/{site_id}/anomalies/{mac}")
 async def get_mac_anomaly(site_id: str, mac: str):
     """

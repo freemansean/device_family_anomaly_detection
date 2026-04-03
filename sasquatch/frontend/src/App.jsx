@@ -104,7 +104,10 @@ export default function App() {
       .catch(console.error);
     apiFetch(`${API_BASE}/api/v1/focus`)
       .then((r) => r.json())
-      .then(setFocusSite)
+      .then((data) => {
+        setFocusSite(data);
+        if (data?.site_id) setSelectedSite((prev) => prev ?? data.site_id);
+      })
       .catch(console.error);
   }, [token]);
 

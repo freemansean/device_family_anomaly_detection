@@ -17,7 +17,12 @@ from sklearn.cluster import DBSCAN
 from sklearn.ensemble import IsolationForest
 from sklearn.preprocessing import StandardScaler
 
-from .feature_engineer import build_posthoc_features, get_features
+from .feature_engineer import (
+    FEATURE_KEYS,
+    _FAILURE_EVENT_TYPES,
+    build_posthoc_features,
+    get_features,
+)
 
 log = logging.getLogger(__name__)
 
@@ -31,25 +36,40 @@ DBSCAN_EPS = float(os.getenv("ANOMALY_DBSCAN_EPS", "0.5"))
 DBSCAN_MIN_SAMPLES = int(os.getenv("ANOMALY_DBSCAN_MIN_SAMPLES", "5"))
 DBSCAN_MIN_FAMILY_SIZE = int(os.getenv("ANOMALY_DBSCAN_MIN_FAMILY_SIZE", "5"))
 FINDING_THRESHOLD = float(os.getenv("ANOMALY_FINDING_THRESHOLD", "0.3"))
+FAILURE_EVENT_WEIGHT = float(os.getenv("ANOMALY_FAILURE_WEIGHT", "2.0"))
+
+# Weight vector aligned to FEATURE_KEYS — failure-class dimensions are multiplied by
+# FAILURE_EVENT_WEIGHT to push failure-heavy behavior further from normal in feature
+# space. All three scoring paths (per-family IF, family-centroid IF, DBSCAN) use
+# _extract_vector_array, so weighting is applied uniformly without duplicating logic.
+# Built once at import time; length must match the feature vector from feature_engineer.
+_FEATURE_WEIGHT_VECTOR: np.ndarray = np.array([
+    FAILURE_EVENT_WEIGHT if key in _FAILURE_EVENT_TYPES else 1.0
+    for key in FEATURE_KEYS
+])
 
 
 def _severity(outlier_ratio: float) -> str:
     if outlier_ratio > 0.6:
-        return "CRITICAL"
+        return "significant"
     if outlier_ratio > 0.3:
-        return "WARNING"
-    return "INFO"
+        return "moderate"
+    return "minimal"
 
 
 def _extract_vector_array(feature_records: list[dict]) -> np.ndarray:
     """
     Convert list of feature record dicts to a numpy array.
     Each record has a 'vector' dict with consistent keys.
+    Failure-class dimensions are multiplied by _FEATURE_WEIGHT_VECTOR so they occupy
+    proportionally more space in feature space — making failure-heavy patterns appear
+    further from normal clients before StandardScaler normalization.
     """
     if not feature_records:
         return np.empty((0, 0))
     keys = list(feature_records[0]["vector"].keys())
-    return np.array([[r["vector"].get(k, 0.0) for k in keys] for r in feature_records])
+    X = np.array([[r["vector"].get(k, 0.0) for k in keys] for r in feature_records])
+    return X * _FEATURE_WEIGHT_VECTOR
 
 
 def _run_isolation_forest(
@@ -83,6 +103,46 @@ def _run_isolation_forest(
             "if_score": float(raw_scores[i]),
             "is_if_outlier": bool(labels[i] == -1),
         }
+    return results
+
+
+def _run_family_isolation_forest(
+    families: list[str], centroid_records: list[dict]
+) -> dict[str, bool]:
+    """
+    Run Isolation Forest on per-family centroid vectors (one point per family).
+    Detects families whose aggregate behavior is anomalous relative to other families
+    at the site — i.e., the whole family is collectively different, not just individuals.
+    Returns dict of family -> is_family_outlier.
+    """
+    X = _extract_vector_array(centroid_records)
+    if X.shape[0] < MIN_PEERS:
+        log.info(
+            f"Family-level IF: skipped (only {X.shape[0]} families, need {MIN_PEERS})"
+        )
+        return {family: False for family in families}
+
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+
+    clf = IsolationForest(
+        contamination=IF_CONTAMINATION,
+        random_state=42,
+        n_estimators=100,
+    )
+    labels = clf.fit_predict(X_scaled)
+    raw_scores = clf.decision_function(X_scaled)
+
+    results = {}
+    for i, family in enumerate(families):
+        is_outlier = bool(labels[i] == -1)
+        results[family] = is_outlier
+        if is_outlier:
+            log.info(
+                f"Family-level IF: [{family}] flagged as family outlier "
+                f"(score={raw_scores[i]:.4f})"
+            )
+
     return results
 
 
@@ -255,18 +315,42 @@ async def score(site_id: str) -> int:
                 f"small families (< {DBSCAN_MIN_FAMILY_SIZE} clients): {excluded_families}"
             )
 
+        # --- Stage 3: Isolation Forest on family centroids ---
+        # Detects whether a whole device family behaves anomalously relative to other
+        # families at this site. Computes the mean feature vector per family, then runs
+        # IF across those centroids. Families with < 2 MACs are excluded (no centroid).
+        centroid_families: list[str] = []
+        centroid_records: list[dict] = []
+        for family, family_macs in family_groups.items():
+            if len(family_macs) < 2:
+                continue
+            vecs = [features[m]["vector"] for m in family_macs]
+            keys = list(vecs[0].keys())
+            centroid_vec = {k: float(np.mean([v.get(k, 0.0) for v in vecs])) for k in keys}
+            centroid_families.append(family)
+            centroid_records.append({"vector": centroid_vec})
+
+        family_outlier_flags = _run_family_isolation_forest(centroid_families, centroid_records)
+        # Families not in centroid_families (singletons) are not flagged
+        flagged_families = {f for f, is_out in family_outlier_flags.items() if is_out}
+        if flagged_families:
+            log.info(f"Family-level IF: flagged families = {flagged_families}")
+
         # --- Merge per-MAC results ---
         anomalies: dict[str, dict] = {}
         for mac in features:
             is_if = if_results[mac]["is_if_outlier"]
             is_db = dbscan_results[mac]["is_dbscan_outlier"]
+            family = features[mac].get("device_family", "Unknown")
+            is_family = family in flagged_families
             anomalies[mac] = {
                 "if_score": if_results[mac]["if_score"],
                 "is_if_outlier": is_if,
                 "dbscan_label": dbscan_results[mac]["dbscan_label"],
                 "is_dbscan_outlier": is_db,
-                "is_outlier": is_if or is_db,
-                "device_family": features[mac].get("device_family", "Unknown"),
+                "is_family_outlier": is_family,
+                "is_outlier": is_if or is_db or is_family,
+                "device_family": family,
                 "event_count": features[mac].get("event_count", 0),
                 "random_mac": features[mac].get("random_mac", False),
             }
@@ -283,8 +367,8 @@ async def score(site_id: str) -> int:
             outlier_count = len(outlier_macs)
             outlier_ratio = outlier_count / total if total > 0 else 0.0
 
-            if outlier_ratio < 0.1:
-                continue  # Below INFO threshold
+            if outlier_ratio < FINDING_THRESHOLD:
+                continue  # Below minimal threshold
 
             # DBSCAN-specific rollup (used by Site Overview severity badge)
             dbscan_outlier_macs = [m for m in family_macs if anomalies[m]["is_dbscan_outlier"]]
@@ -301,14 +385,17 @@ async def score(site_id: str) -> int:
             top_features = _top_contributing_features(outlier_vecs, normal_vecs)
 
             # Post-hoc pattern classification on example outlier MACs
-            probable_pattern = "behavioral_outlier"
-            if outlier_macs:
-                # Aggregate post-hoc features across outlier MACs for pattern detection
-                sample_mac = outlier_macs[0]
-                sample_events = mac_raw_events.get(sample_mac, [])
-                posthoc = build_posthoc_features(sample_events)
-                posthoc["event_count"] = len(sample_events)
-                probable_pattern = _classify_probable_pattern(posthoc)
+            is_family_level_outlier = family in flagged_families
+            if is_family_level_outlier:
+                probable_pattern = "family_behavioral_outlier"
+            else:
+                probable_pattern = "behavioral_outlier"
+                if outlier_macs:
+                    sample_mac = outlier_macs[0]
+                    sample_events = mac_raw_events.get(sample_mac, [])
+                    posthoc = build_posthoc_features(sample_events)
+                    posthoc["event_count"] = len(sample_events)
+                    probable_pattern = _classify_probable_pattern(posthoc)
 
             finding = {
                 "device_family": family,
@@ -316,6 +403,8 @@ async def score(site_id: str) -> int:
                 "outlier_ratio": round(outlier_ratio, 4),
                 "affected_mac_count": outlier_count,
                 "total_mac_count": total,
+                # Family-level outlier — whole family behaves differently from site peers
+                "is_family_outlier": is_family_level_outlier,
                 # DBSCAN-only severity — used by Site Overview heatmap badge
                 "dbscan_severity": _severity(dbscan_outlier_ratio) if dbscan_outlier_count > 0 else None,
                 "dbscan_outlier_ratio": round(dbscan_outlier_ratio, 4),
@@ -334,7 +423,7 @@ async def score(site_id: str) -> int:
             )
 
         # Sort findings by severity then outlier_ratio
-        severity_order = {"CRITICAL": 0, "WARNING": 1, "INFO": 2}
+        severity_order = {"significant": 0, "moderate": 1, "minimal": 2}
         findings.sort(
             key=lambda f: (severity_order.get(f["severity"], 3), -f["outlier_ratio"])
         )
