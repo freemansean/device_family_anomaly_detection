@@ -25,6 +25,14 @@ REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 EVENTS_TTL = 24 * 3600  # 24 hours
 EVENT_TYPE_INDEX_TTL = 7 * 24 * 3600  # 7 days
 
+# DHCPv6 failure events are excluded from analysis — they are frequent noise on
+# dual-stack networks and do not correlate with actionable client connectivity issues.
+IGNORED_EVENT_TYPES: frozenset[str] = frozenset({
+    "MARVIS_EVENT_CLIENT_DHCPV6_NAK",
+    "MARVIS_EVENT_CLIENT_DHCPV6_FAILURE",
+    "MARVIS_EVENT_CLIENT_DHCPV6_STUCK",
+})
+
 # Known Mist client event types — used to define the ML feature vector dimensions.
 # Fetched live from /api/v1/const/client_events at startup and cached in Redis,
 # but this list serves as a safe fallback.
@@ -33,11 +41,8 @@ MIST_CLIENT_EVENT_TYPES = [
     "CLIENT_IP_ASSIGNED",
     "CLIENT_IPV6_ASSIGNED",
     "MARVIS_EVENT_CLIENT_DHCP_NAK",
-    "MARVIS_EVENT_CLIENT_DHCPV6_NAK",
     "MARVIS_EVENT_CLIENT_DHCP_FAILURE",
-    "MARVIS_EVENT_CLIENT_DHCPV6_FAILURE",
     "MARVIS_EVENT_CLIENT_DHCP_STUCK",
-    "MARVIS_EVENT_CLIENT_DHCPV6_STUCK",
     "MARVIS_EVENT_CLIENT_FAILED_DHCP_INFORM",
     # DNS
     "CLIENT_DNS_OK",
@@ -58,11 +63,13 @@ MIST_CLIENT_EVENT_TYPES = [
     "CLIENT_AUTH_REASSOCIATION_OKC",
     "CLIENT_REASSOCIATION",
     "CLIENT_REASSOCIATION_PMKC",
+    "CLIENT_ASSOCIATION_PMKC",
     # Roam / reassociation (failure)
     "MARVIS_EVENT_CLIENT_FBT_FAILURE",
     "MARVIS_EVENT_CLIENT_AUTH_FAILURE_OKC",
     "MARVIS_EVENT_CLIENT_AUTH_FAILURE_11R",
     "MARVIS_EVENT_WLC_FT_KEY_NOT_FOUND",
+    "CLIENT_REASSOCIATION_FAILURE",
     # Disassociation / deauth
     "CLIENT_DEASSOCIATION",
     "CLIENT_DEAUTHENTICATION",
@@ -95,11 +102,8 @@ EVENT_CATEGORIES: dict[str, list[str]] = {
     "DHCP_SUCCESS": ["CLIENT_IP_ASSIGNED", "CLIENT_IPV6_ASSIGNED"],
     "DHCP_FAILURE": [
         "MARVIS_EVENT_CLIENT_DHCP_NAK",
-        "MARVIS_EVENT_CLIENT_DHCPV6_NAK",
         "MARVIS_EVENT_CLIENT_DHCP_FAILURE",
-        "MARVIS_EVENT_CLIENT_DHCPV6_FAILURE",
         "MARVIS_EVENT_CLIENT_DHCP_STUCK",
-        "MARVIS_EVENT_CLIENT_DHCPV6_STUCK",
         "MARVIS_EVENT_CLIENT_FAILED_DHCP_INFORM",
     ],
     "DNS_SUCCESS": ["CLIENT_DNS_OK"],
@@ -121,12 +125,14 @@ EVENT_CATEGORIES: dict[str, list[str]] = {
         "CLIENT_AUTH_REASSOCIATION_OKC",
         "CLIENT_REASSOCIATION",
         "CLIENT_REASSOCIATION_PMKC",
+        "CLIENT_ASSOCIATION_PMKC",
     ],
     "ROAM_FAILURE": [
         "MARVIS_EVENT_CLIENT_FBT_FAILURE",
         "MARVIS_EVENT_CLIENT_AUTH_FAILURE_OKC",
         "MARVIS_EVENT_CLIENT_AUTH_FAILURE_11R",
         "MARVIS_EVENT_WLC_FT_KEY_NOT_FOUND",
+        "CLIENT_REASSOCIATION_FAILURE",
     ],
     "DISASSOC": [
         "CLIENT_DEASSOCIATION",
@@ -134,8 +140,10 @@ EVENT_CATEGORIES: dict[str, list[str]] = {
         "CLIENT_DEAUTHENTICATED",
         "MARVIS_EVENT_STA_LEAVING",
     ],
-    "ARP": [
+    "ARP_SUCCESS": [
         "CLIENT_GW_ARP_OK",
+    ],
+    "ARP_FAILURE": [
         "CLIENT_GW_ARP_FAILURE",
         "CLIENT_ARP_FAILURE",
         "CLIENT_EXCESSIVE_ARPING_GW",
@@ -224,24 +232,40 @@ async def ensure_event_type_index(redis_client) -> list[str]:
     return types
 
 
-async def fetch_all_events(site_id: str, duration: str = "1h") -> list[dict]:
+async def fetch_all_events(
+    site_id: str,
+    duration: str = "1h",
+    on_page: Optional[callable] = None,
+) -> list[dict]:
+    """
+    Fetch all client events for the given duration, paging through cursor results.
+
+    on_page: optional async callable(page: int, fetched: int, total: int | None)
+             called after each page is fetched, useful for progress tracking.
+    """
     url = (
         f"https://{MIST_CLOUD_HOST}/api/v1/sites/{site_id}/clients/events"
         f"?limit=1000&duration={duration}"
     )
-    all_events = []
+    all_events: list[dict] = []
     page = 0
+    total_hint: Optional[int] = None
     async with httpx.AsyncClient(timeout=30.0) as client:
         while url:
             resp = await client.get(url, headers=_auth_headers())
             resp.raise_for_status()
             data = resp.json()
             batch = data.get("results", [])
+            # Capture total record count from first response if the API provides it
+            if total_hint is None and "total" in data:
+                total_hint = data["total"]
             all_events.extend(batch)
             page += 1
             log.info(
                 f"Events page {page}: {len(batch)} events, total so far: {len(all_events)}"
             )
+            if on_page is not None:
+                await on_page(page, len(all_events), total_hint)
             next_path = data.get("next")
             url = f"https://{MIST_CLOUD_HOST}{next_path}" if next_path else None
     log.info(f"Event collection complete: {len(all_events)} total events")
@@ -271,12 +295,17 @@ def _enrich_event(event: dict, client_cache: dict[str, dict]) -> dict:
 
 
 def _enrich_batch(events: list[dict], client_cache: dict) -> tuple[list[dict], set[str]]:
-    """Enrich a batch of raw events. Returns (enriched_events, unknown_types)."""
+    """Enrich a batch of raw events. Returns (enriched_events, unknown_types).
+
+    Events in IGNORED_EVENT_TYPES are silently dropped before enrichment.
+    """
     known_types = set(MIST_CLIENT_EVENT_TYPES)
     unknown_types: set[str] = set()
     enriched = []
     for event in events:
         event_type = event.get("type", "")
+        if event_type in IGNORED_EVENT_TYPES:
+            continue
         if event_type and event_type not in known_types:
             unknown_types.add(event_type)
         enriched.append(_enrich_event(event, client_cache))
@@ -342,10 +371,12 @@ async def collect(site_id: str) -> int:
         await redis_client.aclose()
 
 
-async def collect_full(site_id: str) -> int:
+async def collect_full(site_id: str, on_page: Optional[callable] = None) -> int:
     """
     Full collect: pull last 24hr of events from Mist and replace the Redis
     dataset entirely. Used by manual API trigger only.
+
+    on_page: optional async callable forwarded to fetch_all_events for progress tracking.
     Returns count of events stored.
     """
     redis_client = aioredis.from_url(REDIS_URL, decode_responses=True)
@@ -357,7 +388,7 @@ async def collect_full(site_id: str) -> int:
                 "Run client_cache.refresh_client_cache() first."
             )
 
-        events = await fetch_all_events(site_id, duration="1d")
+        events = await fetch_all_events(site_id, duration="1d", on_page=on_page)
         if not events:
             log.warning(f"No events returned for site {site_id}")
             return 0

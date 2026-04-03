@@ -1,7 +1,7 @@
 """
 webhook_dispatcher.py — Evaluate findings against severity threshold and POST to webhook.
 
-Only CRITICAL findings (configurable) trigger the webhook.
+Only significant findings (configurable) trigger the webhook.
 Retry logic: 3 attempts with exponential backoff (1s, 2s, 4s).
 Never raises — webhook failure does not kill the scheduler job.
 """
@@ -19,9 +19,9 @@ from .anomaly_detector import get_findings
 log = logging.getLogger(__name__)
 
 WEBHOOK_URL = os.getenv("ANOMALY_WEBHOOK_URL", "")
-WEBHOOK_SEVERITY_THRESHOLD = os.getenv("ANOMALY_WEBHOOK_SEVERITY_THRESHOLD", "CRITICAL")
+WEBHOOK_SEVERITY_THRESHOLD = os.getenv("ANOMALY_WEBHOOK_SEVERITY_THRESHOLD", "significant")
 
-_SEVERITY_RANK = {"INFO": 0, "WARNING": 1, "CRITICAL": 2}
+_SEVERITY_RANK = {"minimal": 0, "moderate": 1, "significant": 2}
 
 
 def _meets_threshold(severity: str, threshold: str) -> bool:
