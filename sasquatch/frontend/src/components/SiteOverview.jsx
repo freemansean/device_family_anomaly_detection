@@ -6,10 +6,10 @@ import ClusterViz from "./ClusterViz";
 const CATEGORIES = [
   "DHCP_SUCCESS", "DHCP_FAILURE", "DNS_SUCCESS", "DNS_FAILURE",
   "AUTH_SUCCESS", "AUTH_FAILURE", "ROAM_SUCCESS", "ROAM_FAILURE",
-  "DISASSOC", "ARP", "CAPTIVE_PORTAL", "SECURITY", "COLLABORATION", "OTHER",
+  "DISASSOC", "ARP_SUCCESS", "ARP_FAILURE", "CAPTIVE_PORTAL", "SECURITY", "COLLABORATION", "OTHER",
 ];
 
-const SEVERITY_COLOR = { CRITICAL: "#e05555", WARNING: "#e0a835", INFO: "#4ea8c4" };
+const SEVERITY_COLOR = { significant: "#e05555", moderate: "#e0a835", minimal: "#4ea8c4" };
 
 function ratioColor(ratio) {
   // green (#2d7a4f) → yellow (#c8a820) → red (#c83232)
@@ -22,12 +22,25 @@ function ratioColor(ratio) {
   return `rgb(${Math.round(200)}, ${Math.round(168 - t * 118)}, ${Math.round(32 - t * 32)})`;
 }
 
-export default function SiteOverview({ siteId, apiBase, onMacSelect, onFamilySelect }) {
+function successColor(ratio) {
+  // near-black → bright green, saturating around 40% ratio
+  if (ratio <= 0) return "#111";
+  const t = Math.min(ratio / 0.4, 1);
+  return `rgb(${Math.round(18 + t * 12)}, ${Math.round(44 + t * 116)}, ${Math.round(18 + t * 12)})`;
+}
+
+export default function SiteOverview({ siteId, apiBase, onMacSelect, onFamilySelect, refreshToken }) {
   const [summary, setSummary] = useState(null);
   const [findings, setFindings] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [lastRefresh, setLastRefresh] = useState(null);
+
+  useEffect(() => {
+    setSummary(null);
+    setFindings([]);
+    setError(null);
+  }, [siteId]);
 
   const load = useCallback(() => {
     setLoading(true);
@@ -43,7 +56,7 @@ export default function SiteOverview({ siteId, apiBase, onMacSelect, onFamilySel
       })
       .catch((e) => setError(e.message))
       .finally(() => setLoading(false));
-  }, [siteId, apiBase]);
+  }, [siteId, apiBase, refreshToken]);
 
   useEffect(() => {
     load();
@@ -56,7 +69,25 @@ export default function SiteOverview({ siteId, apiBase, onMacSelect, onFamilySel
   if (!summary) return null;
 
   const HIDDEN_FAMILIES = new Set(["Unknown", "IoT (Unknown)"]);
-  const families = Object.keys(summary.families || {}).filter((f) => !HIDDEN_FAMILIES.has(f)).sort();
+  const MIN_DISPLAY_CLIENTS = 5;
+  const allFamilies = Object.keys(summary.families || {}).filter((f) => !HIDDEN_FAMILIES.has(f));
+  const families = allFamilies
+    .filter((f) => (summary.family_client_counts?.[f] ?? 0) >= MIN_DISPLAY_CLIENTS)
+    .sort();
+  const otherFamilies = allFamilies.filter((f) => (summary.family_client_counts?.[f] ?? 0) < MIN_DISPLAY_CLIENTS);
+
+  // Aggregate "All Other Devices" row — sum event counts across all small families
+  const otherCounts = {};
+  let otherClientCount = 0;
+  for (const f of otherFamilies) {
+    otherClientCount += summary.family_client_counts?.[f] ?? 0;
+    const familyData = summary.families[f] || {};
+    for (const cat of CATEGORIES) {
+      otherCounts[cat] = (otherCounts[cat] ?? 0) + (familyData[cat]?.count ?? 0);
+    }
+  }
+  const otherTotal = Object.values(otherCounts).reduce((s, n) => s + n, 0);
+  const showOtherRow = otherFamilies.length > 0;
 
   // Build findings map: family → finding
   const findingsByFamily = {};
@@ -81,7 +112,7 @@ export default function SiteOverview({ siteId, apiBase, onMacSelect, onFamilySel
           <thead>
             <tr>
               <th style={thStyle}>Device Family</th>
-              <th style={thStyle}>Severity</th>
+              <th style={thStyle}>Anomaly</th>
               {CATEGORIES.map((c) => (
                 <th key={c} style={{ ...thStyle, writingMode: "vertical-rl", transform: "rotate(180deg)", padding: "4px 2px", fontSize: "10px" }}>
                   {c}
@@ -94,7 +125,10 @@ export default function SiteOverview({ siteId, apiBase, onMacSelect, onFamilySel
               const familyData = summary.families[family] || {};
               const clientCount = summary.family_client_counts?.[family] ?? 0;
               const finding = findingsByFamily[family];
-              // Site Overview shows DBSCAN-only severity — IF deviations are in the family drilldown
+              // is_family_outlier = Stage 3 family centroid IF — whole family collectively
+              // behaves differently from other families at this site.
+              // dbscan_severity = fraction of individual MACs in this family that are DBSCAN outliers.
+              const isFamilyOutlier = finding?.is_family_outlier ?? false;
               const severity = finding?.dbscan_severity ?? null;
               const hasIfOutliers = (finding?.if_outlier_count ?? 0) > 0;
               const color = familyColor(family);
@@ -125,7 +159,19 @@ export default function SiteOverview({ siteId, apiBase, onMacSelect, onFamilySel
                     )}
                   </td>
                   <td style={{ ...tdStyle, textAlign: "center" }}>
-                    {severity ? (
+                    {isFamilyOutlier ? (
+                      <span style={{
+                        background: "#2a1a3a",
+                        color: "#b06ad4",
+                        border: "1px solid #6a3a8a",
+                        borderRadius: "3px",
+                        padding: "1px 6px",
+                        fontSize: "10px",
+                        fontWeight: "bold",
+                      }}>
+                        family
+                      </span>
+                    ) : severity ? (
                       <span style={{
                         background: SEVERITY_COLOR[severity] + "33",
                         color: SEVERITY_COLOR[severity],
@@ -146,14 +192,20 @@ export default function SiteOverview({ siteId, apiBase, onMacSelect, onFamilySel
                     const ratio = cell?.ratio ?? 0;
                     const count = cell?.count ?? 0;
                     const isFailure = cat.includes("FAILURE") || cat === "SECURITY";
-                    const displayRatio = isFailure ? ratio : 0;
+                    const isSuccess = cat.includes("SUCCESS");
+                    const bg = isFailure ? ratioColor(ratio)
+                      : isSuccess ? successColor(ratio)
+                      : ratio > 0 ? "#1a2d1a" : "#111";
+                    const textColor = isFailure && ratio > 0.1 ? "#fff"
+                      : isSuccess && ratio > 0.15 ? "#fff"
+                      : "#555";
                     return (
                       <td
                         key={cat}
                         title={`${family} / ${cat}: ${count} events (${(ratio * 100).toFixed(1)}%)`}
                         style={{
                           ...tdStyle,
-                          background: isFailure ? ratioColor(displayRatio) : (ratio > 0 ? "#1a2d1a" : "#111"),
+                          background: bg,
                           textAlign: "center",
                           cursor: count > 0 ? "pointer" : "default",
                           minWidth: "28px",
@@ -161,7 +213,7 @@ export default function SiteOverview({ siteId, apiBase, onMacSelect, onFamilySel
                         onClick={() => count > 0 && finding?.example_macs?.[0] && onMacSelect(finding.example_macs[0])}
                       >
                         {count > 0 && (
-                          <span style={{ fontSize: "10px", color: isFailure && ratio > 0.1 ? "#fff" : "#555" }}>
+                          <span style={{ fontSize: "10px", color: textColor }}>
                             {count > 999 ? `${(count / 1000).toFixed(1)}k` : count}
                           </span>
                         )}
@@ -171,17 +223,67 @@ export default function SiteOverview({ siteId, apiBase, onMacSelect, onFamilySel
                 </tr>
               );
             })}
+            {showOtherRow && (
+              <tr style={{ borderTop: "1px solid #2a2a2a" }}>
+                <td style={{ ...tdStyle, whiteSpace: "nowrap", color: "#555", fontStyle: "italic" }}>
+                  <span style={{
+                    display: "inline-block", width: 8, height: 8,
+                    borderRadius: "50%", background: "#444",
+                    marginRight: "6px", verticalAlign: "middle",
+                  }} />
+                  All Other Devices
+                  <span style={{ color: "#333", fontSize: "11px", marginLeft: "6px" }}>
+                    ({otherClientCount} clients, {otherFamilies.length} types)
+                  </span>
+                </td>
+                <td style={{ ...tdStyle, textAlign: "center" }}>
+                  <span style={{ color: "#333", fontSize: "10px" }}>—</span>
+                </td>
+                {CATEGORIES.map((cat) => {
+                  const count = otherCounts[cat] ?? 0;
+                  const ratio = otherTotal > 0 ? count / otherTotal : 0;
+                  const isFailure = cat.includes("FAILURE") || cat === "SECURITY";
+                  const isSuccess = cat.includes("SUCCESS");
+                  const bg = isFailure ? ratioColor(ratio)
+                    : isSuccess ? successColor(ratio)
+                    : count > 0 ? "#1a2d1a" : "#111";
+                  const textColor = isFailure && ratio > 0.1 ? "#fff"
+                    : isSuccess && ratio > 0.15 ? "#fff"
+                    : "#555";
+                  return (
+                    <td
+                      key={cat}
+                      title={`All Other Devices / ${cat}: ${count} events`}
+                      style={{
+                        ...tdStyle,
+                        background: bg,
+                        textAlign: "center",
+                        minWidth: "28px",
+                      }}
+                    >
+                      {count > 0 && (
+                        <span style={{ fontSize: "10px", color: textColor }}>
+                          {count > 999 ? `${(count / 1000).toFixed(1)}k` : count}
+                        </span>
+                      )}
+                    </td>
+                  );
+                })}
+              </tr>
+            )}
           </tbody>
         </table>
         </div>
 
         <div style={{ flex: "0 0 380px", width: "380px" }}>
-          <ClusterViz siteId={siteId} apiBase={apiBase} onMacSelect={onMacSelect} />
+          <ClusterViz siteId={siteId} apiBase={apiBase} onMacSelect={onMacSelect} refreshToken={refreshToken} />
         </div>
       </div>
 
       <div style={{ marginTop: "8px", fontSize: "11px", color: "#444" }}>
-        Severity badge reflects DBSCAN site-wide anomalies only. Click a device family name to see Isolation Forest deviations within that family.
+        <span style={{ color: "#b06ad4" }}>family</span> = whole device class behaves differently from other families at this site (family centroid IF).
+        {" "}<span style={{ color: "#e0a835" }}>moderate</span> / <span style={{ color: "#e05555" }}>significant</span> = fraction of individual MACs in that family flagged by DBSCAN.
+        {" "}Click a family name to see per-device Isolation Forest deviations.
       </div>
     </div>
   );

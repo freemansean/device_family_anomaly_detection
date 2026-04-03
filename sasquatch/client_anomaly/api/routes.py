@@ -8,19 +8,24 @@ The API is read-only except for the manual refresh POST.
 import json
 import logging
 import os
+import time as _time
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
+from typing import Optional
 
+import httpx
 import numpy as np
 import redis.asyncio as aioredis
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 
-from ..anomaly_detector import get_anomalies, get_findings
+from ..anomaly_detector import get_anomalies, get_findings, score
 from ..client_cache import get_client_cache, refresh_client_cache
-from ..event_collector import EVENT_CATEGORIES
+from ..event_collector import EVENT_CATEGORIES, collect_full
+from ..feature_engineer import build_features
 from ..scheduler import run_collect_only, run_detect_only, run_detection_cycle
+from ..webhook_dispatcher import evaluate_and_dispatch
 from .auth import require_auth
 
 log = logging.getLogger(__name__)
@@ -30,6 +35,9 @@ router = APIRouter(prefix="/api/v1")
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 SITE_ID = os.getenv("MIST_SITE_ID", "")
 DETECTION_INTERVAL_MINUTES = int(os.getenv("DETECTION_INTERVAL_MINUTES", "15"))
+MIST_API_TOKEN = os.getenv("MIST_API_TOKEN", "")
+MIST_CLOUD_HOST = os.getenv("MIST_CLOUD_HOST", "api.mist.com")
+MIST_ORG_ID = os.getenv("MIST_ORG_ID", "")
 
 
 def _configured_sites() -> list[str]:
@@ -46,10 +54,144 @@ async def _redis_get(key: str):
         await client.aclose()
 
 
+async def _detection_background_task(site_id: str) -> None:
+    """
+    Full 24hr detection pipeline run as a FastAPI background task.
+    Writes phase-by-phase progress to Redis key sasquatch:progress:{site_id}.
+    Manages its own lock so it cannot overlap with the scheduler.
+    """
+    lock_key = f"sasquatch:lock:detection:{site_id}"
+    progress_key = f"sasquatch:progress:{site_id}"
+    started = _time.time()
+
+    redis_client = aioredis.from_url(REDIS_URL, decode_responses=True)
+
+    async def wp(data: dict) -> None:
+        data["started_at"] = started
+        await redis_client.set(progress_key, json.dumps(data), ex=300)
+
+    acquired = await redis_client.set(lock_key, "1", nx=True, ex=45 * 60)
+    if not acquired:
+        await wp({"phase": "error", "message": "Another detection cycle is already running"})
+        await redis_client.aclose()
+        return
+
+    try:
+        await wp({"phase": "starting", "events_fetched": 0, "total_estimated": None, "pages": 0})
+
+        # Ensure client cache exists before pulling events; refresh if missing.
+        client_cache = await get_client_cache(site_id)
+        if not client_cache:
+            log.info(f"Client cache missing for site {site_id} — refreshing before full run")
+            await refresh_client_cache(site_id)
+
+        async def on_page(page: int, fetched: int, total: Optional[int]) -> None:
+            await wp({
+                "phase": "collecting",
+                "events_fetched": fetched,
+                "total_estimated": total,
+                "pages": page,
+            })
+
+        event_count = await collect_full(site_id, on_page=on_page)
+
+        await wp({"phase": "scoring", "events_fetched": event_count, "total_estimated": event_count, "pages": -1})
+
+        mac_count = await build_features(site_id)
+        scored = await score(site_id)
+
+        try:
+            await evaluate_and_dispatch(site_id)
+        except Exception:
+            log.exception(f"Webhook dispatch failed for site {site_id} (non-fatal)")
+
+        await wp({
+            "phase": "complete",
+            "events_fetched": event_count,
+            "total_estimated": event_count,
+            "pages": -1,
+            "macs_scored": scored,
+        })
+
+    except Exception as exc:
+        log.exception(f"Background detection failed for site {site_id}")
+        await wp({"phase": "error", "message": str(exc)})
+    finally:
+        await redis_client.delete(lock_key)
+        await redis_client.aclose()
+
+
+@router.get("/focus")
+async def get_focus():
+    """Return the site the scheduler is currently targeting (Redis override or env fallback)."""
+    client = aioredis.from_url(REDIS_URL, decode_responses=True)
+    try:
+        override = await client.get("sasquatch:focus_site")
+    finally:
+        await client.aclose()
+    return {
+        "site_id": override if override else SITE_ID,
+        "source": "override" if override else "env",
+    }
+
+
+@router.post("/focus")
+async def set_focus(body: dict):
+    """Redirect the scheduler to poll a different site (stored in Redis)."""
+    site_id = (body.get("site_id") or "").strip()
+    if not site_id:
+        raise HTTPException(status_code=400, detail="site_id is required")
+    client = aioredis.from_url(REDIS_URL, decode_responses=True)
+    try:
+        await client.set("sasquatch:focus_site", site_id)
+    finally:
+        await client.aclose()
+    log.info(f"Scheduler focus updated to site {site_id}")
+    return {"site_id": site_id, "source": "override"}
+
+
+@router.get("/sites/{site_id}/progress")
+async def get_site_progress(site_id: str):
+    """Return the latest detection cycle progress for a site (written by the background task)."""
+    raw = await _redis_get(f"sasquatch:progress:{site_id}")
+    if not raw:
+        return {"phase": "idle"}
+    return json.loads(raw)
+
+
 @router.get("/sites")
 async def list_sites():
     """List all configured site IDs."""
     return {"sites": _configured_sites()}
+
+
+@router.get("/org/sites")
+async def list_org_sites():
+    """Fetch all sites in the configured org from the Mist API."""
+    if not MIST_ORG_ID:
+        raise HTTPException(status_code=500, detail="MIST_ORG_ID not configured.")
+    if not MIST_API_TOKEN:
+        raise HTTPException(status_code=500, detail="MIST_API_TOKEN not configured.")
+
+    url = f"https://{MIST_CLOUD_HOST}/api/v1/orgs/{MIST_ORG_ID}/sites"
+    headers = {"Authorization": f"Token {MIST_API_TOKEN}"}
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        try:
+            resp = await client.get(url, headers=headers)
+            resp.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            log.error(f"Mist API error fetching org sites: {exc.response.status_code}")
+            raise HTTPException(status_code=502, detail=f"Mist API returned {exc.response.status_code}")
+        except httpx.RequestError as exc:
+            log.error(f"Network error fetching org sites: {exc}")
+            raise HTTPException(status_code=502, detail="Could not reach Mist API")
+
+    raw = resp.json()
+    # Mist returns a list of site objects directly
+    sites = [{"id": s["id"], "name": s.get("name", s["id"])} for s in raw if "id" in s]
+    sites.sort(key=lambda s: s["name"].lower())
+    return {"sites": sites}
 
 
 @router.get("/sites/{site_id}/findings")
@@ -144,28 +286,30 @@ async def get_family_if_outliers(site_id: str, family: str):
     if not family_macs:
         raise HTTPException(status_code=404, detail=f"No clients found for family '{family}'.")
 
-    if_outliers = [
+    all_clients = [
         {
             "mac": mac,
             "if_score": anomalies[mac].get("if_score"),
+            "is_if_outlier": anomalies[mac].get("is_if_outlier", False),
             "is_dbscan_outlier": anomalies[mac].get("is_dbscan_outlier", False),
             "event_count": anomalies[mac].get("event_count", 0),
             "random_mac": anomalies[mac].get("random_mac", False),
             "client_metadata": client_cache.get(mac, {}),
         }
         for mac in family_macs
-        if anomalies[mac].get("is_if_outlier")
     ]
 
-    # Sort by IF score ascending — most anomalous (most negative) first
-    if_outliers.sort(key=lambda x: (x["if_score"] is None, x["if_score"] or 0))
+    # Sort by IF score ascending — most anomalous (most negative) first, None last
+    all_clients.sort(key=lambda x: (x["if_score"] is None, x["if_score"] or 0))
+
+    if_outlier_count = sum(1 for c in all_clients if c["is_if_outlier"])
 
     return {
         "site_id": site_id,
         "family": family,
         "total_family_count": len(family_macs),
-        "if_outlier_count": len(if_outliers),
-        "outliers": if_outliers,
+        "if_outlier_count": if_outlier_count,
+        "outliers": all_clients,
     }
 
 
@@ -253,28 +397,36 @@ async def flush_site_redis(site_id: str):
 
 
 @router.post("/sites/{site_id}/run")
-async def trigger_full_detection_run(site_id: str):
+async def trigger_full_detection_run(site_id: str, background_tasks: BackgroundTasks):
     """
-    Pull 24hr events, build features, score anomalies, and populate findings.
-    Runs the full detection pipeline — same steps as the scheduler job.
+    Start the full 24hr detection pipeline as a background task.
+    Returns immediately with status "started". Poll GET /progress for live updates.
     Returns 409 if a cycle is already in progress.
     """
+    client = aioredis.from_url(REDIS_URL, decode_responses=True)
     try:
-        summary = await run_detection_cycle(site_id, full_refresh=True)
-    except RuntimeError as exc:
-        raise HTTPException(status_code=409, detail=str(exc))
-    except Exception as exc:
-        log.exception(f"Detection cycle failed for site {site_id}")
-        raise HTTPException(status_code=500, detail=str(exc))
+        locked = await client.exists(f"sasquatch:lock:detection:{site_id}")
+    finally:
+        await client.aclose()
 
-    findings = await get_findings(site_id)
+    if locked:
+        raise HTTPException(status_code=409, detail="Detection cycle already running for this site")
+
+    background_tasks.add_task(_detection_background_task, site_id)
+    return {"status": "started", "site_id": site_id, "timestamp": datetime.now(timezone.utc).isoformat()}
+
+
+@router.post("/sites/{site_id}/unlock")
+async def unlock_detection(site_id: str):
+    """Force-release the detection lock for a site. Use when a run was interrupted and left the lock stuck."""
+    client = aioredis.from_url(REDIS_URL, decode_responses=True)
+    try:
+        deleted = await client.delete(f"sasquatch:lock:detection:{site_id}")
+    finally:
+        await client.aclose()
     return {
         "site_id": site_id,
-        "status": "ok",
-        "events_collected": summary["events"],
-        "macs_with_features": summary["macs_with_features"],
-        "macs_scored": summary["macs_scored"],
-        "findings_generated": len(findings),
+        "status": "ok" if deleted else "no_lock",
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
