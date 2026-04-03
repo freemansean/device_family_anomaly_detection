@@ -24,7 +24,7 @@ function scaleCoords(points) {
   }));
 }
 
-export default function ClusterViz({ siteId, apiBase, onMacSelect }) {
+export default function ClusterViz({ siteId, apiBase, onMacSelect, refreshToken }) {
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
@@ -39,7 +39,7 @@ export default function ClusterViz({ siteId, apiBase, onMacSelect }) {
       .then((d) => { setData(d); setError(null); })
       .catch((e) => setError(e.message))
       .finally(() => setLoading(false));
-  }, [siteId, apiBase]);
+  }, [siteId, apiBase, refreshToken]);
 
   useEffect(() => {
     load();
@@ -58,7 +58,19 @@ export default function ClusterViz({ siteId, apiBase, onMacSelect }) {
   );
 
   const HIDDEN_FAMILIES = new Set(["Unknown", "IoT (Unknown)"]);
-  const scaled = scaleCoords(data.points.filter((p) => !HIDDEN_FAMILIES.has(p.device_family)));
+  const MIN_DISPLAY_CLIENTS = 5;
+  // Count MACs per family to match the SiteOverview threshold
+  const familyPointCounts = {};
+  for (const p of data.points) {
+    if (!HIDDEN_FAMILIES.has(p.device_family)) {
+      familyPointCounts[p.device_family] = (familyPointCounts[p.device_family] ?? 0) + 1;
+    }
+  }
+  const scaled = scaleCoords(
+    data.points.filter(
+      (p) => !HIDDEN_FAMILIES.has(p.device_family) && (familyPointCounts[p.device_family] ?? 0) >= MIN_DISPLAY_CLIENTS
+    )
+  );
 
   // Unique families sorted for legend
   const families = [...new Set(scaled.map((p) => p.device_family))].sort();
