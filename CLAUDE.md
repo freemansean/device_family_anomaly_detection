@@ -68,6 +68,13 @@ Match existing patterns in the codebase where they exist.
 
 ---
 
+## Known Issues & Backlog
+
+See [TODO.md](TODO.md) for tracked issues, improvement notes, and technical debt.
+Update it when you identify new problems or resolve existing ones.
+
+---
+
 ## Project Structure
 
 ```
@@ -105,8 +112,10 @@ sasquatch/
 
 | Key | TTL | Contents |
 |---|---|---|
-| `sasquatch:clients:{site_id}` | 25hr | JSON dict: MAC → {model, os, manufacturer, family} |
-| `sasquatch:events:{site_id}` | 24hr | JSON array: enriched event objects |
+| `sasquatch:clients:{site_id}` | 7 days | JSON dict: MAC → {model, os, manufacturer, family} |
+| `sasquatch:events:{site_id}` | 7 days | Sorted set: enriched event objects scored by Unix timestamp |
+| `sasquatch:wlans:{site_id}` | 7 days | Set: unique SSID names seen for this site |
+| `sasquatch:event_type_index` | 7 days | JSON array: ordered list of known Mist client event type strings |
 | `sasquatch:features:{site_id}:{wlan_key}` | 24hr | JSON dict: MAC → feature vector dict |
 | `sasquatch:anomalies:{site_id}:{wlan_key}` | 24hr | JSON dict: MAC → {if_score, dbscan_label, is_outlier, is_family_outlier, …} |
 | `sasquatch:health:{site_id}:{wlan_key}` | 24hr | JSON dict: family → {health_score, components, total_events, mac_count} |
@@ -114,8 +123,9 @@ sasquatch/
 | `sasquatch:org_anomalies:{site_id}:{wlan_key}` | 24hr | JSON dict: per-MAC org-wide scores (written by `score_org_wide`) |
 | `sasquatch:org_findings:{wlan_key}` | 24hr | JSON array: org-wide findings (one entry per device family across all sites) |
 
-**TTL note:** Client cache is 25hr (not 24hr) to provide a buffer so the daily refresh
-job can run before the key expires. All other keys are 24hr.
+**TTL note:** Client cache and events are both 7 days — the cache survives across the full
+event retention window, so a cache miss on a historical event is not possible due to TTL
+expiry. Detection/scoring output keys (features, anomalies, health, findings) are 24hr.
 
 **Startup behavior:** If `sasquatch:clients:{site_id}` is missing at startup, the event
 collector must fail fast with a clear error — do NOT silently make a redundant client

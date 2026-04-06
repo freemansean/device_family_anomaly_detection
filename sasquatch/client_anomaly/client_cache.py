@@ -18,7 +18,7 @@ MIST_CLOUD_HOST = os.getenv("MIST_CLOUD_HOST", "api.mist.com")
 MIST_API_TOKEN = os.getenv("MIST_API_TOKEN", "")
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 
-CLIENT_CACHE_TTL = 25 * 3600  # 25 hours
+CLIENT_CACHE_TTL = 7 * 24 * 3600  # 7 days — matches event retention window
 
 
 def _auth_headers() -> dict:

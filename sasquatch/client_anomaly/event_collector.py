@@ -10,6 +10,11 @@ WLAN enumeration without scanning event data.
 
 Scheduled runs fetch only the last hour and append to the rolling dataset.
 A full 24hr backfill is only performed when explicitly requested via the API.
+
+Miss-threshold refresh: if an incremental collect() batch contains more than
+CACHE_MISS_REFRESH_THRESHOLD distinct MACs absent from the client cache, the cache is
+refreshed from the Mist API and the batch is re-enriched before writing to Redis. This
+catches new devices that joined after the last midnight refresh.
 """
 
 import json
@@ -22,7 +27,8 @@ from typing import Optional
 import httpx
 import redis.asyncio as aioredis
 
-from .client_cache import get_client_cache
+from .client_cache import get_client_cache, refresh_client_cache
+from .oui_lookup import lookup as oui_lookup
 
 log = logging.getLogger(__name__)
 
@@ -33,6 +39,11 @@ REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 # Events are kept for 7 days in the global sorted set.
 EVENTS_TTL = 7 * 24 * 3600
 EVENT_TYPE_INDEX_TTL = 7 * 24 * 3600  # 7 days
+
+# If an incremental collect() batch contains this many distinct cache-miss MACs,
+# the client cache is refreshed from the Mist API and the batch re-enriched.
+# Covers devices that joined after the last midnight refresh.
+CACHE_MISS_REFRESH_THRESHOLD = int(os.getenv("CACHE_MISS_REFRESH_THRESHOLD", "10"))
 
 # DHCPv6 failure events are excluded from analysis — they are frequent noise on
 # dual-stack networks and do not correlate with actionable client connectivity issues.
@@ -192,11 +203,8 @@ def _auth_headers() -> dict:
 
 
 def _oui_lookup(mac: str) -> str:
-    """
-    Stub OUI lookup — returns first 3 octets as manufacturer hint.
-    A real implementation would query a local OUI database.
-    """
-    return mac[:6].upper() if len(mac) >= 6 else "Unknown"
+    """Resolve MAC OUI to manufacturer name via the local IEEE registry."""
+    return oui_lookup(mac)
 
 
 def sanitize_wlan_key(wlan: str) -> str:
@@ -315,20 +323,89 @@ def _enrich_event(event: dict, client_cache: dict[str, dict]) -> dict:
         enriched["device_model"] = client_meta.get("model", "Unknown")
         enriched["device_manufacturer"] = client_meta.get("manufacturer", "Unknown")
     else:
-        enriched["device_family"] = "Unknown"
+        mfg = _oui_lookup(mac)
+        enriched["device_manufacturer"] = mfg
         enriched["device_model"] = "Unknown"
-        enriched["device_manufacturer"] = _oui_lookup(mac)
+        # Sub-group cache-miss MACs by OUI manufacturer so they are scored against
+        # like-with-like peers rather than collapsed into a single "Unknown" bucket.
+        # Strip everything from the first comma onward (drops ", Inc.", ", Ltd.", etc.)
+        # and cap at 24 chars so peer-group keys stay readable.
+        if mfg != "Unknown":
+            # Drop everything from the first comma ("Nokia ..., Ltd." → "Nokia ...").
+            # Then truncate at the last word boundary within 24 chars so the key
+            # doesn't end mid-word (e.g. "Extreme Networks" not "Extreme Network").
+            base = mfg.split(",")[0].strip()
+            if len(base) > 24:
+                base = base[:24].rsplit(" ", 1)[0]
+            enriched["device_family"] = f"Unknown/{base}"
+        else:
+            enriched["device_family"] = "Unknown"
 
     return enriched
 
 
-def _enrich_batch(events: list[dict], client_cache: dict) -> tuple[list[dict], set[str]]:
-    """Enrich a batch of raw events. Returns (enriched_events, unknown_types).
+def _dedup_events(events: list[dict]) -> list[dict]:
+    """Collapse Mist API variant duplicates and strip volatile fields.
+
+    Mist returns MARVIS_EVENT_CLIENT_AUTH_FAILURE (and potentially other MARVIS
+    events) in up to 3 variants per logical event, all at the same timestamp:
+      - one with has_pcap=False + pcap_url
+      - one with no has_pcap / no pcap_url
+      - one with has_pcap=True + pcap_url
+
+    The pcap_url field is a short-lived JWT (~2hr expiry). Re-fetching the same
+    event on a subsequent collect() cycle produces a new JWT → a new JSON member
+    string → a new sorted-set entry, multiplying events on every 15-minute cycle.
+
+    Fix: strip pcap_url before deduplication (and storage), then collapse variants
+    sharing the same (mac, type, timestamp, bssid) to a single representative,
+    preferring the has_pcap=True variant for maximum information value.
+    """
+    seen: dict[tuple, int] = {}  # dedup key → index into result
+    result: list[dict] = []
+
+    for event in events:
+        # Strip pcap_url — short-lived JWT, useless after ~2hr and causes
+        # dedup failures when the JWT rotates across collect() cycles.
+        e = {k: v for k, v in event.items() if k != "pcap_url"}
+
+        key = (
+            (e.get("mac") or "").replace(":", "").lower(),
+            e.get("type", ""),
+            e.get("timestamp", 0),
+            e.get("bssid", ""),
+        )
+
+        if key not in seen:
+            seen[key] = len(result)
+            result.append(e)
+        elif e.get("has_pcap") is True and not result[seen[key]].get("has_pcap"):
+            # Upgrade to the has_pcap=True variant — it's the most informative
+            result[seen[key]] = e
+
+    return result
+
+
+def _enrich_batch(
+    events: list[dict], client_cache: dict
+) -> tuple[list[dict], set[str], set[str]]:
+    """Enrich a batch of raw events.
+
+    Returns (enriched_events, unknown_types, cache_miss_macs).
+
+    unknown_types: event type strings not in the known list.
+    cache_miss_macs: distinct MAC addresses absent from client_cache (excluding
+        MACs that are empty strings). Used by collect() to decide whether to
+        trigger a cache refresh for newly joined devices.
 
     Events in IGNORED_EVENT_TYPES are silently dropped before enrichment.
+    Mist API variant duplicates (has_pcap variants, pcap_url JWT rotation) are
+    collapsed by _dedup_events before enrichment.
     """
+    events = _dedup_events(events)
     known_types = set(MIST_CLIENT_EVENT_TYPES)
     unknown_types: set[str] = set()
+    cache_miss_macs: set[str] = set()
     enriched = []
     for event in events:
         event_type = event.get("type", "")
@@ -336,8 +413,11 @@ def _enrich_batch(events: list[dict], client_cache: dict) -> tuple[list[dict], s
             continue
         if event_type and event_type not in known_types:
             unknown_types.add(event_type)
+        mac = (event.get("mac") or "").replace(":", "").lower()
+        if mac and mac not in client_cache:
+            cache_miss_macs.add(mac)
         enriched.append(_enrich_event(event, client_cache))
-    return enriched, unknown_types
+    return enriched, unknown_types, cache_miss_macs
 
 
 async def _write_events_to_site_set(
@@ -433,6 +513,66 @@ async def _load_events_from_site_sets(
     return events
 
 
+async def reenrich_stale_events(site_id: str, client_cache: dict[str, dict]) -> int:
+    """
+    Re-enrich stored events whose device_family is "Unknown" (or "Unknown/...") where
+    the MAC is now present in client_cache. Intended to be called after a cache refresh
+    so that historical events gain correct family labels rather than staying Unknown.
+
+    Atomically replaces each stale sorted-set member with its freshly enriched version
+    at the same timestamp score (ZREM + ZADD in a single pipeline). Members whose
+    re-enriched JSON is identical to the stored version are skipped.
+
+    Returns the count of events re-enriched.
+    """
+    if not client_cache:
+        return 0
+
+    redis_client = aioredis.from_url(REDIS_URL, decode_responses=True)
+    try:
+        events_key = f"sasquatch:events:{site_id}"
+        cutoff = time.time() - EVENTS_TTL
+
+        key_type = await redis_client.type(events_key)
+        if key_type != "zset":
+            return 0
+
+        raw_with_scores = await redis_client.zrangebyscore(
+            events_key, cutoff, "+inf", withscores=True
+        )
+
+        replacements: list[tuple[str, str, float]] = []
+        for member, score in raw_with_scores:
+            event = json.loads(member)
+            family = event.get("device_family", "")
+            if not family.startswith("Unknown"):
+                continue
+            mac = (event.get("mac") or "").replace(":", "").lower()
+            if mac not in client_cache:
+                continue
+            new_event = _enrich_event(event, client_cache)
+            new_member = json.dumps(new_event, sort_keys=True)
+            if new_member == member:
+                continue  # no change — family already matched
+            replacements.append((member, new_member, score))
+
+        if not replacements:
+            log.info(f"No stale events to re-enrich for site {site_id}")
+            return 0
+
+        pipe = redis_client.pipeline()
+        for old_member, new_member, score in replacements:
+            pipe.zrem(events_key, old_member)
+            pipe.zadd(events_key, {new_member: score})
+        await pipe.execute()
+
+        log.info(f"Re-enriched {len(replacements)} stale events for site {site_id}")
+        return len(replacements)
+
+    finally:
+        await redis_client.aclose()
+
+
 async def collect(site_id: str) -> int:
     """
     Incremental collect: pull last 1hr of events from Mist and append to the global
@@ -453,7 +593,17 @@ async def collect(site_id: str) -> int:
             log.info(f"No new events in last 1hr for site {site_id}")
             return 0
 
-        new_enriched, unknown_types = _enrich_batch(new_raw, client_cache)
+        new_enriched, unknown_types, miss_macs = _enrich_batch(new_raw, client_cache)
+
+        if len(miss_macs) >= CACHE_MISS_REFRESH_THRESHOLD:
+            log.info(
+                f"{len(miss_macs)} cache-miss MACs in batch for site {site_id} "
+                f"(threshold={CACHE_MISS_REFRESH_THRESHOLD}) — refreshing client cache"
+            )
+            await refresh_client_cache(site_id)
+            client_cache = await get_client_cache(site_id)
+            new_enriched, unknown_types, _ = _enrich_batch(new_raw, client_cache)
+            await reenrich_stale_events(site_id, client_cache)
 
         if unknown_types:
             await redis_client.sadd(f"sasquatch:unknown_event_types:{site_id}", *unknown_types)
@@ -494,7 +644,7 @@ async def collect_full(site_id: str, on_page: Optional[callable] = None) -> int:
             log.warning(f"No events returned for site {site_id}")
             return 0
 
-        enriched, unknown_types = _enrich_batch(events, client_cache)
+        enriched, unknown_types, _ = _enrich_batch(events, client_cache)
 
         if unknown_types:
             await redis_client.sadd(f"sasquatch:unknown_event_types:{site_id}", *unknown_types)
