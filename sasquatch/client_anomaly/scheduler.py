@@ -19,7 +19,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from .anomaly_detector import score, score_org_wide
 from .client_cache import get_client_cache, refresh_client_cache
-from .event_collector import collect, collect_full, get_wlans
+from .event_collector import collect, collect_full, get_wlans, reenrich_stale_events
 from .feature_engineer import build_features, get_features
 from .health_scorer import score_health
 from .webhook_dispatcher import evaluate_and_dispatch
@@ -163,12 +163,20 @@ async def client_refresh_job():
             try:
                 count = await refresh_client_cache(sid)
                 log.info(f"Client cache refreshed for site {sid}: {count} devices")
+                cache = await get_client_cache(sid)
+                reenriched = await reenrich_stale_events(sid, cache)
+                if reenriched:
+                    log.info(f"Re-enriched {reenriched} stale events for site {sid}")
             except Exception:
                 log.exception(f"client_refresh_job failed for site {sid}")
         return
     try:
         count = await refresh_client_cache(site_id)
         log.info(f"Client cache refreshed for site {site_id}: {count} devices")
+        cache = await get_client_cache(site_id)
+        reenriched = await reenrich_stale_events(site_id, cache)
+        if reenriched:
+            log.info(f"Re-enriched {reenriched} stale events for site {site_id}")
     except Exception:
         log.exception("client_refresh_job failed")
 
