@@ -519,6 +519,43 @@ async def flush_org_redis():
     }
 
 
+@router.post("/org/refresh")
+async def trigger_org_client_refresh():
+    """
+    Manually trigger a client cache refresh from the Mist API for every site in the org.
+    Runs serially per site (same as the per-site /refresh endpoint).
+    """
+    if not MIST_ORG_ID or not MIST_API_TOKEN:
+        raise HTTPException(status_code=500, detail="MIST_ORG_ID or MIST_API_TOKEN not configured.")
+
+    redis_client = _get_redis()
+    try:
+        site_ids = await _get_org_site_ids(redis_client)
+    except Exception:
+        raise HTTPException(status_code=502, detail="Could not reach Mist API")
+    finally:
+        await redis_client.aclose()
+
+    results = []
+    total_cached = 0
+    for sid in site_ids:
+        try:
+            count = await refresh_client_cache(sid)
+            total_cached += count
+            results.append({"site_id": sid, "status": "ok", "clients_cached": count})
+        except Exception as exc:
+            log.exception(f"Org client refresh failed for site {sid}")
+            results.append({"site_id": sid, "status": "error", "detail": str(exc)})
+
+    return {
+        "status": "ok",
+        "site_count": len(site_ids),
+        "total_clients_cached": total_cached,
+        "results": results,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
 _ORG_SITES_CACHE_KEY = "sasquatch:org_sites_map"
 _ORG_SITES_CACHE_TTL = 300  # 5 minutes
 
