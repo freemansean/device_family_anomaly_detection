@@ -3,20 +3,44 @@ import { apiFetch } from "../api";
 import OrgClusterViz from "./OrgClusterViz";
 import OrgFamilyInsights from "./OrgFamilyInsights";
 import OrgFindingsFeed from "./OrgFindingsFeed";
+import OrgAlerts from "./OrgAlerts";
 
+// Site card border reflects the dual-gate alert state, not raw anomaly severity
 const SEVERITY_BORDER = {
-  significant: "#3a2020",
-  moderate:    "#3a2f10",
-  ok:          "#1a3a2a",
-  none:        "#2a2a2a",
+  alert:     "#3a2020",  // dark red — anomalous + unhealthy
+  anomalous: "#1a3a20",  // dark green — anomalies only, no health issue
+  ok:        "#1a2a1a",  // very dark green — healthy, no anomalies
+  none:      "#2a2a2a",  // dark gray — no data
 };
 
-function SiteCard({ site, onClick }) {
-  const { site_name, site_id, has_data, critical_count, warning_count, info_count, event_count } = site;
+// Anomaly severity colors — green spectrum (anomalies alone are not alerts)
+const ANOMALY_COLOR = { significant: "#39e84e", moderate: "#2eb845", minimal: "#1a6b27" };
+const ANOMALY_BG    = { significant: "#0d2a15", moderate: "#0b2210", minimal: "#09180a" };
 
-  const severity = !has_data ? "none" : critical_count > 0 ? "significant" : warning_count > 0 ? "moderate" : "ok";
-  const statusColor = { none: "#555", significant: "#e05555", moderate: "#e0a835", ok: "#2d7a4f" }[severity];
-  const statusText  = { none: "No data", significant: "Significant", moderate: "Moderate", ok: "OK" }[severity];
+function SiteCard({ site, onClick }) {
+  const { site_name, site_id, has_data, alert_count = 0, critical_count, warning_count, info_count, event_count } = site;
+
+  const severity = !has_data
+    ? "none"
+    : alert_count > 0
+    ? "alert"
+    : (critical_count > 0 || warning_count > 0 || info_count > 0)
+    ? "anomalous"
+    : "ok";
+
+  const statusColor = {
+    none:      "#555",
+    alert:     "#e05555",
+    anomalous: "#39e84e",
+    ok:        "#2d7a4f",
+  }[severity];
+
+  const statusText = {
+    none:      "No data",
+    alert:     "Alert",
+    anomalous: "Anomalous",
+    ok:        "OK",
+  }[severity];
 
   const [hovered, setHovered] = useState(false);
 
@@ -46,18 +70,23 @@ function SiteCard({ site, onClick }) {
 
       {has_data ? (
         <div style={{ display: "flex", gap: "5px", flexWrap: "wrap", alignItems: "center" }}>
-          {critical_count > 0 && (
+          {alert_count > 0 && (
             <span style={{ background: "#2a1515", color: "#e05555", padding: "1px 6px", borderRadius: "3px", fontSize: "10px" }}>
+              {alert_count} ALERT
+            </span>
+          )}
+          {critical_count > 0 && (
+            <span style={{ background: ANOMALY_BG.significant, color: ANOMALY_COLOR.significant, padding: "1px 6px", borderRadius: "3px", fontSize: "10px" }}>
               {critical_count} SIGNIFICANT
             </span>
           )}
           {warning_count > 0 && (
-            <span style={{ background: "#2a1f10", color: "#e0a835", padding: "1px 6px", borderRadius: "3px", fontSize: "10px" }}>
+            <span style={{ background: ANOMALY_BG.moderate, color: ANOMALY_COLOR.moderate, padding: "1px 6px", borderRadius: "3px", fontSize: "10px" }}>
               {warning_count} MODERATE
             </span>
           )}
           {info_count > 0 && (
-            <span style={{ background: "#1a2a3a", color: "#7ec8e3", padding: "1px 6px", borderRadius: "3px", fontSize: "10px" }}>
+            <span style={{ background: ANOMALY_BG.minimal, color: ANOMALY_COLOR.minimal, padding: "1px 6px", borderRadius: "3px", fontSize: "10px" }}>
               {info_count} MINIMAL
             </span>
           )}
@@ -79,7 +108,7 @@ export default function OrgOverview({ apiBase, onSiteSelect, onMacSiteSelect, re
   const [summary, setSummary]       = useState(null);
   const [loading, setLoading]       = useState(true);
   const [error, setError]           = useState(null);
-  const [activeView, setActiveView] = useState("overview");
+  const [activeView, setActiveView] = useState("alerts");
 
   useEffect(() => {
     setLoading(true);
@@ -91,18 +120,24 @@ export default function OrgOverview({ apiBase, onSiteSelect, onMacSiteSelect, re
       .finally(() => { setLoading(false); onLoaded?.(); });
   }, [apiBase, refreshToken, wlan]);
 
-  const sites = summary?.sites || [];
+  const sites             = (summary?.sites || []).slice().sort((a, b) => (b.event_count || 0) - (a.event_count || 0));
   const sitesWithData     = sites.filter(s => s.has_data).length;
-  const totalSignificant  = sites.reduce((n, s) => n + (s.critical_count || 0), 0);
-  const totalModerate     = sites.reduce((n, s) => n + (s.warning_count  || 0), 0);
+  const orgAlertCount     = summary?.org_alert_count ?? 0;
+  const orgSignificant    = summary?.org_significant_count ?? 0;
+  const orgModerate       = summary?.org_moderate_count ?? 0;
+  const orgMinimal        = summary?.org_minimal_count ?? 0;
+  const orgFindingCount   = summary?.org_finding_count ?? 0;
 
   return (
     <div>
       {/* View toggle */}
       <div style={{ display: "flex", gap: "8px", marginBottom: "18px" }}>
-        {["overview", "insights", "findings"].map(view => {
-          const label = view === "overview" ? "Org Overview" : view === "insights" ? "Org Family Insights" : "Findings";
+        {["alerts", "overview", "insights", "findings"].map(view => {
+          const label = view === "alerts" ? "Org Alerts" : view === "overview" ? "Org Overview" : view === "insights" ? "Org Family Insights" : "Findings";
           const active = activeView === view;
+          const isAlertTab = view === "alerts";
+          const activeColor  = isAlertTab ? "#e05555" : "#7ec8e3";
+          const activeBg     = isAlertTab ? "#2a1515" : "#0d2a38";
           return (
             <button
               key={view}
@@ -111,9 +146,9 @@ export default function OrgOverview({ apiBase, onSiteSelect, onMacSiteSelect, re
                 padding: "5px 14px",
                 fontSize: "12px",
                 borderRadius: "4px",
-                border: active ? "1px solid #7ec8e3" : "1px solid #333",
-                background: active ? "#0d2a38" : "#161616",
-                color: active ? "#7ec8e3" : "#666",
+                border: active ? `1px solid ${activeColor}` : "1px solid #333",
+                background: active ? activeBg : "#161616",
+                color: active ? activeColor : "#666",
                 cursor: "pointer",
                 transition: "all 0.15s",
               }}
@@ -124,9 +159,13 @@ export default function OrgOverview({ apiBase, onSiteSelect, onMacSiteSelect, re
         })}
       </div>
 
+      {activeView === "alerts" && (
+        <OrgAlerts apiBase={apiBase} onMacSiteSelect={onMacSiteSelect} refreshToken={refreshToken} wlan={wlan} />
+      )}
+
       {activeView === "overview" && (
         <div>
-          {/* Header */}
+          {/* Header — counts from org-wide findings, not per-site aggregates */}
           <div style={{ marginBottom: "16px", display: "flex", alignItems: "center", gap: "14px", flexWrap: "wrap" }}>
             <h2 style={{ margin: 0, fontSize: "15px", color: "#7ec8e3" }}>Org Overview</h2>
             {loading
@@ -136,15 +175,28 @@ export default function OrgOverview({ apiBase, onSiteSelect, onMacSiteSelect, re
             {sitesWithData > 0 && (
               <span style={{ color: "#555", fontSize: "12px" }}>{sitesWithData} with data</span>
             )}
-            {totalSignificant > 0 && (
+            {orgAlertCount > 0 && (
               <span style={{ background: "#2a1515", color: "#e05555", padding: "2px 8px", borderRadius: "3px", fontSize: "11px" }}>
-                {totalSignificant} SIGNIFICANT
+                {orgAlertCount} ALERT
               </span>
             )}
-            {totalModerate > 0 && (
-              <span style={{ background: "#2a1f10", color: "#e0a835", padding: "2px 8px", borderRadius: "3px", fontSize: "11px" }}>
-                {totalModerate} MODERATE
+            {orgSignificant > 0 && (
+              <span style={{ background: ANOMALY_BG.significant, color: ANOMALY_COLOR.significant, padding: "2px 8px", borderRadius: "3px", fontSize: "11px" }}>
+                {orgSignificant} SIGNIFICANT
               </span>
+            )}
+            {orgModerate > 0 && (
+              <span style={{ background: ANOMALY_BG.moderate, color: ANOMALY_COLOR.moderate, padding: "2px 8px", borderRadius: "3px", fontSize: "11px" }}>
+                {orgModerate} MODERATE
+              </span>
+            )}
+            {orgMinimal > 0 && (
+              <span style={{ background: ANOMALY_BG.minimal, color: ANOMALY_COLOR.minimal, padding: "2px 8px", borderRadius: "3px", fontSize: "11px" }}>
+                {orgMinimal} MINIMAL
+              </span>
+            )}
+            {!loading && !error && orgFindingCount === 0 && sitesWithData > 0 && (
+              <span style={{ color: "#444", fontSize: "11px" }}>No org-wide findings yet — run Full Discovery to start org analysis</span>
             )}
             {!loading && !error && (
               <span style={{ color: "#444", fontSize: "11px", marginLeft: "auto" }}>Click a site to inspect</span>

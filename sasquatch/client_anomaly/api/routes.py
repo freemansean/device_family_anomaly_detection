@@ -293,21 +293,39 @@ async def get_org_summary(wlan: str = Query("__all__")):
             if e.get("site_id") and (wlan == "__all__" or e.get("wlan") == wlan)
         )
 
-        # Fetch all per-site findings in one pipeline round trip
+        # Fetch per-site findings, per-site health, and org-wide findings in one pipeline round trip
         sites_sorted = sorted(site_map.items(), key=lambda x: x[1].lower())
         pipe = redis_client.pipeline()
         for sid, _ in sites_sorted:
             pipe.get(_findings_redis_key(sid, wlan))
-        findings_results = await pipe.execute()
+            pipe.get(_health_redis_key(sid, wlan))
+        pipe.get(_org_findings_redis_key(wlan))
+        pipeline_results = await pipe.execute()
+
+        n = len(sites_sorted)
         findings_by_site = {
-            sid: (json.loads(raw) if raw else [])
-            for (sid, _), raw in zip(sites_sorted, findings_results)
+            sid: (json.loads(pipeline_results[i * 2]) if pipeline_results[i * 2] else [])
+            for i, (sid, _) in enumerate(sites_sorted)
         }
+        health_by_site = {
+            sid: (json.loads(pipeline_results[i * 2 + 1]) if pipeline_results[i * 2 + 1] else {})
+            for i, (sid, _) in enumerate(sites_sorted)
+        }
+        raw_org = pipeline_results[n * 2]
+        org_findings = json.loads(raw_org) if raw_org else []
+
+        _SUMMARY_HEALTH_THRESHOLD = 0.75
 
         result = []
         for sid, site_name in sites_sorted:
             findings = findings_by_site[sid]
+            health = health_by_site[sid]
             event_count = events_per_site.get(sid, 0)
+            # alert_count: families that are both anomalous (in findings) AND unhealthy
+            alert_count = sum(
+                1 for f in findings
+                if health.get(f.get("device_family"), {}).get("health_score", 1.0) < _SUMMARY_HEALTH_THRESHOLD
+            )
             result.append({
                 "site_id": sid,
                 "site_name": site_name,
@@ -315,13 +333,24 @@ async def get_org_summary(wlan: str = Query("__all__")):
                 "critical_count": sum(1 for f in findings if f.get("severity") == "significant"),
                 "warning_count": sum(1 for f in findings if f.get("severity") == "moderate"),
                 "info_count": sum(1 for f in findings if f.get("severity") == "minimal"),
+                "alert_count": alert_count,
                 "event_count": event_count,
                 "has_data": event_count > 0,
             })
     finally:
         await redis_client.aclose()
 
-    return {"sites": result, "total_sites": len(result)}
+    return {
+        "sites": result,
+        "total_sites": len(result),
+        "org_significant_count": sum(1 for f in org_findings if f.get("severity") == "significant"),
+        "org_moderate_count": sum(1 for f in org_findings if f.get("severity") == "moderate"),
+        "org_minimal_count": sum(1 for f in org_findings if f.get("severity") == "minimal"),
+        "org_alert_count": sum(
+            1 for f in org_findings if f.get("health_score", 1.0) < _SUMMARY_HEALTH_THRESHOLD
+        ),
+        "org_finding_count": len(org_findings),
+    }
 
 
 @router.post("/org/run")
@@ -600,6 +629,85 @@ async def get_org_findings_endpoint(wlan: str = Query("__all__")):
             sa["site_name"] = site_map.get(sa["site_id"], sa["site_id"])
 
     return {"findings": findings, "count": len(findings), "wlan": wlan}
+
+
+@router.get("/org/alerts")
+async def get_org_alerts(wlan: str = Query("__all__")):
+    """
+    Return org-wide alerts AND per-site alerts in a single response.
+
+    Org-wide alerts: org findings (cross-site scoring) where health_score < 0.75.
+    Site alerts: per-site findings where the family health_score < 0.75, grouped by site.
+    Only sites with at least one alert are included in site_alerts.
+
+    All data is read from Redis — no real-time Mist API calls.
+    """
+    if not MIST_ORG_ID or not MIST_API_TOKEN:
+        raise HTTPException(status_code=500, detail="MIST_ORG_ID or MIST_API_TOKEN not configured.")
+
+    _ALERT_HEALTH_THRESHOLD = 0.75
+
+    redis_client = _get_redis()
+    try:
+        try:
+            site_map = await _get_org_site_map(redis_client)
+        except Exception:
+            raise HTTPException(status_code=502, detail="Could not reach Mist API")
+
+        sites_sorted = sorted(site_map.items(), key=lambda x: x[1].lower())
+        pipe = redis_client.pipeline()
+        for sid, _ in sites_sorted:
+            pipe.get(_findings_redis_key(sid, wlan))
+            pipe.get(_health_redis_key(sid, wlan))
+        pipe.get(_org_findings_redis_key(wlan))
+        pipeline_results = await pipe.execute()
+    finally:
+        await redis_client.aclose()
+
+    n = len(sites_sorted)
+    findings_by_site = {
+        sid: (json.loads(pipeline_results[i * 2]) if pipeline_results[i * 2] else [])
+        for i, (sid, _) in enumerate(sites_sorted)
+    }
+    health_by_site = {
+        sid: (json.loads(pipeline_results[i * 2 + 1]) if pipeline_results[i * 2 + 1] else {})
+        for i, (sid, _) in enumerate(sites_sorted)
+    }
+    raw_org = pipeline_results[n * 2]
+    org_findings = json.loads(raw_org) if raw_org else []
+
+    # Org-wide alerts: org findings that are also unhealthy
+    org_alerts = [
+        f for f in org_findings
+        if f.get("health_score", 1.0) < _ALERT_HEALTH_THRESHOLD
+    ]
+    for f in org_alerts:
+        for sa in f.get("sites_affected", []):
+            sa["site_name"] = site_map.get(sa["site_id"], sa["site_id"])
+
+    # Per-site alerts: per-site findings cross-referenced with per-site health
+    site_alerts = []
+    for sid, site_name in sites_sorted:
+        findings = findings_by_site[sid]
+        health = health_by_site[sid]
+        alerts = [
+            {**f, "health_score": health.get(f.get("device_family"), {}).get("health_score", 1.0),
+             "health_components": health.get(f.get("device_family"), {}).get("components")}
+            for f in findings
+            if health.get(f.get("device_family"), {}).get("health_score", 1.0) < _ALERT_HEALTH_THRESHOLD
+        ]
+        if alerts:
+            site_alerts.append({
+                "site_id": sid,
+                "site_name": site_name,
+                "alerts": alerts,
+            })
+
+    return {
+        "org_alerts": org_alerts,
+        "site_alerts": site_alerts,
+        "wlan": wlan,
+    }
 
 
 @router.get("/org/family-insights")

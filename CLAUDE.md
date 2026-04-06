@@ -88,8 +88,11 @@ sasquatch/
 │   └── src/
 │       ├── components/
 │       │   ├── SiteOverview.jsx         # Heatmap: event categories × device types + health column
+│       │   ├── OrgOverview.jsx          # Org four-tab shell: Org Alerts (default), Org Overview, Org Family Insights, Findings
+│       │   ├── OrgAlerts.jsx            # Default org view: org-wide + per-site dual-gate alerts with family drilldown
 │       │   ├── OrgFamilyInsights.jsx    # Org-wide family heatmap + health column
-│       │   ├── FindingsFeed.jsx         # Ranked anomaly findings list
+│       │   ├── FindingsFeed.jsx         # Site findings: ALERT → HEALTH → ANOMALOUS sections
+│       │   ├── OrgFindingsFeed.jsx      # Org findings: same three-section layout, family name drills down to OrgFamilyDrilldown
 │       │   └── MacDrilldown.jsx         # Per-MAC 24hr timeline + feature breakdown
 │       └── App.jsx
 ├── .env                         # See env vars section below
@@ -745,10 +748,39 @@ GET  /api/v1/sites/{site_id}/families/{family}/if-outliers → per-family IF dev
 POST /api/v1/sites/{site_id}/refresh                 → manually trigger client cache refresh
 GET  /api/v1/sites/{site_id}/status                  → last run timestamp, event count, finding count
 
+GET  /api/v1/org/summary                             → per-site event counts, finding counts, alert_count,
+                                                       plus org-wide finding counts (org_significant_count,
+                                                       org_moderate_count, org_minimal_count, org_alert_count,
+                                                       org_finding_count) read from sasquatch:org_findings:{wlan}
+GET  /api/v1/org/alerts                              → org-wide alerts + per-site alerts in one response;
+                                                       org_alerts = org findings with health_score < 0.75;
+                                                       site_alerts = per-site findings × per-site health, grouped by site
 GET  /api/v1/org/findings                            → org-wide findings (cross-site scoring)
 GET  /api/v1/org/family-insights                     → per-family heatmap + health scores org-wide
 GET  /api/v1/org/families/{family}/drilldown         → per-MAC drilldown for a family across all sites
 ```
+
+**`GET /org/summary` response shape:**
+```json
+{
+  "sites": [
+    {
+      "site_id": "...", "site_name": "...", "event_count": 26071,
+      "finding_count": 5, "critical_count": 2, "warning_count": 3, "info_count": 0,
+      "alert_count": 1,
+      "has_data": true
+    }
+  ],
+  "total_sites": 20,
+  "org_significant_count": 2,
+  "org_moderate_count": 2,
+  "org_minimal_count": 0,
+  "org_alert_count": 1,
+  "org_finding_count": 4
+}
+```
+- `alert_count` per site: families at that site that are both in per-site findings AND have `health_score < 0.75` (cross-referenced from `sasquatch:health:{site_id}:{wlan}`)
+- `org_*` counts: derived from `sasquatch:org_findings:{wlan}`, not aggregated from per-site data
 
 All responses are JSON. All reads come from Redis — no real-time Mist API calls in the
 request path. The API is read-only except for the manual refresh POST.
@@ -776,19 +808,62 @@ computed as a volume-weighted average of per-site health scores across all sites
 - No "Device Family Behavior Explanation" / Shapley column — that detail belongs in drilldowns
 - Data source: `/api/v1/org/family-insights`
 
-**3. Findings Feed (`FindingsFeed.jsx`)**
-- Ranked list of active findings, highest severity first
-- Each card shows: device family, severity badge, outlier ratio, top feature evidence,
-  affected MAC count, timestamp
-- Expandable to show example MACs with links to MAC drill-down view
-- Data source: `/api/v1/sites/{site_id}/findings`
+**3. Findings Feed (`FindingsFeed.jsx`) — site context**
+- Three sections rendered top-to-bottom: **ALERT → HEALTH → ANOMALOUS**
+  - **ALERT** (red): device families that are both anomalous (in findings) AND unhealthy (`health_score < 0.75`). This is the dual-gate condition that mirrors the webhook dispatch logic.
+  - **HEALTH** (amber): device families from the health endpoint with `health_score < 0.75` that have no anomaly finding — unhealthy but not yet anomalous.
+  - **ANOMALOUS** (green): anomaly findings where health is OK (`health_score ≥ 0.75`).
+- Anomaly severity color scheme — **green spectrum** (anomalies alone are not alerts):
+  - Significant: bright green `#39e84e`
+  - Moderate: medium green `#2eb845`
+  - Minimal: forest green `#1a6b27`
+- Each anomaly card shows an "unhealthy X%" amber badge when `health_score < 0.75`
+- Health score is cross-referenced from the separately-fetched health endpoint by `device_family` — do NOT rely on `health_score` embedded on the finding object, as per-site findings in Redis may not carry it
+- Data source: `/api/v1/sites/{site_id}/findings` + `/api/v1/sites/{site_id}/health` (parallel fetch)
 
-**4. MAC Drill-down (`MacDrilldown.jsx`)**
+**4. Org Alerts (`OrgAlerts.jsx`) — default org view**
+- **Default tab** shown when the user selects Organization in the site picker.
+- Two sections rendered top-to-bottom: **ORG-WIDE ALERTS** → **SITE ALERTS**
+  - **ORG-WIDE ALERTS**: org findings (from `sasquatch:org_findings:{wlan}`, cross-site scoring) where `health_score < 0.75`. Each card shows severity, outlier ratio, device count, health score, failure category breakdown, pattern label, and top contributing features. Family name is a clickable link that opens `OrgFamilyDrilldown` in-place.
+  - **SITE ALERTS**: per-site findings cross-referenced with per-site health, grouped by site. Only sites with ≥ 1 alert are shown. Family name opens `FamilyDrilldown` (site-scoped) in-place.
+- WLAN dropdown scopes both sections via `?wlan=` query param.
+- No example MACs on cards — click the family name to drilldown instead.
+- Auto-refreshes every 30s. Data source: `GET /api/v1/org/alerts?wlan=`
+
+**5. Org Findings Feed (`OrgFindingsFeed.jsx`) — org context**
+- Same three-section layout as site Findings Feed (ALERT → HEALTH → ANOMALOUS)
+- HEALTH section populated from org/family-insights for families not in org findings
+- Org findings carry `health_score` directly on the finding object (written by `score_org_wide`)
+- Family name on each card is a clickable link — opens `OrgFamilyDrilldown` in-place.
+- No example MACs on cards — drilldown is the navigation path.
+- Data source: `/api/v1/org/findings` + `/api/v1/org/family-insights` (parallel fetch)
+
+**6. Org Overview (`OrgOverview.jsx`)**
+- Four tabs, left-to-right: **Org Alerts** (default, red accent), **Org Overview**, **Org Family Insights**, **Findings**
+- "Org Alerts" tab styled with red border/background (`#e05555`) to distinguish it from the blue-accented tabs.
+- **Org Overview tab**: Site cards sorted by `event_count` descending (highest-traffic sites first); sites with no data sort to the bottom. Site card alert state uses the dual-gate: a site is "Alert" (red) only when `alert_count > 0`.
+- Site card anomaly severity badges use the green color spectrum (not red/amber)
+- Header badges show **org-wide finding counts** from `sasquatch:org_findings:{wlan}` — not aggregates of per-site data. Counts are returned by `GET /org/summary` in `org_significant_count`, `org_moderate_count`, `org_minimal_count`, `org_alert_count`, `org_finding_count`.
+
+**7. MAC Drill-down (`MacDrilldown.jsx`)**
 - 24hr event timeline (chronological event list with timestamps and types)
 - Feature vector bar chart vs. family baseline
 - Isolation Forest score and DBSCAN label display
 - Navigation: accessible by clicking a MAC in the Findings Feed
 - Data source: `/api/v1/sites/{site_id}/anomalies/{mac}`
+
+### Findings Alert Logic — Health Threshold
+
+The health threshold used across the frontend and backend is **0.75** (`ANOMALY_HEALTH_SCORE_THRESHOLD`). A device family is "unhealthy" when its health score falls below this value. This threshold is hardcoded as `HEALTH_THRESHOLD = 0.75` in `FindingsFeed.jsx` and `OrgFindingsFeed.jsx`, and as `_ALERT_HEALTH_THRESHOLD = 0.75` in `OrgAlerts.jsx` and `routes.py` (`get_org_alerts`, `get_org_summary`). If the env var threshold is changed, all these frontend constants must be updated to match.
+
+### Drilldown Navigation
+
+Clicking a device family name anywhere in `OrgFindingsFeed` or `OrgAlerts` opens a drilldown in-place (replacing the feed view within the same tab):
+
+- **Org-wide context** (org findings, org alerts ORG-WIDE section): opens `OrgFamilyDrilldown` — cross-site MACs for that family.
+- **Site context** (org alerts SITE ALERTS section): opens `FamilyDrilldown` scoped to that specific site.
+
+Back navigation returns to the feed. There are no example MAC buttons on finding cards — drilldown is the only navigation path into individual devices.
 
 ---
 

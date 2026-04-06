@@ -117,6 +117,23 @@ function scoreBar(ifScore) {
   return { fraction: anomalyFraction, color: `rgb(${red}, ${green}, 50)` };
 }
 
+function computeMacHealth(cats) {
+  const success = (cats.DHCP_SUCCESS || 0) + (cats.DNS_SUCCESS || 0) +
+                  (cats.AUTH_SUCCESS || 0) + (cats.ROAM_SUCCESS || 0) + (cats.ARP_SUCCESS || 0);
+  const failure = (cats.DHCP_FAILURE || 0) + (cats.DNS_FAILURE || 0) +
+                  (cats.AUTH_FAILURE || 0) + (cats.ROAM_FAILURE || 0) + (cats.ARP_FAILURE || 0);
+  const total = success + failure;
+  if (total === 0) return null;
+  return 1.0 - (failure / total);
+}
+
+function healthColor(score) {
+  if (score >= 0.85) return "#4caf7d";
+  if (score >= 0.75) return "#e0a835";
+  if (score >= 0.55) return "#e07835";
+  return "#e05555";
+}
+
 export default function OrgFamilyDrilldown({ family, apiBase, onMacSiteSelect, onBack, wlan = "__all__" }) {
   const [data, setData]       = useState(null);
   const [loading, setLoading] = useState(true);
@@ -142,7 +159,7 @@ export default function OrgFamilyDrilldown({ family, apiBase, onMacSiteSelect, o
       setSortDir(d => d === "asc" ? "desc" : "asc");
     } else {
       setSortCol(col);
-      setSortDir(col === "mac" || col === "site_name" ? "asc" : "desc");
+      setSortDir(col === "mac" || col === "site_name" || col === "health" ? "asc" : "desc");
     }
   };
 
@@ -152,6 +169,11 @@ export default function OrgFamilyDrilldown({ family, apiBase, onMacSiteSelect, o
     if (sortCol === "if_score") {
       const av = a.if_score ?? 999;
       const bv = b.if_score ?? 999;
+      return sortDir === "asc" ? av - bv : bv - av;
+    }
+    if (sortCol === "health") {
+      const av = computeMacHealth(a.categories) ?? 2;
+      const bv = computeMacHealth(b.categories) ?? 2;
       return sortDir === "asc" ? av - bv : bv - av;
     }
     if (sortCol === "total_events") {
@@ -227,6 +249,7 @@ export default function OrgFamilyDrilldown({ family, apiBase, onMacSiteSelect, o
                   <tr>
                     <SortTh col="site_name">Site</SortTh>
                     <SortTh col="mac">MAC</SortTh>
+                    <SortTh col="health" style={{ minWidth: "90px" }}>Health</SortTh>
                     <SortTh col="if_score" style={{ minWidth: "120px" }}>IF Score</SortTh>
                     <th style={thStyle}>▲IF</th>
                     <th style={thStyle}>DBSCAN</th>
@@ -256,6 +279,22 @@ export default function OrgFamilyDrilldown({ family, apiBase, onMacSiteSelect, o
                           {row.random_mac && (
                             <span style={{ color: "#555", fontSize: "10px", marginLeft: "6px" }}>rnd</span>
                           )}
+                        </td>
+                        <td style={{ ...tdStyle, minWidth: "90px" }}>
+                          {(() => {
+                            const h = computeMacHealth(row.categories);
+                            if (h === null) return <span style={{ color: "#444" }}>—</span>;
+                            const color = healthColor(h);
+                            const pct = Math.round(h * 100);
+                            return (
+                              <div style={{ display: "flex", alignItems: "center", gap: "5px" }}>
+                                <div style={{ width: "40px", height: "6px", background: "#222", borderRadius: "2px", overflow: "hidden" }}>
+                                  <div style={{ width: `${pct}%`, height: "100%", background: color, borderRadius: "2px" }} />
+                                </div>
+                                <span style={{ fontSize: "11px", color }}>{pct}%</span>
+                              </div>
+                            );
+                          })()}
                         </td>
                         <td style={{ ...tdStyle, minWidth: "120px" }}>
                           {bar ? (
