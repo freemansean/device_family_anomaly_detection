@@ -5,27 +5,35 @@ DESIGN PRINCIPLE: Volume is not anomaly.
 The ML models receive ratio/timing features ONLY — not raw counts.
 All features are normalized so that active clients are not penalized for being active.
 
-Feature vector — raw event type frequency vector + timing:
-  - N dimensions: one per known event type in MIST_CLIENT_EVENT_TYPES.
-    Value = count of that event type for this MAC / total events for this MAC.
-    Zero-filled for event types not seen by this client.
-    The event type dimensions always sum to 1.0.
-  - 2 timing features: median_inter_event_seconds, inter_event_cv
+Feature vector — event category frequency vector + concentration features:
+  - 13 dimensions: one per event category (all EVENT_CATEGORIES except COLLABORATION).
+    Value = fraction of this MAC's events that fall in that category.
+    Zero-filled for categories with no events.
+    The category dimensions always sum to 1.0.
+  - 2 concentration features: top_category_fraction, top_failure_category_fraction
 
 Post-hoc explainer features are computed separately, only for flagged MACs.
-Event category buckets (DHCP_SUCCESS, AUTH_FAILURE, etc.) are used only for the
-GUI heatmap and post-hoc pattern classification — NOT fed to the ML models.
+
+Redis key scheme:
+  sasquatch:features:{site_id}:{wlan_key}
+  where wlan_key = "__all__" for all WLANs, or a sanitized SSID name.
 """
 
 import json
 import logging
+import math
 import os
-import statistics
+import statistics  # used by build_posthoc_features
 from collections import Counter, defaultdict
 
 import redis.asyncio as aioredis
 
-from .event_collector import EVENT_CATEGORIES, MIST_CLIENT_EVENT_TYPES
+from .event_collector import (
+    EVENT_CATEGORIES,
+    MIST_CLIENT_EVENT_TYPES,
+    get_events,
+    sanitize_wlan_key,
+)
 
 log = logging.getLogger(__name__)
 
@@ -42,49 +50,27 @@ ROAM_FAILURE_TYPES = {
     "MARVIS_EVENT_WLC_FT_KEY_NOT_FOUND",
 }
 
-# All failure-class event types — used for failure concentration scoring in the ML vector.
-_FAILURE_EVENT_TYPES: set[str] = set()
-for _cat in ("DHCP_FAILURE", "DNS_FAILURE", "AUTH_FAILURE", "ROAM_FAILURE"):
-    _FAILURE_EVENT_TYPES.update(EVENT_CATEGORIES.get(_cat, []))
-_FAILURE_EVENT_TYPES.update([
-    "CLIENT_ASSOCIATION_FAILURE",
-    "CLIENT_REASSOCIATION_FAILURE",
-    "CLIENT_GW_ARP_FAILURE",
-    "CLIENT_ARP_FAILURE",
-    "CLIENT_EXCESSIVE_ARPING_GW",
-])
+# Collaboration events are excluded from the ML feature vector.
+# They are application-layer signals (Zoom/Teams calls, CPU spikes) that have no
+# bearing on network connectivity behaviour and are absent for most device types,
+# which would create spurious anomaly signal against devices that do have them.
+_COLLABORATION_EVENT_TYPES: frozenset[str] = frozenset(EVENT_CATEGORIES["COLLABORATION"])
+
+# Event categories used as ML input dimensions — collaboration excluded.
+_ML_CATEGORIES: list[str] = [cat for cat in EVENT_CATEGORIES if cat != "COLLABORATION"]
+
+# Failure-class categories — used for failure concentration scoring and feature weighting.
+_FAILURE_CATEGORIES: frozenset[str] = frozenset({
+    "DHCP_FAILURE", "DNS_FAILURE", "AUTH_FAILURE", "ROAM_FAILURE", "ARP_FAILURE"
+})
 
 # Canonical feature key ordering — guarantees vector consistency across MACs and runs.
-# Event type dimensions first (in MIST_CLIENT_EVENT_TYPES order), then timing and concentration.
-FEATURE_KEYS: list[str] = (
-    list(MIST_CLIENT_EVENT_TYPES)
-    + ["median_inter_event_seconds", "inter_event_cv", "top_event_fraction", "top_failure_event_fraction"]
-)
+# Category dimensions first (in _ML_CATEGORIES order), then concentration.
+FEATURE_KEYS: list[str] = _ML_CATEGORIES + ["top_category_fraction", "top_failure_category_fraction"]
 
 
-def _inter_event_stats(timestamps: list[float]) -> tuple[float, float]:
-    """
-    Compute median and coefficient of variation of inter-event gaps.
-    Returns (median_seconds, cv) — both 0.0 if fewer than 2 events.
-    """
-    if len(timestamps) < 2:
-        return 0.0, 0.0
-
-    gaps = [timestamps[i + 1] - timestamps[i] for i in range(len(timestamps) - 1)]
-    gaps = [g for g in gaps if g > 0]
-    if not gaps:
-        return 0.0, 0.0
-
-    med = statistics.median(gaps)
-    if len(gaps) < 2:
-        return med, 0.0
-
-    mean_gap = statistics.mean(gaps)
-    if mean_gap == 0:
-        return med, 0.0
-
-    cv = statistics.stdev(gaps) / mean_gap
-    return med, cv
+def _features_redis_key(site_id: str, wlan: str = "__all__") -> str:
+    return f"sasquatch:features:{site_id}:{sanitize_wlan_key(wlan)}"
 
 
 def build_mac_feature_vector(mac_events: list[dict]) -> dict[str, float]:
@@ -92,37 +78,35 @@ def build_mac_feature_vector(mac_events: list[dict]) -> dict[str, float]:
     Build the ML input feature vector for a single MAC.
 
     Dimensions:
-      [0–N-1]  One frequency per known event type: count / total events for this MAC.
-               Zero-filled for types not seen. Dimensions sum to 1.0.
-      [N, N+1] median_inter_event_seconds, inter_event_cv
+      [0–N-1]  One frequency per event category (excluding COLLABORATION):
+               count of events in that category / total non-collaboration events.
+               Zero-filled for categories with no events. Dimensions sum to 1.0.
+      [N, N+1] top_category_fraction, top_failure_category_fraction
     """
     if not mac_events:
         return {k: 0.0 for k in FEATURE_KEYS}
 
-    total = len(mac_events)
-    type_counts: Counter = Counter(e.get("type", "") for e in mac_events)
+    # Strip collaboration events — they are not network signals and are absent for most
+    # device types, so including them would create spurious cross-device anomaly signal.
+    ml_events = [e for e in mac_events if e.get("type") not in _COLLABORATION_EVENT_TYPES]
+    if not ml_events:
+        return {k: 0.0 for k in FEATURE_KEYS}
+
+    total = len(ml_events)
+    type_counts: Counter = Counter(e.get("type", "") for e in ml_events)
 
     vec: dict[str, float] = {}
 
-    # Per-event-type normalized frequency — no domain bucketing, no human-defined groupings.
-    for event_type in MIST_CLIENT_EVENT_TYPES:
-        vec[event_type] = type_counts.get(event_type, 0) / total
+    # Per-category normalized frequency.
+    for cat in _ML_CATEGORIES:
+        cat_count = sum(type_counts.get(t, 0) for t in EVENT_CATEGORIES.get(cat, []))
+        vec[cat] = cat_count / total
 
-    # Timing features
-    timestamps = sorted(e.get("timestamp", 0) for e in mac_events)
-    median_gap, cv = _inter_event_stats(timestamps)
-    vec["median_inter_event_seconds"] = median_gap
-    vec["inter_event_cv"] = cv
-
-    # Concentration features — amplify signal for clients stuck in a single-event loop.
-    # top_event_fraction: how dominated the stream is by any one event type.
-    # top_failure_event_fraction: same, but only counting failure-class event types.
-    # Both are ratios (0–1), consistent with the volume-neutral design principle.
-    vec["top_event_fraction"] = max(vec[t] for t in MIST_CLIENT_EVENT_TYPES)
-    top_failure_count = max(
-        (type_counts.get(t, 0) for t in _FAILURE_EVENT_TYPES), default=0
+    # Concentration features — amplify signal for clients stuck in a single-category loop.
+    vec["top_category_fraction"] = max(vec[cat] for cat in _ML_CATEGORIES)
+    vec["top_failure_category_fraction"] = max(
+        (vec[cat] for cat in _FAILURE_CATEGORIES), default=0.0
     )
-    vec["top_failure_event_fraction"] = top_failure_count / total
 
     return vec
 
@@ -163,13 +147,7 @@ def build_posthoc_features(mac_events: list[dict]) -> dict:
     }
     dhcp_unique_xid_count = len(dhcp_xids)
 
-    # DHCP burst detection — distinguishes a storm from routine IP renewal.
-    # A client getting an IP every 8 hours is normal lease renewal behaviour.
-    # A client getting 10 IPs in 3 minutes is a discard loop.
-    #
-    # dhcp_max_burst_5min: max CLIENT_IP_ASSIGNED events in any 5-minute sliding window.
-    # dhcp_median_gap_seconds: median time between consecutive CLIENT_IP_ASSIGNED events.
-    #   -1 sentinel means fewer than 2 events (can't compute gap — not a storm by definition).
+    # DHCP burst detection
     dhcp_success_timestamps = sorted(
         e.get("timestamp", 0)
         for e in mac_events
@@ -191,20 +169,17 @@ def build_posthoc_features(mac_events: list[dict]) -> dict:
         ]
         dhcp_median_gap_seconds = statistics.median(gaps)
     else:
-        dhcp_median_gap_seconds = -1  # sentinel: not enough events to measure cadence
+        dhcp_median_gap_seconds = -1
 
-    # DNS to unique DHCP XID ratio — collapses toward 0 in DHCP discard pattern
     dns_ok_count = type_counts.get("CLIENT_DNS_OK", 0)
     dns_to_dhcp_xid_ratio = (
         dns_ok_count / dhcp_unique_xid_count if dhcp_unique_xid_count > 0 else 0.0
     )
 
-    # Roam failure types seen
     roam_failure_types_seen = {
         e.get("type") for e in mac_events if e.get("type") in ROAM_FAILURE_TYPES
     }
 
-    # Top event type
     if type_counts:
         top_event_type, top_count = type_counts.most_common(1)[0]
         top_event_fraction = top_count / total
@@ -212,7 +187,6 @@ def build_posthoc_features(mac_events: list[dict]) -> dict:
         top_event_type = ""
         top_event_fraction = 0.0
 
-    # Auth fail recovery ratio: auth successes / (auth successes + auth failures)
     auth_success = sum(
         type_counts.get(t, 0)
         for t in [
@@ -233,7 +207,6 @@ def build_posthoc_features(mac_events: list[dict]) -> dict:
     auth_total = auth_success + auth_failure
     auth_fail_recovery_ratio = auth_success / auth_total if auth_total > 0 else 1.0
 
-    # Category bucket ratios (used for probable_pattern classification in webhook)
     category_counts: Counter = Counter(e.get("event_category", "OTHER") for e in mac_events)
     category_ratios = {
         f"cat_ratio_{cat.lower()}": category_counts.get(cat, 0) / total
@@ -255,19 +228,22 @@ def build_posthoc_features(mac_events: list[dict]) -> dict:
     }
 
 
-async def build_features(site_id: str) -> int:
+async def build_features(site_id: str, wlan: str = "__all__") -> int:
     """
-    Read events from Redis, build per-MAC feature vectors, store in Redis.
+    Read events from the global Redis sorted set (filtered by site and WLAN),
+    build per-MAC feature vectors, store in Redis.
+
+    wlan="__all__" uses all events for the site regardless of WLAN.
     Returns count of MACs processed.
     """
     redis_client = aioredis.from_url(REDIS_URL, decode_responses=True)
     try:
-        raw_events = await redis_client.get(f"sasquatch:events:{site_id}")
-        if not raw_events:
+        events = await get_events(site_id=site_id, wlan=wlan if wlan != "__all__" else None)
+        if not events:
             raise RuntimeError(
-                f"No events found for site {site_id}. Run event_collector.collect() first."
+                f"No events found for site {site_id} / wlan={wlan}. "
+                "Run event_collector.collect() first."
             )
-        events: list[dict] = json.loads(raw_events)
 
         # Group events by MAC
         mac_events: dict[str, list[dict]] = defaultdict(list)
@@ -285,18 +261,20 @@ async def build_features(site_id: str) -> int:
                 continue
             vec = build_mac_feature_vector(evts)
             device_family = evts[0].get("device_family", "Unknown") if evts else "Unknown"
+            volume_concentration_weight = math.log1p(len(evts)) * vec["top_category_fraction"]
             features[mac] = {
                 "vector": vec,
                 "device_family": device_family,
                 "event_count": len(evts),
                 "random_mac": evts[0].get("random_mac", False) if evts else False,
+                "volume_concentration_weight": volume_concentration_weight,
             }
 
-        key = f"sasquatch:features:{site_id}"
+        key = _features_redis_key(site_id, wlan)
         await redis_client.set(key, json.dumps(features), ex=FEATURES_TTL)
         log.info(
             f"Built features for {len(features)} MACs → {key} "
-            f"({skipped} skipped with < {MIN_MAC_EVENTS} events)"
+            f"({skipped} skipped with < {MIN_MAC_EVENTS} events) [wlan={wlan}]"
         )
         return len(features)
 
@@ -304,10 +282,10 @@ async def build_features(site_id: str) -> int:
         await redis_client.aclose()
 
 
-async def get_features(site_id: str) -> dict[str, dict]:
+async def get_features(site_id: str, wlan: str = "__all__") -> dict[str, dict]:
     redis_client = aioredis.from_url(REDIS_URL, decode_responses=True)
     try:
-        raw = await redis_client.get(f"sasquatch:features:{site_id}")
+        raw = await redis_client.get(_features_redis_key(site_id, wlan))
     finally:
         await redis_client.aclose()
     if not raw:

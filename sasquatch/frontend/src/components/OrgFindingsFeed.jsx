@@ -4,77 +4,6 @@ import { apiFetch } from "../api";
 const SEVERITY_COLOR = { significant: "#e05555", moderate: "#e0a835", minimal: "#4ea8c4" };
 const SEVERITY_BG = { significant: "#2a1515", moderate: "#2a2015", minimal: "#152030" };
 
-function shapleyScoreFromIfScore(ifScore) {
-  if (ifScore == null) return null;
-  return Math.max(0, Math.min(100, Math.round((0.5 - ifScore) / 1.0 * 100)));
-}
-
-function shapleyColor(score) {
-  if (score >= 60) return "#e05555";
-  if (score >= 35) return "#e0a835";
-  return "#4ea8c4";
-}
-
-function ShapleyBlock({ label, score, features, description }) {
-  const color = score != null ? shapleyColor(score) : "#666";
-  return (
-    <div style={{
-      background: "#0e0e0e",
-      border: `1px solid ${color}33`,
-      borderLeft: `3px solid ${color}`,
-      borderRadius: "3px",
-      padding: "10px 12px",
-      marginBottom: "10px",
-    }}>
-      <div style={{ display: "flex", alignItems: "center", gap: "12px", marginBottom: "6px" }}>
-        <span style={{ fontSize: "11px", color: "#666", fontWeight: "normal", textTransform: "uppercase", letterSpacing: "0.06em" }}>
-          {label}
-        </span>
-        {score != null && (
-          <div style={{ display: "flex", alignItems: "center", gap: "8px", flex: 1 }}>
-            <div style={{ flex: 1, height: "6px", background: "#1a1a1a", borderRadius: "3px", overflow: "hidden" }}>
-              <div style={{ width: `${score}%`, height: "100%", background: color, borderRadius: "3px", transition: "width 0.4s ease" }} />
-            </div>
-            <span style={{ fontSize: "13px", fontWeight: "bold", color, minWidth: "36px", textAlign: "right" }}>
-              {score}<span style={{ fontSize: "10px", color: "#555" }}>/100</span>
-            </span>
-          </div>
-        )}
-        {score == null && (
-          <span style={{ fontSize: "11px", color: "#444" }}>score unavailable</span>
-        )}
-      </div>
-      {description && (
-        <div style={{ fontSize: "11px", color: "#555", marginBottom: features?.length > 0 ? "6px" : 0 }}>
-          {description}
-        </div>
-      )}
-      {features?.length > 0 && (
-        <div style={{ display: "flex", flexDirection: "column", gap: "3px" }}>
-          {features.slice(0, 4).map((f, i) => {
-            const delta = Math.abs(f.outlier_mean - f.baseline_mean);
-            const barWidth = Math.min(delta * 400, 100);
-            return (
-              <div key={i} style={{ display: "flex", alignItems: "center", gap: "8px" }}>
-                <span style={{ fontSize: "10px", color: "#777", width: "220px", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flexShrink: 0 }}
-                  title={f.feature}>
-                  {f.feature}
-                </span>
-                <div style={{ flex: 1, height: "5px", background: "#1a1a1a", borderRadius: "2px", overflow: "hidden" }}>
-                  <div style={{ width: `${barWidth}%`, height: "100%", background: color + "99", borderRadius: "2px" }} />
-                </div>
-                <span style={{ fontSize: "10px", color: color, minWidth: "42px", textAlign: "right" }}>
-                  +{delta.toFixed(3)}
-                </span>
-              </div>
-            );
-          })}
-        </div>
-      )}
-    </div>
-  );
-}
-
 const PATTERN_LABELS = {
   dhcp_discard_loop: "DHCP Discard Loop",
   pmkid_stale: "Stale PMKID",
@@ -88,14 +17,14 @@ const PATTERN_LABELS = {
   family_behavioral_outlier: "Family-Wide Outlier",
 };
 
-export default function FindingsFeed({ siteId, apiBase, onMacSelect, refreshToken, wlan = "__all__" }) {
+export default function OrgFindingsFeed({ apiBase, onMacSiteSelect, refreshToken, wlan = "__all__" }) {
   const [findings, setFindings] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [expanded, setExpanded] = useState({});
 
   const load = useCallback(() => {
-    apiFetch(`${apiBase}/api/v1/sites/${siteId}/findings?wlan=${encodeURIComponent(wlan)}`)
+    apiFetch(`${apiBase}/api/v1/org/findings?wlan=${encodeURIComponent(wlan)}`)
       .then((r) => r.json())
       .then((data) => {
         setFindings(data.findings || []);
@@ -103,7 +32,7 @@ export default function FindingsFeed({ siteId, apiBase, onMacSelect, refreshToke
       })
       .catch((e) => setError(e.message))
       .finally(() => setLoading(false));
-  }, [siteId, apiBase, wlan]);
+  }, [apiBase, wlan]);
 
   useEffect(() => {
     load();
@@ -114,7 +43,7 @@ export default function FindingsFeed({ siteId, apiBase, onMacSelect, refreshToke
   if (loading) return <div style={{ color: "#888" }}>Loading findings…</div>;
   if (error) return <div style={{ color: "#e05555" }}>Error: {error}</div>;
   if (findings.length === 0) {
-    return <div style={{ color: "#2d7a4f", padding: "20px" }}>No anomalies detected. All device families behaving normally.</div>;
+    return <div style={{ color: "#2d7a4f", padding: "20px" }}>No anomalies detected across the organization.</div>;
   }
 
   function toggleExpand(idx) {
@@ -124,7 +53,7 @@ export default function FindingsFeed({ siteId, apiBase, onMacSelect, refreshToke
   return (
     <div>
       <h2 style={{ fontSize: "15px", color: "#aaa", marginBottom: "12px" }}>
-        Anomaly Findings — {findings.length} active
+        Org Anomaly Findings — {findings.length} active
       </h2>
       <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
         {findings.map((finding, idx) => {
@@ -186,20 +115,34 @@ export default function FindingsFeed({ siteId, apiBase, onMacSelect, refreshToke
                 </div>
               </div>
 
-              {/* Device Family Behavior Explanation — Shapley Score (centroid IF) */}
-              <div style={{ marginTop: "10px" }}>
-                <ShapleyBlock
-                  label="Device Family Behavior Explanation"
-                  score={shapleyScoreFromIfScore(finding.centroid_if_score)}
-                  features={finding.top_features}
-                  description={
-                    finding.centroid_if_score != null
-                      ? `Family centroid IF score ${finding.centroid_if_score.toFixed(4)} — measures how distinctly this family's collective behavior differs from all other families at this site.`
-                      : finding.is_family_outlier
-                        ? "This family's collective behavior is flagged as anomalous relative to other families."
-                        : "Anomaly driven by individual device deviations within the family."
-                  }
-                /></div>
+              {/* Site attribution — org findings span multiple sites */}
+              <div style={{ marginTop: "5px", fontSize: "11px", color: "#557799" }}>
+                {finding.sites_affected?.length > 1
+                  ? finding.sites_affected.map((sa) => sa.site_name || sa.site_id).join(" · ")
+                  : (finding.sites_affected?.[0]?.site_name || finding.sites_affected?.[0]?.site_id || "")}
+              </div>
+
+              {/* Top contributing features */}
+              {finding.top_features?.length > 0 && (
+                <div style={{ marginTop: "8px", display: "flex", gap: "6px", flexWrap: "wrap" }}>
+                  {finding.top_features.slice(0, 3).map((f, fi) => (
+                    <span
+                      key={fi}
+                      title={`Outlier mean: ${f.outlier_mean.toFixed(3)} vs baseline: ${f.baseline_mean.toFixed(3)}`}
+                      style={{
+                        background: "#222",
+                        border: "1px solid #333",
+                        borderRadius: "3px",
+                        padding: "2px 7px",
+                        fontSize: "11px",
+                        color: "#999",
+                      }}
+                    >
+                      {f.feature} <span style={{ color: SEVERITY_COLOR[sev] }}>↑{(Math.abs(f.outlier_mean - f.baseline_mean)).toFixed(3)}</span>
+                    </span>
+                  ))}
+                </div>
+              )}
 
               {/* Expand/collapse example MACs */}
               <button
@@ -218,24 +161,29 @@ export default function FindingsFeed({ siteId, apiBase, onMacSelect, refreshToke
 
               {isExpanded && finding.example_macs?.length > 0 && (
                 <div style={{ marginTop: "6px", display: "flex", gap: "6px", flexWrap: "wrap" }}>
-                  {finding.example_macs.map((mac) => (
-                    <button
-                      key={mac}
-                      onClick={() => onMacSelect(mac)}
-                      style={{
-                        background: "#1a1a2e",
-                        border: "1px solid #2a2a5e",
-                        color: "#7ec8e3",
-                        borderRadius: "3px",
-                        padding: "3px 10px",
-                        cursor: "pointer",
-                        fontSize: "12px",
-                        fontFamily: "monospace",
-                      }}
-                    >
-                      {mac}
-                    </button>
-                  ))}
+                  {finding.example_macs.map((entry) => {
+                    const mac = entry?.mac ?? entry;
+                    const siteId = entry?.site_id ?? null;
+                    return (
+                      <button
+                        key={`${siteId}:${mac}`}
+                        onClick={() => onMacSiteSelect(mac, siteId)}
+                        title={siteId || ""}
+                        style={{
+                          background: "#1a1a2e",
+                          border: "1px solid #2a2a5e",
+                          color: "#7ec8e3",
+                          borderRadius: "3px",
+                          padding: "3px 10px",
+                          cursor: "pointer",
+                          fontSize: "12px",
+                          fontFamily: "monospace",
+                        }}
+                      >
+                        {mac}
+                      </button>
+                    );
+                  })}
                 </div>
               )}
             </div>

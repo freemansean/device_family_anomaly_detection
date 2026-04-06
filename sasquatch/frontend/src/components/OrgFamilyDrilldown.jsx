@@ -94,6 +94,20 @@ const CATEGORY_LABELS = {
 
 const EVENT_CATEGORIES = Object.keys(CATEGORY_LABELS);
 
+const thStyle = {
+  padding: "6px 8px",
+  borderBottom: "1px solid #333",
+  color: "#666",
+  textAlign: "left",
+  fontWeight: "normal",
+  background: "#161616",
+};
+
+const tdStyle = {
+  padding: "5px 8px",
+  borderBottom: "1px solid #1e1e1e",
+};
+
 function scoreBar(ifScore) {
   if (ifScore === null || ifScore === undefined) return null;
   const clamped = Math.max(-0.5, Math.min(0.5, ifScore));
@@ -103,95 +117,50 @@ function scoreBar(ifScore) {
   return { fraction: anomalyFraction, color: `rgb(${red}, ${green}, 50)` };
 }
 
-export default function FamilyDrilldown({ siteId, family, apiBase, onMacSelect, onBack, refreshToken, wlan = "__all__" }) {
-  const [ifData, setIfData] = useState(null);
-  const [ifLoading, setIfLoading] = useState(true);
-  const [ifError, setIfError] = useState(null);
-
-  const [eventData, setEventData] = useState(null);
-  const [eventLoading, setEventLoading] = useState(true);
-  const [eventError, setEventError] = useState(null);
+export default function OrgFamilyDrilldown({ family, apiBase, onMacSiteSelect, onBack, wlan = "__all__" }) {
+  const [data, setData]       = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError]     = useState(null);
 
   const [sortCol, setSortCol] = useState("if_score");
-  const [sortDir, setSortDir] = useState("desc");
+  const [sortDir, setSortDir] = useState("asc");
 
   useEffect(() => {
-    setIfLoading(true);
-    setIfError(null);
-    apiFetch(`${apiBase}/api/v1/sites/${siteId}/families/${encodeURIComponent(family)}/if-outliers?wlan=${encodeURIComponent(wlan)}`)
-      .then((r) => {
-        if (!r.ok) return r.json().then((e) => Promise.reject(e.detail || r.statusText));
+    setLoading(true);
+    setError(null);
+    apiFetch(`${apiBase}/api/v1/org/families/${encodeURIComponent(family)}/drilldown?wlan=${encodeURIComponent(wlan)}`)
+      .then(r => {
+        if (!r.ok) return r.json().then(e => Promise.reject(e.detail || r.statusText));
         return r.json();
       })
-      .then((d) => { setIfData(d); setIfLoading(false); })
-      .catch((e) => { setIfError(String(e)); setIfLoading(false); });
-  }, [siteId, family, apiBase, refreshToken, wlan]);
-
-  useEffect(() => {
-    setEventLoading(true);
-    setEventError(null);
-    apiFetch(`${apiBase}/api/v1/sites/${siteId}/families/${encodeURIComponent(family)}/event-counts?wlan=${encodeURIComponent(wlan)}`)
-      .then((r) => {
-        if (!r.ok) return r.json().then((e) => Promise.reject(e.detail || r.statusText));
-        return r.json();
-      })
-      .then((d) => { setEventData(d); setEventLoading(false); })
-      .catch((e) => { setEventError(String(e)); setEventLoading(false); });
-  }, [siteId, family, apiBase, refreshToken, wlan]);
+      .then(d => { setData(d); setLoading(false); })
+      .catch(e => { setError(String(e)); setLoading(false); });
+  }, [family, apiBase, wlan]);
 
   const handleSort = (col) => {
     if (sortCol === col) {
-      setSortDir((d) => (d === "asc" ? "desc" : "asc"));
+      setSortDir(d => d === "asc" ? "desc" : "asc");
     } else {
       setSortCol(col);
-      setSortDir(col === "mac" ? "asc" : "desc");
+      setSortDir(col === "mac" || col === "site_name" ? "asc" : "desc");
     }
   };
 
-  // Build merged rows indexed by MAC
-  const mergedRows = (() => {
-    if (!ifData) return [];
-    const eventByMac = {};
-    if (eventData) {
-      for (const c of eventData.clients) eventByMac[c.mac] = c;
-    }
-    return ifData.outliers.map((client) => {
-      const ev = eventByMac[client.mac] || {};
-      return {
-        mac: client.mac,
-        random_mac: client.random_mac,
-        if_score: client.if_score,
-        is_if_outlier: client.is_if_outlier,
-        is_dbscan_outlier: client.is_dbscan_outlier,
-        event_count: client.event_count,
-        categories: ev.categories || {},
-        total_events: ev.total_events ?? client.event_count,
-        meta: client.client_metadata || {},
-      };
-    });
-  })();
-
-  const sortedRows = [...mergedRows].sort((a, b) => {
-    if (sortCol === "mac") {
-      return sortDir === "asc" ? a.mac.localeCompare(b.mac) : b.mac.localeCompare(a.mac);
-    }
+  const sortedRows = data ? [...data.rows].sort((a, b) => {
+    if (sortCol === "mac")       return sortDir === "asc" ? a.mac.localeCompare(b.mac) : b.mac.localeCompare(a.mac);
+    if (sortCol === "site_name") return sortDir === "asc" ? a.site_name.localeCompare(b.site_name) : b.site_name.localeCompare(a.site_name);
     if (sortCol === "if_score") {
-      const av = a.if_score ?? -999;
-      const bv = b.if_score ?? -999;
-      // More anomalous (lower score) = higher rank in desc
-      return sortDir === "desc" ? av - bv : bv - av;
+      const av = a.if_score ?? 999;
+      const bv = b.if_score ?? 999;
+      return sortDir === "asc" ? av - bv : bv - av;
     }
     if (sortCol === "total_events") {
       return sortDir === "asc" ? a.total_events - b.total_events : b.total_events - a.total_events;
     }
-    // Event category column
     const av = a.categories[sortCol] || 0;
     const bv = b.categories[sortCol] || 0;
     return sortDir === "asc" ? av - bv : bv - av;
-  });
-
-  const loading = ifLoading || eventLoading;
-  const error = ifError || eventError;
+  }) : [];
 
   const SortTh = ({ col, children, style = {} }) => (
     <th style={{ ...thStyle, ...style }}>
@@ -222,69 +191,66 @@ export default function FamilyDrilldown({ siteId, family, apiBase, onMacSelect, 
             padding: "4px 10px", borderRadius: "4px", cursor: "pointer", fontSize: "12px",
           }}
         >
-          ← Site Overview
+          ← Org Family Insights
         </button>
-        <h2 style={{ margin: 0, fontSize: "15px", color: "#aaa" }}>
-          {family}
-        </h2>
+        <h2 style={{ margin: 0, fontSize: "15px", color: "#aaa" }}>{family}</h2>
+        <span style={{ color: "#555", fontSize: "12px" }}>org-wide</span>
       </div>
 
-      {loading && <div style={{ color: "#888" }}>Loading…</div>}
-      {error && <div style={{ color: "#e05555" }}>Error: {error}</div>}
+      {loading && <div style={{ color: "#888", fontSize: "13px" }}>Loading…</div>}
+      {error && <div style={{ color: "#e05555", fontSize: "13px" }}>Error: {error}</div>}
 
-      {!loading && ifData && (
+      {!loading && data && (
         <>
           <ShapleyBlock
             label="Device Family Behavior Explanation"
-            score={shapleyScoreFromIfScore(ifData.centroid_if_score)}
-            features={ifData.top_features}
+            score={shapleyScoreFromIfScore(data.worst_centroid_if_score)}
+            features={data.worst_centroid_top_features}
             description={
-              ifData.centroid_if_score != null
-                ? `Family centroid IF score ${ifData.centroid_if_score.toFixed(4)} — measures how distinctly this family's collective behavior differs from all other families at this site.`
-                : "Centroid score unavailable — fewer than 3 qualifying families at this site, or this family has fewer than 2 members."
+              data.worst_centroid_if_score != null
+                ? `Worst centroid IF score ${data.worst_centroid_if_score.toFixed(4)} across all sites — measures how distinctly this family's collective behavior differs from all other families at its most anomalous site.`
+                : "No centroid IF score available — fewer than 3 qualifying families at all sites, or this family has fewer than 2 members at every site."
             }
           />
           <div style={{ fontSize: "12px", color: "#666", marginBottom: "12px" }}>
-            Showing all {ifData.total_family_count} clients in this family.{" "}
-            <span style={{ color: "#e05555" }}>{ifData.if_outlier_count} flagged</span> by Isolation Forest.
-            Click column headers to sort.
+            {data.total_count} clients across all sites.{" "}
+            <span style={{ color: "#e05555" }}>{data.if_outlier_count} flagged</span> by Isolation Forest.
+            Click column headers to sort. Click a row to open MAC drill-down.
           </div>
 
           {sortedRows.length === 0 ? (
-            <div style={{ color: "#555", fontSize: "13px" }}>No clients found for this family.</div>
+            <div style={{ color: "#555", fontSize: "13px" }}>No clients found.</div>
           ) : (
             <div style={{ overflowX: "auto" }}>
               <table style={{ borderCollapse: "collapse", fontSize: "12px" }}>
                 <thead>
                   <tr>
-                    {/* IF columns */}
+                    <SortTh col="site_name">Site</SortTh>
                     <SortTh col="mac">MAC</SortTh>
                     <SortTh col="if_score" style={{ minWidth: "120px" }}>IF Score</SortTh>
                     <th style={thStyle}>▲IF</th>
                     <th style={thStyle}>DBSCAN</th>
-                    {/* Event category columns */}
-                    {EVENT_CATEGORIES.map((cat) => (
+                    {EVENT_CATEGORIES.map(cat => (
                       <SortTh key={cat} col={cat}>{CATEGORY_LABELS[cat]}</SortTh>
                     ))}
                     <SortTh col="total_events">Total</SortTh>
-                    {/* Metadata */}
-                    <th style={thStyle}>Model</th>
-                    <th style={thStyle}>OS</th>
-                    <th style={thStyle}>Manufacturer</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {sortedRows.map((row) => {
+                  {sortedRows.map((row, i) => {
                     const bar = scoreBar(row.if_score);
                     const rowBg = row.is_if_outlier ? "#1a1510" : "transparent";
                     return (
                       <tr
-                        key={row.mac}
-                        onClick={() => onMacSelect(row.mac)}
+                        key={`${row.site_id}-${row.mac}`}
+                        onClick={() => onMacSiteSelect(row.mac, row.site_id)}
                         style={{ cursor: "pointer", background: rowBg }}
-                        onMouseEnter={(e) => e.currentTarget.style.background = "#1a2530"}
-                        onMouseLeave={(e) => e.currentTarget.style.background = rowBg}
+                        onMouseEnter={e => e.currentTarget.style.background = "#1a2530"}
+                        onMouseLeave={e => e.currentTarget.style.background = rowBg}
                       >
+                        <td style={{ ...tdStyle, color: "#888", whiteSpace: "nowrap", fontSize: "11px" }}>
+                          {row.site_name}
+                        </td>
                         <td style={{ ...tdStyle, color: "#7ec8e3", fontFamily: "monospace", whiteSpace: "nowrap" }}>
                           {row.mac}
                           {row.random_mac && (
@@ -325,7 +291,7 @@ export default function FamilyDrilldown({ siteId, family, apiBase, onMacSelect, 
                             <span style={{ color: "#444", fontSize: "10px" }}>—</span>
                           )}
                         </td>
-                        {EVENT_CATEGORIES.map((cat) => (
+                        {EVENT_CATEGORIES.map(cat => (
                           <td key={cat} style={{ ...tdStyle, color: (row.categories[cat] || 0) > 0 ? "#aaa" : "#333", textAlign: "right" }}>
                             {(row.categories[cat] || 0) > 0 ? row.categories[cat] : "—"}
                           </td>
@@ -333,9 +299,6 @@ export default function FamilyDrilldown({ siteId, family, apiBase, onMacSelect, 
                         <td style={{ ...tdStyle, color: "#ccc", textAlign: "right", fontWeight: "500" }}>
                           {row.total_events}
                         </td>
-                        <td style={{ ...tdStyle, color: "#999" }}>{row.meta.model || "—"}</td>
-                        <td style={{ ...tdStyle, color: "#999" }}>{row.meta.os || "—"}</td>
-                        <td style={{ ...tdStyle, color: "#999" }}>{row.meta.manufacturer || "—"}</td>
                       </tr>
                     );
                   })}
@@ -345,24 +308,10 @@ export default function FamilyDrilldown({ siteId, family, apiBase, onMacSelect, 
           )}
 
           <div style={{ marginTop: "8px", fontSize: "11px", color: "#444" }}>
-            Click a row to open the MAC drill-down timeline. ▲ = Isolation Forest outlier. DBSCAN = flagged site-wide.
+            ▲ = Isolation Forest outlier within site peer group. DBSCAN = flagged site-wide. Click a row to open MAC timeline.
           </div>
         </>
       )}
     </div>
   );
 }
-
-const thStyle = {
-  padding: "6px 8px",
-  borderBottom: "1px solid #333",
-  color: "#666",
-  textAlign: "left",
-  fontWeight: "normal",
-  background: "#161616",
-};
-
-const tdStyle = {
-  padding: "5px 8px",
-  borderBottom: "1px solid #1e1e1e",
-};

@@ -8,7 +8,8 @@ cd "$SCRIPT_DIR"
 BACKEND_PORT=8000
 FRONTEND_PORT=3000
 LOG_DIR="$SCRIPT_DIR/logs"
-mkdir -p "$LOG_DIR"
+REDIS_DATA_DIR="$SCRIPT_DIR/data/redis"
+mkdir -p "$LOG_DIR" "$REDIS_DATA_DIR"
 
 echo "=== Sasquatch — Starting Local Services ==="
 
@@ -21,17 +22,35 @@ fi
 if redis-cli ping &>/dev/null 2>&1; then
   echo "✓ Redis already running"
 else
-  if command -v brew &>/dev/null; then
-    brew services start redis
-  else
-    redis-server --daemonize yes --logfile "$LOG_DIR/redis.log"
-  fi
+  LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8 redis-server "$SCRIPT_DIR/redis.conf" \
+    --daemonize yes \
+    --logfile "$LOG_DIR/redis.log" \
+    --dir "$REDIS_DATA_DIR"
   # Wait for Redis to be ready
   for i in {1..10}; do
     if redis-cli ping &>/dev/null 2>&1; then break; fi
     sleep 0.5
   done
   echo "✓ Redis started"
+fi
+
+# ── Ollama ────────────────────────────────────────────────────────────────────
+if command -v ollama &>/dev/null; then
+  if curl -sf http://localhost:11434/api/tags >/dev/null 2>&1; then
+    echo "✓ Ollama already running"
+  else
+    echo "Starting Ollama..."
+    ollama serve > "$LOG_DIR/ollama.log" 2>&1 &
+    echo $! > "$LOG_DIR/ollama.pid"
+    # Wait for Ollama to be ready (up to 10s)
+    for i in {1..20}; do
+      if curl -sf http://localhost:11434/api/tags >/dev/null 2>&1; then break; fi
+      sleep 0.5
+    done
+    echo "✓ Ollama started (PID $(cat $LOG_DIR/ollama.pid)) → logs/ollama.log"
+  fi
+else
+  echo "  Ollama not installed — AI Assist will be unavailable (run ./setup.sh to install)"
 fi
 
 # ── Backend ───────────────────────────────────────────────────────────────────
@@ -82,6 +101,7 @@ echo "┌───────────────────────�
 echo "│  Frontend    http://localhost:$FRONTEND_PORT           │"
 echo "│  Backend API http://localhost:$BACKEND_PORT           │"
 echo "│  API docs    http://localhost:$BACKEND_PORT/docs      │"
+echo "│  Ollama LLM  http://localhost:11434          │"
 echo "└─────────────────────────────────────────────┘"
 echo ""
 echo "Run ./stop.sh to shut everything down."

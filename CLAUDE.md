@@ -12,14 +12,21 @@ Detects anomalous client behavior at a Juniper Mist site by:
 1. Building a 24-hour client device database (MAC → device metadata)
 2. Pulling all client events for the site over the last 24 hours
 3. Engineering per-MAC behavioral feature vectors
-4. Running Isolation Forest (per device type) + DBSCAN (site-wide) to surface outliers
-5. Rolling up MAC-level anomalies to device type findings
-6. Exposing findings via a React + FastAPI dashboard
-7. Firing a webhook for extreme anomalies to the Sasquatch processing pipeline
+4. Running a two-stage ML detection pipeline (see `anomaly_detector.py`):
+   - **Stage 1 — DBSCAN** (site-wide): flags MACs that don't cluster with any site peer group
+   - **Stage 1b — Family Centroid IF**: flags entire device families behaving differently from all other families
+   - **Stage 2 — Isolation Forest** (per device family): flags individual MACs anomalous within their family
+5. Computing a separate per-family **Health Score** (see `health_scorer.py`): mean of per-MAC
+   failure rates across AUTH, ROAM, DHCP, DNS, and ARP — independent of the anomaly pipeline
+6. Rolling up MAC-level anomalies to device type findings
+7. Exposing findings via a React + FastAPI dashboard
+8. Firing a webhook only when a device family is **both** a behavioral outlier (centroid IF) **and**
+   unhealthy (health score below threshold) — dual-gate to prevent single-device noise
 
-**This module has NO LLM in the detection path.** Pure ML only. Isolation Forest + DBSCAN.
-LLMs (Sonnet/Haiku) only enter if a finding is escalated into the existing Sasquatch RCA
-pipeline via the webhook. Do not add LLM calls to any detection or scoring code.
+**This module has NO publicly hosted LLM in the detection path.** Pure ML + rule-based only.
+Publicly hosted LLMs (e.g. Anthropic/OpenAI APIs) must never receive client event data — data must not
+egress to third-party providers. Locally hosted LLMs (e.g. Ollama) are permitted for explanation/comparison
+features that operate read-only on top of existing Redis findings. Do not add any LLM calls to detection or scoring code.
 
 ---
 
@@ -71,7 +78,8 @@ sasquatch/
 │   ├── event_collector.py       # 24hr event pull + MAC enrichment → Redis
 │   ├── feature_engineer.py      # Per-MAC feature vector construction
 │   ├── anomaly_detector.py      # Isolation Forest + DBSCAN scoring
-│   ├── webhook_dispatcher.py    # Threshold evaluation + webhook POST
+│   ├── health_scorer.py         # Per-family health score (separate from anomaly pipeline)
+│   ├── webhook_dispatcher.py    # Dual-gate alert dispatch (anomaly + health)
 │   ├── scheduler.py             # APScheduler job definitions
 │   └── api/
 │       ├── __init__.py
@@ -79,9 +87,10 @@ sasquatch/
 ├── frontend/
 │   └── src/
 │       ├── components/
-│       │   ├── SiteOverview.jsx     # Heatmap: event categories × device types
-│       │   ├── FindingsFeed.jsx     # Ranked anomaly findings list
-│       │   └── MacDrilldown.jsx     # Per-MAC 24hr timeline + feature breakdown
+│       │   ├── SiteOverview.jsx         # Heatmap: event categories × device types + health column
+│       │   ├── OrgFamilyInsights.jsx    # Org-wide family heatmap + health column
+│       │   ├── FindingsFeed.jsx         # Ranked anomaly findings list
+│       │   └── MacDrilldown.jsx         # Per-MAC 24hr timeline + feature breakdown
 │       └── App.jsx
 ├── .env                         # See env vars section below
 └── CLAUDE.md                    # This file
@@ -95,9 +104,12 @@ sasquatch/
 |---|---|---|
 | `sasquatch:clients:{site_id}` | 25hr | JSON dict: MAC → {model, os, manufacturer, family} |
 | `sasquatch:events:{site_id}` | 24hr | JSON array: enriched event objects |
-| `sasquatch:features:{site_id}` | 24hr | JSON dict: MAC → feature vector dict |
-| `sasquatch:anomalies:{site_id}` | 24hr | JSON dict: MAC → {if_score, dbscan_label, is_outlier} |
-| `sasquatch:findings:{site_id}` | 24hr | JSON array: rolled-up findings for GUI + webhook |
+| `sasquatch:features:{site_id}:{wlan_key}` | 24hr | JSON dict: MAC → feature vector dict |
+| `sasquatch:anomalies:{site_id}:{wlan_key}` | 24hr | JSON dict: MAC → {if_score, dbscan_label, is_outlier, is_family_outlier, …} |
+| `sasquatch:health:{site_id}:{wlan_key}` | 24hr | JSON dict: family → {health_score, components, total_events, mac_count} |
+| `sasquatch:findings:{site_id}:{wlan_key}` | 24hr | JSON array: rolled-up findings for GUI + webhook |
+| `sasquatch:org_anomalies:{site_id}:{wlan_key}` | 24hr | JSON dict: per-MAC org-wide scores (written by `score_org_wide`) |
+| `sasquatch:org_findings:{wlan_key}` | 24hr | JSON array: org-wide findings (one entry per device family across all sites) |
 
 **TTL note:** Client cache is 25hr (not 24hr) to provide a buffer so the daily refresh
 job can run before the key expires. All other keys are 24hr.
@@ -478,29 +490,13 @@ a reminder that it applies to both timing features and the frequency vector.
 
 ### `anomaly_detector.py`
 
-**Purpose:** Score each MAC using Isolation Forest (within device family) and DBSCAN
-(across all MACs). Produce per-MAC anomaly scores and roll up to device type findings.
+**Purpose:** Score each MAC through a two-stage ML detection pipeline. Produce per-MAC
+anomaly scores and roll up to device type findings. Does NOT compute health scores —
+that is handled separately by `health_scorer.py`.
 
-**Stage 1 — Isolation Forest (per device family):**
+**Stage 1 — DBSCAN (site-wide) + Family Centroid IF:**
 
-```python
-from sklearn.ensemble import IsolationForest
-
-# Run separately for each device_family group with >= MIN_PEERS MACs
-MIN_PEERS = 5  # Don't run IF on a family with fewer than 5 MACs — not enough signal
-
-clf = IsolationForest(
-    contamination=float(os.getenv("ANOMALY_IF_CONTAMINATION", "0.1")),
-    random_state=42,
-    n_estimators=100
-)
-scores = clf.fit_predict(feature_matrix)  # -1 = outlier, 1 = normal
-raw_scores = clf.decision_function(feature_matrix)  # continuous score
-```
-
-For families below MIN_PEERS, set `if_score = None`, `is_if_outlier = False`.
-
-**Stage 2 — DBSCAN (site-wide):**
+DBSCAN runs per-MAC across all MACs in the WLAN scope:
 
 ```python
 from sklearn.cluster import DBSCAN
@@ -513,31 +509,146 @@ labels = db.fit_predict(full_feature_matrix)  # -1 = noise/outlier
 ```
 
 DBSCAN label -1 means the MAC doesn't fit any cluster — a site-wide behavioral outlier
-regardless of device type. This catches the "all HP printers are failing DNS" case where
-the entire printer family is an outlier from the site population.
+regardless of device type. Families with fewer than `ANOMALY_DBSCAN_MIN_FAMILY_SIZE`
+(default 2) MACs are excluded from DBSCAN (too small to form a meaningful cluster).
+DBSCAN sets `dbscan_label`, `is_dbscan_outlier`, and `dbscan_family_noise_ratio` on
+each MAC record. These values are stored on anomaly records and used by the frontend,
+but DBSCAN noise ratio no longer determines which families are flagged at the family level.
+
+**`is_family_outlier` is set by family centroid Isolation Forest (separate step):**
+
+After DBSCAN, a second IF pass runs across family-level centroids. For each device family
+with ≥ 2 MACs, one mean feature vector (centroid) is computed from all MACs in that family
+using `FEATURE_KEYS` for consistent column ordering. IF is then run across all qualifying
+family centroids. Families whose centroid is an outlier among other family centroids are
+flagged (`is_family_outlier = True`). This catches the case where an entire device family
+behaves differently from all other families at the site.
+
+Requires at least `ANOMALY_CENTROID_IF_MIN_FAMILIES` (default 3) qualifying families
+(≥ 2 MACs each) to run. If fewer qualify, centroid IF is skipped and `flagged_families`
+remains empty.
+
+**Stage 2 — Isolation Forest (per device family):**
+
+```python
+from sklearn.ensemble import IsolationForest
+
+# Run separately for each device_family group with >= MIN_PEERS MACs
+MIN_PEERS = 2  # Don't run IF on a family with fewer than 2 MACs — not enough signal
+
+clf = IsolationForest(
+    contamination=float(os.getenv("ANOMALY_IF_CONTAMINATION", "0.1")),
+    random_state=42,
+    n_estimators=100
+)
+scores = clf.fit_predict(feature_matrix)  # -1 = outlier, 1 = normal
+raw_scores = clf.decision_function(feature_matrix)  # continuous score
+```
+
+For families below MIN_PEERS at a single site, the scorer attempts to supplement with
+feature records from the same family at other org sites (org-level pooling). If the
+combined count still falls below MIN_PEERS, set `if_score = None`, `is_if_outlier = False`.
+
+**No failure weighting in the ML feature vector.** The `_extract_vector_array()` function
+passes raw normalized frequencies to StandardScaler without any column weighting. Failure
+signals are captured by the separate Health Score — mixing them into the anomaly feature
+space conflates "behaves differently" with "is failing", which are distinct signals.
 
 **Finding rollup logic:**
 
-After scoring all MACs, roll up to device family findings:
+After both stages, roll up to device family findings:
 - For each device family: count `is_outlier` MACs / total MACs in family
-- If outlier_ratio > `ANOMALY_FINDING_THRESHOLD` (default 0.3), generate a finding
-- A finding includes: family, outlier_ratio, top contributing features, example MACs
-- Top contributing features: identify which feature dimensions are most extreme for
-  the outlier MACs vs the non-outlier MACs in the same family (simple mean comparison)
+- `is_outlier = is_if_outlier OR is_dbscan_outlier OR is_family_outlier`
+- If outlier_ratio >= `ANOMALY_FINDING_THRESHOLD` (default 0.2), generate a finding
+- Minimum family size to generate a finding:
+  - Families that used org-level IF pooling: **2** (avoids single-device IF noise)
+  - All others: **MIN_PEERS** (2)
+- Top contributing features: mean comparison of outlier MACs vs non-outlier MACs in
+  the same family. For family-wide outliers (all MACs flagged), compares against all
+  other families at the site.
 
 **Finding severity:**
-- `INFO`: outlier_ratio 0.1–0.3
-- `WARNING`: outlier_ratio 0.3–0.6
-- `CRITICAL`: outlier_ratio > 0.6
+- `minimal`: outlier_ratio 0–0.3
+- `moderate`: outlier_ratio 0.3–0.6
+- `significant`: outlier_ratio > 0.6
 
-Only `CRITICAL` findings trigger the webhook by default. Configurable via
-`ANOMALY_WEBHOOK_SEVERITY_THRESHOLD` in `.env`.
+Findings at any severity are stored in Redis and visible in the UI. Webhook dispatch
+is governed by the dual gate in `webhook_dispatcher.py` — severity alone is not sufficient.
+
+---
+
+### `health_scorer.py`
+
+**Purpose:** Compute a per-family health score that is completely independent of the anomaly
+detection pipeline. The health score answers "is this device family experiencing elevated
+failures?" — separate from "is this device family behaving unusually?"
+
+**Input:** Redis `sasquatch:features:{site_id}:{wlan_key}` (already computed by `feature_engineer`)
+**Output:** Redis `sasquatch:health:{site_id}:{wlan_key}`
+
+**Per-device average, not volume-weighted pool.** Each MAC's normalized feature vector
+already encodes per-MAC failure rates (e.g. `AUTH_FAILURE / (AUTH_SUCCESS + AUTH_FAILURE)`).
+The family health score is the **simple mean of per-MAC scores** — every device gets one
+equal vote regardless of how many events it generated. This prevents a single high-volume
+misbehaving device from dragging down the family score.
+
+**Score formula per MAC:**
+```python
+# Aggregate all success and failure events across all categories.
+# Neutral events (DISASSOC, OTHER, CAPTIVE_PORTAL, etc.) are excluded from
+# the denominator so they don't dilute the failure signal.
+SUCCESS_CATS = (AUTH_SUCCESS, ROAM_SUCCESS, DHCP_SUCCESS, DNS_SUCCESS, ARP_SUCCESS)
+FAILURE_CATS = (AUTH_FAILURE, ROAM_FAILURE, DHCP_FAILURE, DNS_FAILURE, ARP_FAILURE)
+
+total_success = sum(vec[cat] for cat in SUCCESS_CATS)
+total_failure = sum(vec[cat] for cat in FAILURE_CATS)
+total = total_success + total_failure
+
+mac_health = 1.0 - (total_failure / total)  if total > 0 else 1.0
+family_health_score = mean(mac_health for mac in family)
+```
+
+**Why aggregate instead of per-category weighted average:** A device with 100% DHCP
+failure and perfect auth/roam would previously score 0.80 health (DHCP weight = 0.20).
+Under the aggregate model it scores 0.0 — all outcome-bearing events are failures. Any
+category failing completely drags health to its floor. The per-category breakdown is
+still computed and stored in `components` for tooltip display, but does not affect the
+health score itself.
+
+**Score ranges:** 1.0 = no failures observed. 0.0 = all outcome-bearing events are failures.
+Default alert threshold: `ANOMALY_HEALTH_SCORE_THRESHOLD = 0.75`.
+
+**Key functions:**
+- `compute_family_health(features)` — pure computation, no I/O, testable in isolation
+- `score_health(site_id, wlan)` — reads features from Redis, calls above, writes results
+- `get_health(site_id, wlan)` — Redis read helper used by routes and webhook dispatcher
+
+**Run order:** `score_health` must be called after `build_features` and before
+`webhook_dispatcher.evaluate_and_dispatch`. It runs in the scheduler, background detection
+task, and org-wide detection job.
+
+**Critical:** Every code path that calls `build_features` must also call `score_health`
+immediately after, or health data will be stale/expired (24hr TTL) while anomaly findings
+remain fresh. The `POST /org/detect` route must call `score_health(sid, wlan)` inside
+its Phase 1 feature-build loop — omitting it leaves health null for families that only
+appear at a small number of sites.
 
 ---
 
 ### `webhook_dispatcher.py`
 
-**Purpose:** POST findings that exceed the severity threshold to the configured webhook URL.
+**Purpose:** Apply the dual alert gate and POST qualifying findings to the webhook URL.
+
+**Dual alert gate — all three conditions must be true to fire the webhook:**
+1. `finding["is_family_outlier"] == True` — the centroid IF flagged the whole family as
+   behaviorally different from all other device types. Single-device IF or DBSCAN outliers
+   are visible in the UI but never trigger the webhook.
+2. `family health_score < ANOMALY_HEALTH_SCORE_THRESHOLD` — the family is also measurably
+   failing, not just behaviorally unusual.
+3. `finding["severity"] >= ANOMALY_WEBHOOK_SEVERITY_THRESHOLD` — severity floor (default: `significant`).
+
+Valid severity values: `minimal`, `moderate`, `significant`. Do not use `CRITICAL` — it is
+not a valid severity string and will cause `_meets_severity()` to return False for everything.
 
 **Webhook payload:**
 ```json
@@ -545,26 +656,29 @@ Only `CRITICAL` findings trigger the webhook by default. Configurable via
   "source": "sasquatch_client_anomaly",
   "site_id": "04edb3ac-542a-4d1d-ad90-b1e2fd682a67",
   "timestamp": "2025-01-15T14:32:00Z",
-  "finding_count": 2,
+  "finding_count": 1,
   "findings": [
     {
       "device_family": "iPhone",
-      "severity": "CRITICAL",
+      "severity": "significant",
       "outlier_ratio": 0.72,
       "affected_mac_count": 18,
+      "is_family_outlier": true,
+      "health_score": 0.61,
+      "health_components": {"auth": 0.42, "roam": 0.08, "dhcp": 0.02, "dns": 0.01, "arp": 0.0},
       "example_macs": ["aa:bb:cc:dd:ee:ff", "11:22:33:44:55:66"],
       "top_features": [
-        {"feature": "repetition_score", "outlier_mean": 0.84, "baseline_mean": 0.12},
-        {"feature": "failure_ratio_dhcp", "outlier_mean": 0.91, "baseline_mean": 0.03}
+        {"feature": "AUTH_FAILURE", "outlier_mean": 0.38, "baseline_mean": 0.03},
+        {"feature": "AUTH_SUCCESS", "outlier_mean": 0.12, "baseline_mean": 0.41}
       ],
-      "probable_pattern": "dhcp_loop"
+      "probable_pattern": "auth_failure_terminal"
     }
   ]
 }
 ```
 
 **`probable_pattern` field:** Derive from top contributing features using rule-based
-lookup — NO LLM. Evaluated in priority order (first match wins):
+lookup — NO LLM (rule-based only, no network calls). Evaluated in priority order (first match wins):
 
 | Pattern label | Trigger condition |
 |---|---|
@@ -602,11 +716,16 @@ scheduler.add_job(event_and_detect_job, 'interval',
                   minutes=int(os.getenv("DETECTION_INTERVAL_MINUTES", "15")))
 ```
 
-`event_and_detect_job` runs these in sequence:
+`event_and_detect_job` runs these in sequence per WLAN scope (`__all__` + each unique SSID):
 1. `event_collector.collect(site_id)`
-2. `feature_engineer.build_features(site_id)`
-3. `anomaly_detector.score(site_id)`
-4. `webhook_dispatcher.evaluate_and_dispatch(site_id)`
+2. `feature_engineer.build_features(site_id, wlan)`
+3. `health_scorer.score_health(site_id, wlan)`   ← must run before webhook dispatch
+4. `anomaly_detector.score(site_id, wlan)`
+5. `webhook_dispatcher.evaluate_and_dispatch(site_id)`
+
+The same sequence runs in `_run_wlan_detection_bg()` in `routes.py` (triggered by the
+"Re-detect Anomalies" button). Any code path that calls `build_features` + `score` must
+also call `score_health` in between, so health data is never stale relative to anomaly data.
 
 If any step raises, log the error and skip remaining steps for that cycle. Do not
 let one bad cycle corrupt Redis state from the previous good cycle.
@@ -616,37 +735,55 @@ let one bad cycle corrupt Redis state from the previous good cycle.
 ### FastAPI Routes (`api/routes.py`)
 
 ```
-GET  /api/v1/sites                              → list configured sites from .env
-GET  /api/v1/sites/{site_id}/findings           → current findings from Redis
-GET  /api/v1/sites/{site_id}/clients            → client list with device type breakdown
-GET  /api/v1/sites/{site_id}/events/summary     → event category counts for GUI charts
-GET  /api/v1/sites/{site_id}/anomalies/{mac}    → full event timeline + scores for one MAC
-POST /api/v1/sites/{site_id}/refresh            → manually trigger client cache refresh
-GET  /api/v1/sites/{site_id}/status             → last run timestamp, event count, finding count
+GET  /api/v1/sites                                   → list configured sites from .env
+GET  /api/v1/sites/{site_id}/findings                → current findings from Redis
+GET  /api/v1/sites/{site_id}/health                  → per-family health scores from Redis
+GET  /api/v1/sites/{site_id}/clients                 → client list with device type breakdown
+GET  /api/v1/sites/{site_id}/events/summary          → event category counts for GUI charts
+GET  /api/v1/sites/{site_id}/anomalies/{mac}         → full event timeline + scores for one MAC
+GET  /api/v1/sites/{site_id}/families/{family}/if-outliers → per-family IF deviation list
+POST /api/v1/sites/{site_id}/refresh                 → manually trigger client cache refresh
+GET  /api/v1/sites/{site_id}/status                  → last run timestamp, event count, finding count
+
+GET  /api/v1/org/findings                            → org-wide findings (cross-site scoring)
+GET  /api/v1/org/family-insights                     → per-family heatmap + health scores org-wide
+GET  /api/v1/org/families/{family}/drilldown         → per-MAC drilldown for a family across all sites
 ```
 
 All responses are JSON. All reads come from Redis — no real-time Mist API calls in the
 request path. The API is read-only except for the manual refresh POST.
 
+The `/health` endpoint returns `{family: {health_score, components, total_events, mac_count}}`.
+The `/org/family-insights` endpoint includes `health_score` and `health_components` per family,
+computed as a volume-weighted average of per-site health scores across all sites.
+
 ---
 
-### React Frontend — Three Views
+### React Frontend
 
 **1. Site Overview (`SiteOverview.jsx`)**
 - Heatmap: rows = device families, columns = event categories, cell = failure ratio
 - Color scale: green (0%) → yellow → red (100%)
-- Anomaly score badge per device family row (INFO / WARNING / CRITICAL)
-- Data source: `/api/v1/sites/{site_id}/events/summary` + `/api/v1/sites/{site_id}/findings`
-- Auto-refreshes every `DETECTION_INTERVAL_MINUTES`
+- Anomaly badge per device family row (`family` / `significant` / `moderate` / OK)
+- **Health column**: bar + percentage showing family health score (green ≥85%, yellow 75–85%, orange 55–75%, red <55%). Hover for per-category breakdown.
+- Data source: `events/summary` + `findings` + `health` (three concurrent fetches)
+- Auto-refreshes every 60s
 
-**2. Findings Feed (`FindingsFeed.jsx`)**
+**2. Org Family Insights (`OrgFamilyInsights.jsx`)**
+- Same heatmap layout but aggregated across all org sites
+- Anomaly badge reflects worst finding across all sites for that family
+- **Health column**: volume-weighted average health score from all sites. Hover tooltip shows per-category failure rates.
+- No "Device Family Behavior Explanation" / Shapley column — that detail belongs in drilldowns
+- Data source: `/api/v1/org/family-insights`
+
+**3. Findings Feed (`FindingsFeed.jsx`)**
 - Ranked list of active findings, highest severity first
 - Each card shows: device family, severity badge, outlier ratio, top feature evidence,
   affected MAC count, timestamp
 - Expandable to show example MACs with links to MAC drill-down view
 - Data source: `/api/v1/sites/{site_id}/findings`
 
-**3. MAC Drill-down (`MacDrilldown.jsx`)**
+**4. MAC Drill-down (`MacDrilldown.jsx`)**
 - 24hr event timeline (chronological event list with timestamps and types)
 - Feature vector bar chart vs. family baseline
 - Isolation Forest score and DBSCAN label display
@@ -672,16 +809,25 @@ REDIS_URL=redis://localhost:6379
 # Scheduling
 DETECTION_INTERVAL_MINUTES=15
 
-# ML Tuning
-ANOMALY_IF_CONTAMINATION=0.1
-ANOMALY_DBSCAN_EPS=0.5
+# ML Tuning — Isolation Forest + DBSCAN
+ANOMALY_IF_CONTAMINATION=0.05
+ANOMALY_DBSCAN_EPS=2.5
 ANOMALY_DBSCAN_MIN_SAMPLES=5
-ANOMALY_FINDING_THRESHOLD=0.3
+ANOMALY_DBSCAN_MIN_FAMILY_SIZE=5
+ANOMALY_FINDING_THRESHOLD=0.2
 ANOMALY_MIN_PEERS=5
+ANOMALY_MIN_MAC_EVENTS=20
+ANOMALY_CENTROID_IF_MIN_FAMILIES=3
 
-# Webhook
+# Health Score (health_scorer.py)
+# Families with health_score below this value are considered degraded for webhook gating.
+# Range: 0.0 (all failing) to 1.0 (no failures). Tune down if too noisy.
+ANOMALY_HEALTH_SCORE_THRESHOLD=0.75
+
+# Webhook — dual gate: is_family_outlier AND health_score < threshold AND severity >= threshold
+# Valid severity values: minimal, moderate, significant  (do NOT use CRITICAL — invalid)
 ANOMALY_WEBHOOK_URL=https://project-sasquatch-production.up.railway.app/webhook/anomaly
-ANOMALY_WEBHOOK_SEVERITY_THRESHOLD=CRITICAL
+ANOMALY_WEBHOOK_SEVERITY_THRESHOLD=significant
 
 # Frontend
 VITE_API_BASE_URL=http://localhost:8000
@@ -689,16 +835,19 @@ VITE_API_BASE_URL=http://localhost:8000
 
 ---
 
-## Org-Level Scope (Future Enhancement)
+## Org-Level Scope
 
-The same client search and event endpoints exist at org level:
-```
-GET https://{MIST_CLOUD_HOST}/api/v1/orgs/{org_id}/clients/search?limit=1000
-GET https://{MIST_CLOUD_HOST}/api/v1/orgs/{org_id}/clients/events?limit=1000
-```
-Pagination behavior is identical. v1 of this module targets a single site via
-`MIST_SITE_ID`. Org-level monitoring (all sites in one poll) is a natural v2
-enhancement — the architecture supports it by parameterizing `site_id` throughout.
+Org-wide cross-site detection is fully implemented. When `MIST_ORG_ID` is configured,
+`org_cross_site_detect_job` runs every `ORG_DETECTION_INTERVAL_HOURS` (default: 6h) and:
+1. Collects events for every site in the org
+2. Builds features + health scores for every site
+3. Pools all MACs org-wide and runs DBSCAN, Centroid IF, and per-family IF against the
+   combined population — each MAC is scored relative to all org peers, not just its own site
+4. Stores results under `sasquatch:org_anomalies:{site_id}:{wlan_key}` and `sasquatch:org_findings:{wlan_key}`
+5. Dispatches a single org-wide webhook from the combined findings
+
+The org-level pipeline uses the same `score_org_wide()` function in `anomaly_detector.py`
+and the same dual alert gate in `webhook_dispatcher.py`.
 
 ---
 
@@ -823,9 +972,11 @@ Build in this order to enable incremental testing:
 
 ## What NOT to Build (Explicit Exclusions)
 
-- No LLM in the detection, scoring, or webhook path
+- No publicly hosted LLM anywhere (no Anthropic/OpenAI API calls) — data must not egress to third-party providers
+- No LLM in the detection, scoring, health scoring, or webhook path (locally hosted LLMs are permitted for read-only explanation features only)
 - No SLE data — client event stream only
 - No per-AP correlation (future enhancement)
 - No real-time Mist API calls in the FastAPI request path — reads from Redis only
-- No authentication on the FastAPI/React interface (internal tool)
-- No multi-site support in v1 — single MIST_SITE_ID from .env is sufficient
+- No failure weighting in the anomaly ML feature vector — failure signals belong in the health score, not the anomaly vector
+- Do not gate webhooks on single-device IF or DBSCAN anomalies — only `is_family_outlier` (centroid IF) qualifies for webhook dispatch
+- Do not re-introduce Stage 3 rule-based threshold detection — that signal is now covered by the health score
