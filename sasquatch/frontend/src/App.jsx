@@ -1,5 +1,4 @@
 import { useState, useEffect, useRef } from "react";
-import AiAssist from "./components/AiAssist";
 import FamilyDrilldown from "./components/FamilyDrilldown";
 import FindingsFeed from "./components/FindingsFeed";
 import Login from "./components/Login";
@@ -12,11 +11,17 @@ const ORG_FOCUS_VALUE = "__org__";
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL || "http://localhost:8000";
 
+const ACTION_BTN_PULSE_STYLE = `
+@keyframes sq-btn-pulse {
+  0%, 100% { border-color: #2a2a3a; }
+  50%       { border-color: #4a4a7a; }
+}`;
+
 function actionBtnStyle(state) {
   const base = { border: "1px solid", borderRadius: "4px", padding: "4px 10px", cursor: "pointer", fontSize: "12px", fontFamily: "monospace" };
   if (state === "ok")      return { ...base, background: "#1a3a1a", color: "#2d7a4f", borderColor: "#2d7a4f55" };
   if (state === "error")   return { ...base, background: "#2a1515", color: "#e05555", borderColor: "#e0555555" };
-  if (state === "loading") return { ...base, background: "#1a1a2a", color: "#555", borderColor: "#2a2a3a", cursor: "default" };
+  if (state === "loading") return { ...base, background: "#1a1a2a", color: "#555", borderColor: "#2a2a3a", cursor: "default", animation: "sq-btn-pulse 1.2s ease-in-out infinite" };
   if (state === "warn")    return { ...base, background: "#2a1f10", color: "#e0a835", borderColor: "#e0a83555" };
   return { ...base, background: "#1a1a1a", color: "#888", borderColor: "#333" };
 }
@@ -115,7 +120,7 @@ export default function App() {
   const [selectedSite, setSelectedSite] = useState(null); // site ID string
   const [selectedMac, setSelectedMac] = useState(null);
   const [selectedFamily, setSelectedFamily] = useState(null);
-  const [view, setView] = useState("overview"); // "overview" | "findings" | "family" | "mac" | "ai"
+  const [view, setView] = useState("overview"); // "overview" | "findings" | "family" | "mac"
   const [siteSearch, setSiteSearch] = useState("");
   const [siteDropdownOpen, setSiteDropdownOpen] = useState(false);
   const [discoveryRefreshToken, setDiscoveryRefreshToken] = useState(0);
@@ -220,7 +225,10 @@ export default function App() {
     if (!selectedSite) return;
     setAS("clientRefresh", "loading");
     try {
-      const r = await apiFetch(`${API_BASE}/api/v1/sites/${selectedSite}/refresh`, { method: "POST" });
+      const endpoint = selectedSite === ORG_FOCUS_VALUE
+        ? `${API_BASE}/api/v1/org/refresh`
+        : `${API_BASE}/api/v1/sites/${selectedSite}/refresh`;
+      const r = await apiFetch(endpoint, { method: "POST" });
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       setAS("clientRefresh", "ok");
       setTimeout(() => setAS("clientRefresh", "idle"), 2000);
@@ -251,7 +259,7 @@ export default function App() {
 
   async function handleFlush() {
     if (!selectedSite) return;
-    if (actionState.flush === "idle") { setAS("flush", "confirm"); return; }
+    if (actionState.flush === "idle") { setAS("flush", "confirm"); setTimeout(() => setActionState(prev => prev.flush === "confirm" ? { ...prev, flush: "idle" } : prev), 4000); return; }
     if (actionState.flush !== "confirm") return;
     setAS("flush", "loading");
     try {
@@ -337,6 +345,7 @@ export default function App() {
 
   return (
     <div style={{ fontFamily: "monospace", padding: "16px", background: "#111", minHeight: "100vh", color: "#e0e0e0" }}>
+      <style>{ACTION_BTN_PULSE_STYLE}</style>
       <header style={{ borderBottom: "1px solid #333", paddingBottom: "12px", marginBottom: "16px" }}>
         <h1 style={{ margin: 0, fontSize: "18px", color: "#7ec8e3" }}>
           Project Sasquatch — Client Anomaly Detection
@@ -505,13 +514,14 @@ export default function App() {
           {(() => {
             const s = actionState.clientRefresh;
             const isOrg = selectedSite === ORG_FOCUS_VALUE;
+            const label = isOrg ? "Org Client Refresh" : "Client Refresh";
             return (
               <button
                 onClick={handleClientRefresh}
-                disabled={!selectedSite || isOrg || s === "loading"}
+                disabled={!selectedSite || s === "loading"}
                 style={actionBtnStyle(s)}
               >
-                {s === "loading" ? "Refreshing…" : s === "ok" ? "Refreshed ✓" : s === "error" ? "Error ✗" : "Client Refresh"}
+                {s === "loading" ? "Refreshing…" : s === "ok" ? "Refreshed ✓" : s === "error" ? "Error ✗" : label}
               </button>
             );
           })()}
@@ -533,11 +543,10 @@ export default function App() {
           {/* Flush Events */}
           {(() => {
             const s = actionState.flush;
-            const isOrg = selectedSite === ORG_FOCUS_VALUE;
             return (
               <button
                 onClick={handleFlush}
-                disabled={!selectedSite || isOrg || s === "loading"}
+                disabled={!selectedSite || s === "loading"}
                 style={actionBtnStyle(s === "confirm" ? "warn" : s)}
               >
                 {s === "loading" ? "Flushing…" : s === "confirm" ? "Confirm Flush?" : s === "ok" ? "Flushed ✓" : s === "error" ? "Error ✗" : "Flush Events"}
@@ -559,24 +568,6 @@ export default function App() {
             );
           })()}
 
-          {/* AI Assist — right-justified */}
-          <button
-            onClick={() => setView("ai")}
-            style={{
-              marginLeft: "auto",
-              border: "1px solid",
-              borderRadius: "4px",
-              padding: "4px 12px",
-              cursor: "pointer",
-              fontSize: "12px",
-              fontFamily: "monospace",
-              background: view === "ai" ? "#1a2a3a" : "#161616",
-              color: view === "ai" ? "#7ec8e3" : "#7ec8e3",
-              borderColor: view === "ai" ? "#2a5a7e" : "#2a4a5e",
-            }}
-          >
-            AI Assist
-          </button>
         </div>
 
         {/* Progress bar for Full Discovery */}
@@ -614,9 +605,6 @@ export default function App() {
           onBack={() => selectedFamily ? setView("family") : setView("findings")}
           wlan={selectedWlan}
         />
-      )}
-      {view === "ai" && (
-        <AiAssist apiBase={API_BASE} sites={sites} />
       )}
       {wlanFallbackToast && (
         <WlanFallbackToast wlan={wlanFallbackToast} onDismiss={() => setWlanFallbackToast(null)} />
