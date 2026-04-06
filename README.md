@@ -148,8 +148,8 @@ ANOMALY_WEBHOOK_URL=https://your-endpoint/webhook/anomaly
 ANOMALY_WEBHOOK_SEVERITY_THRESHOLD=significant  # minimal | moderate | significant
 
 # Dashboard auth
-APP_USERNAME=sasquatch
-APP_PASSWORD=Sasquatch123
+APP_USERNAME=your_username
+APP_PASSWORD=your_password
 
 # Frontend
 VITE_API_BASE_URL=http://localhost:8000
