@@ -24,7 +24,7 @@ function scaleCoords(points) {
   }));
 }
 
-export default function ClusterViz({ siteId, apiBase, onMacSelect, refreshToken }) {
+export default function ClusterViz({ siteId, apiBase, onMacSelect, refreshToken, wlan = "__all__" }) {
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
@@ -34,12 +34,12 @@ export default function ClusterViz({ siteId, apiBase, onMacSelect, refreshToken 
 
   const load = useCallback(() => {
     setLoading(true);
-    apiFetch(`${apiBase}/api/v1/sites/${siteId}/cluster-viz`)
+    apiFetch(`${apiBase}/api/v1/sites/${siteId}/cluster-viz?wlan=${encodeURIComponent(wlan)}`)
       .then((r) => r.json())
       .then((d) => { setData(d); setError(null); })
       .catch((e) => setError(e.message))
       .finally(() => setLoading(false));
-  }, [siteId, apiBase, refreshToken]);
+  }, [siteId, apiBase, refreshToken, wlan]);
 
   useEffect(() => {
     load();

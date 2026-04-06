@@ -1,13 +1,21 @@
 """
 event_collector.py — Pull client events, enrich with device metadata, store in Redis.
 
-Scheduled runs fetch only the last hour and append to the rolling 24hr dataset.
+Events are stored in per-site Redis sorted sets (sasquatch:events:{site_id}) scored by
+Unix timestamp. Each site has its own set. Entries survive for 7 days (EVENTS_TTL);
+stale entries are purged on each write via ZREMRANGEBYSCORE.
+
+A companion set sasquatch:wlans:{site_id} tracks unique SSIDs seen per site for O(1)
+WLAN enumeration without scanning event data.
+
+Scheduled runs fetch only the last hour and append to the rolling dataset.
 A full 24hr backfill is only performed when explicitly requested via the API.
 """
 
 import json
 import logging
 import os
+import re
 import time
 from typing import Optional
 
@@ -22,7 +30,8 @@ MIST_CLOUD_HOST = os.getenv("MIST_CLOUD_HOST", "api.mist.com")
 MIST_API_TOKEN = os.getenv("MIST_API_TOKEN", "")
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 
-EVENTS_TTL = 24 * 3600  # 24 hours
+# Events are kept for 7 days in the global sorted set.
+EVENTS_TTL = 7 * 24 * 3600
 EVENT_TYPE_INDEX_TTL = 7 * 24 * 3600  # 7 days
 
 # DHCPv6 failure events are excluded from analysis — they are frequent noise on
@@ -55,6 +64,8 @@ MIST_CLIENT_EVENT_TYPES = [
     "MARVIS_EVENT_CLIENT_AUTH_FAILURE",
     "MARVIS_EVENT_CLIENT_AUTH_DENIED",
     "MARVIS_EVENT_CLIENT_MAC_AUTH_FAILURE",
+    "MARVIS_EVENT_SAE_AUTH_FAILURE",
+    "SA_QUERY_TIMEOUT",
     "CLIENT_ASSOCIATION",
     "CLIENT_ASSOCIATION_FAILURE",
     # Roam / reassociation (success)
@@ -118,6 +129,8 @@ EVENT_CATEGORIES: dict[str, list[str]] = {
         "MARVIS_EVENT_CLIENT_AUTH_FAILURE",
         "MARVIS_EVENT_CLIENT_AUTH_DENIED",
         "MARVIS_EVENT_CLIENT_MAC_AUTH_FAILURE",
+        "MARVIS_EVENT_SAE_AUTH_FAILURE",
+        "SA_QUERY_TIMEOUT",
     ],
     "ROAM_SUCCESS": [
         "CLIENT_AUTH_REASSOCIATION",
@@ -184,6 +197,16 @@ def _oui_lookup(mac: str) -> str:
     A real implementation would query a local OUI database.
     """
     return mac[:6].upper() if len(mac) >= 6 else "Unknown"
+
+
+def sanitize_wlan_key(wlan: str) -> str:
+    """
+    Sanitize a WLAN (SSID) name for safe use as a Redis key segment.
+    Replaces colons, slashes, and whitespace with hyphens.
+    """
+    if not wlan or wlan == "__all__":
+        return "__all__"
+    return re.sub(r"[:/\s]", "-", wlan) or "__all__"
 
 
 async def fetch_event_type_index() -> list[str]:
@@ -282,6 +305,11 @@ def _enrich_event(event: dict, client_cache: dict[str, dict]) -> dict:
     enriched = dict(event)
     enriched["event_category"] = _get_category(event.get("type", ""))
 
+    # Store the SSID as an explicit wlan field. No longer appended to device_family —
+    # WLAN is now a first-class scope dimension in the UI and detection pipeline.
+    ssid = (event.get("ssid") or "").strip()
+    enriched["wlan"] = ssid if ssid else None
+
     if client_meta:
         enriched["device_family"] = client_meta.get("family", "Unknown")
         enriched["device_model"] = client_meta.get("model", "Unknown")
@@ -312,12 +340,104 @@ def _enrich_batch(events: list[dict], client_cache: dict) -> tuple[list[dict], s
     return enriched, unknown_types
 
 
+async def _write_events_to_site_set(
+    redis_client, events: list[dict], site_id: str
+) -> int:
+    """
+    Write enriched events to the per-site sorted set (sasquatch:events:{site_id}).
+    Score = Unix timestamp. Member = deterministic JSON string.
+    Cleans up entries older than EVENTS_TTL (7 days) after writing.
+    Also updates sasquatch:wlans:{site_id} for O(1) WLAN enumeration.
+    Returns count of entries written (including already-existing duplicates).
+    """
+    if not events:
+        return 0
+
+    events_key = f"sasquatch:events:{site_id}"
+    wlans_key = f"sasquatch:wlans:{site_id}"
+    cutoff = time.time() - EVENTS_TTL
+
+    # Guard against legacy STRING key written by old per-site schema.
+    # If the key exists but isn't a sorted set, delete it before writing.
+    key_type = await redis_client.type(events_key)
+    if key_type not in ("zset", "none"):
+        log.warning(
+            f"Deleting legacy Redis key {events_key} (type={key_type}); "
+            "migrating to sorted set schema."
+        )
+        await redis_client.delete(events_key)
+
+    pipe = redis_client.pipeline()
+
+    mapping: dict[str, float] = {}
+    wlans: set[str] = set()
+    for event in events:
+        score = float(event.get("timestamp") or 0)
+        member = json.dumps(event, sort_keys=True)
+        mapping[member] = score
+        if event.get("wlan"):
+            wlans.add(event["wlan"])
+
+    if mapping:
+        pipe.zadd(events_key, mapping)
+
+    # Purge entries older than 7 days and refresh TTL
+    pipe.zremrangebyscore(events_key, "-inf", cutoff)
+    pipe.expire(events_key, EVENTS_TTL)
+
+    # Track WLANs seen for this site for O(1) enumeration
+    if wlans:
+        pipe.sadd(wlans_key, *wlans)
+        pipe.expire(wlans_key, EVENTS_TTL)
+
+    await pipe.execute()
+    return len(mapping)
+
+
+async def _load_events_from_site_sets(
+    redis_client,
+    site_id: Optional[str] = None,
+    wlan: Optional[str] = None,
+) -> list[dict]:
+    """
+    Load events from per-site sorted sets, optionally filtered by site and/or WLAN.
+    Returns events from the last EVENTS_TTL window (7 days).
+
+    For a single site: one targeted ZRANGEBYSCORE call.
+    For org-level (no site_id): all site keys discovered via SCAN and fetched in
+    a single pipeline — one Redis round trip regardless of site count.
+    """
+    cutoff = time.time() - EVENTS_TTL
+
+    if site_id:
+        # Guard against legacy STRING key written by old per-site schema
+        key_type = await redis_client.type(f"sasquatch:events:{site_id}")
+        keys = [f"sasquatch:events:{site_id}"] if key_type == "zset" else []
+    else:
+        # _type="zset" skips any legacy STRING keys written by the old per-site schema
+        keys = [k async for k in redis_client.scan_iter("sasquatch:events:*", _type="zset")]
+
+    if not keys:
+        return []
+
+    pipe = redis_client.pipeline()
+    for key in keys:
+        pipe.zrangebyscore(key, cutoff, "+inf")
+    results = await pipe.execute()
+
+    events = [json.loads(m) for batch in results for m in batch]
+
+    if wlan and wlan != "__all__":
+        events = [e for e in events if e.get("wlan") == wlan]
+
+    return events
+
+
 async def collect(site_id: str) -> int:
     """
-    Incremental collect: pull last 1hr of events from Mist, append to the existing
-    rolling dataset in Redis, and age out events older than 24hr.
-    Used by the scheduler. Fails fast if client cache is missing.
-    Returns total count of events in the dataset after the update.
+    Incremental collect: pull last 1hr of events from Mist and append to the global
+    sorted set. Used by the scheduler. Fails fast if client cache is missing.
+    Returns total count of events written (new + already-present).
     """
     redis_client = aioredis.from_url(REDIS_URL, decode_responses=True)
     try:
@@ -331,7 +451,7 @@ async def collect(site_id: str) -> int:
         new_raw = await fetch_all_events(site_id, duration="1h")
         if not new_raw:
             log.info(f"No new events in last 1hr for site {site_id}")
-            new_raw = []
+            return 0
 
         new_enriched, unknown_types = _enrich_batch(new_raw, client_cache)
 
@@ -339,33 +459,12 @@ async def collect(site_id: str) -> int:
             await redis_client.sadd(f"sasquatch:unknown_event_types:{site_id}", *unknown_types)
             log.warning(f"Unknown event types found: {unknown_types}")
 
-        # Load existing dataset
-        key = f"sasquatch:events:{site_id}"
-        existing_raw = await redis_client.get(key)
-        existing: list[dict] = json.loads(existing_raw) if existing_raw else []
-
-        # Deduplicate incoming events against what's already stored
-        existing_keys = {
-            (e.get("timestamp"), e.get("mac"), e.get("type"))
-            for e in existing
-        }
-        truly_new = [
-            e for e in new_enriched
-            if (e.get("timestamp"), e.get("mac"), e.get("type")) not in existing_keys
-        ]
-
-        # Age out events older than 24hr, then append new ones
-        cutoff = time.time() - EVENTS_TTL
-        merged = [e for e in existing if (e.get("timestamp") or 0) >= cutoff]
-        merged.extend(truly_new)
-
-        await redis_client.set(key, json.dumps(merged), ex=EVENTS_TTL)
+        written = await _write_events_to_site_set(redis_client, new_enriched, site_id)
         log.info(
-            f"Incremental collect: +{len(truly_new)} new events "
-            f"({len(new_enriched) - len(truly_new)} dupes skipped), "
-            f"{len(merged)} total in dataset → {key}"
+            f"Incremental collect: {len(new_enriched)} events processed for site {site_id} "
+            f"({written} unique members written to site set)"
         )
-        return len(merged)
+        return written
 
     finally:
         await redis_client.aclose()
@@ -373,11 +472,13 @@ async def collect(site_id: str) -> int:
 
 async def collect_full(site_id: str, on_page: Optional[callable] = None) -> int:
     """
-    Full collect: pull last 24hr of events from Mist and replace the Redis
-    dataset entirely. Used by manual API trigger only.
+    Full collect: pull last 24hr of events from Mist and add to the global sorted set.
+    Used by manual API trigger only. Does not replace existing history — events from
+    previous days (up to 7 days) are preserved. Same-day events are deduplicated by
+    the sorted set's unique member constraint.
 
     on_page: optional async callable forwarded to fetch_all_events for progress tracking.
-    Returns count of events stored.
+    Returns count of event members written.
     """
     redis_client = aioredis.from_url(REDIS_URL, decode_responses=True)
     try:
@@ -399,24 +500,60 @@ async def collect_full(site_id: str, on_page: Optional[callable] = None) -> int:
             await redis_client.sadd(f"sasquatch:unknown_event_types:{site_id}", *unknown_types)
             log.warning(f"Unknown event types found: {unknown_types}")
 
-        key = f"sasquatch:events:{site_id}"
-        await redis_client.set(key, json.dumps(enriched), ex=EVENTS_TTL)
-        log.info(f"Full collect: stored {len(enriched)} events → {key}")
-        return len(enriched)
+        written = await _write_events_to_site_set(redis_client, enriched, site_id)
+        log.info(f"Full collect: {len(enriched)} events processed, {written} written → site set")
+        return written
 
     finally:
         await redis_client.aclose()
 
 
-async def get_events(site_id: str) -> list[dict]:
+async def get_events(
+    site_id: Optional[str] = None,
+    wlan: Optional[str] = None,
+) -> list[dict]:
+    """
+    Load events from per-site sorted sets, optionally filtered by site and/or WLAN.
+    wlan=None or wlan="__all__" returns all WLANs.
+    """
     redis_client = aioredis.from_url(REDIS_URL, decode_responses=True)
     try:
-        raw = await redis_client.get(f"sasquatch:events:{site_id}")
+        return await _load_events_from_site_sets(
+            redis_client,
+            site_id=site_id,
+            wlan=wlan if (wlan and wlan != "__all__") else None,
+        )
     finally:
         await redis_client.aclose()
-    if not raw:
-        return []
-    return json.loads(raw)
+
+
+async def get_wlans(site_id: Optional[str] = None) -> list[str]:
+    """
+    Return sorted list of unique WLAN (SSID) names for a site or org-wide.
+    For a single site, reads from sasquatch:wlans:{site_id} set — O(1).
+    Falls back to scanning event data only if the WLAN set is missing.
+    """
+    redis_client = aioredis.from_url(REDIS_URL, decode_responses=True)
+    try:
+        if site_id:
+            members = await redis_client.smembers(f"sasquatch:wlans:{site_id}")
+            if members:
+                return sorted(members)
+        # Org-level or fallback: union all site WLAN sets in one pipeline
+        wlan_keys = [k async for k in redis_client.scan_iter("sasquatch:wlans:*")]
+        if wlan_keys:
+            pipe = redis_client.pipeline()
+            for k in wlan_keys:
+                pipe.smembers(k)
+            results = await pipe.execute()
+            all_wlans = sorted({w for batch in results for w in batch})
+            if not site_id:
+                return all_wlans
+        # Last resort: derive from event data (handles cold start before first write)
+        events = await _load_events_from_site_sets(redis_client, site_id=site_id)
+        return sorted({e["wlan"] for e in events if e.get("wlan")})
+    finally:
+        await redis_client.aclose()
 
 
 async def get_event_type_index(site_id: Optional[str] = None) -> list[str]:

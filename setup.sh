@@ -45,5 +45,57 @@ npm run build
 echo "✓ Frontend built → sasquatch/frontend/dist/"
 cd "$SCRIPT_DIR"
 
+# ── Ollama (local LLM — required for AI Assist) ───────────────────────────────
+echo ""
+echo "--- Ollama (local LLM for AI Assist) ---"
+
+# Determine which model to pull — read from .env if present, else default
+OLLAMA_MODEL_TO_PULL="llama3.2"
+if [ -f ".env" ]; then
+  _env_model=$(grep -E '^OLLAMA_MODEL=' .env | head -1 | cut -d'=' -f2- | tr -d '"'"'" | xargs)
+  if [ -n "$_env_model" ]; then
+    OLLAMA_MODEL_TO_PULL="$_env_model"
+  fi
+fi
+
+if command -v ollama &>/dev/null; then
+  echo "✓ Ollama already installed: $(ollama --version 2>/dev/null || echo 'version unknown')"
+else
+  echo "Installing Ollama..."
+  if [[ "$OSTYPE" == "darwin"* ]]; then
+    if command -v brew &>/dev/null; then
+      brew install --quiet ollama
+    else
+      echo "  Homebrew not found — using install script..."
+      curl -fsSL https://ollama.com/install.sh | sh
+    fi
+  elif [[ "$OSTYPE" == "linux"* ]]; then
+    curl -fsSL https://ollama.com/install.sh | sh
+  else
+    echo "  Unsupported OS for automatic Ollama install."
+    echo "  Download manually from https://ollama.com/download"
+    echo "  AI Assist will not be available until Ollama is installed."
+    OLLAMA_SKIP=true
+  fi
+fi
+
+if [ "${OLLAMA_SKIP:-false}" != "true" ] && command -v ollama &>/dev/null; then
+  echo "✓ Ollama installed"
+
+  # Start a temporary Ollama server to pull the model, then stop it
+  echo "Pulling model '$OLLAMA_MODEL_TO_PULL' (this may take a few minutes on first run)..."
+  # Start Ollama in background just long enough to pull
+  OLLAMA_HOST=127.0.0.1:11434 ollama serve >/dev/null 2>&1 &
+  _tmp_ollama_pid=$!
+  # Wait for it to be ready (up to 15s)
+  for i in {1..30}; do
+    if curl -sf http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then break; fi
+    sleep 0.5
+  done
+  ollama pull "$OLLAMA_MODEL_TO_PULL"
+  kill "$_tmp_ollama_pid" 2>/dev/null || true
+  echo "✓ Model '$OLLAMA_MODEL_TO_PULL' ready"
+fi
+
 echo ""
 echo "Setup complete. Run ./start.sh to launch all services."

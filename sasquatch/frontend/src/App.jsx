@@ -1,10 +1,14 @@
-import { useState, useEffect } from "react";
-import SiteOverview from "./components/SiteOverview";
-import FindingsFeed from "./components/FindingsFeed";
-import MacDrilldown from "./components/MacDrilldown";
+import { useState, useEffect, useRef } from "react";
+import AiAssist from "./components/AiAssist";
 import FamilyDrilldown from "./components/FamilyDrilldown";
+import FindingsFeed from "./components/FindingsFeed";
 import Login from "./components/Login";
+import MacDrilldown from "./components/MacDrilldown";
+import OrgOverview from "./components/OrgOverview";
+import SiteOverview from "./components/SiteOverview";
 import { apiFetch, getToken, setToken, clearToken } from "./api";
+
+const ORG_FOCUS_VALUE = "__org__";
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL || "http://localhost:8000";
 
@@ -15,6 +19,51 @@ function actionBtnStyle(state) {
   if (state === "loading") return { ...base, background: "#1a1a2a", color: "#555", borderColor: "#2a2a3a", cursor: "default" };
   if (state === "warn")    return { ...base, background: "#2a1f10", color: "#e0a835", borderColor: "#e0a83555" };
   return { ...base, background: "#1a1a1a", color: "#888", borderColor: "#333" };
+}
+
+function WlanFallbackToast({ wlan, onDismiss }) {
+  return (
+    <div style={{
+      position: "fixed", bottom: "24px", right: "24px", zIndex: 200,
+      background: "#221a0a", border: "1px solid #e0a83560",
+      borderRadius: "6px", padding: "10px 14px",
+      color: "#e0a835", fontSize: "12px", fontFamily: "monospace",
+      maxWidth: "300px", boxShadow: "0 4px 16px rgba(0,0,0,0.6)",
+      display: "flex", alignItems: "flex-start", gap: "10px",
+    }}>
+      <span style={{ fontSize: "13px", lineHeight: "1.4" }}>⚠</span>
+      <div style={{ flex: 1 }}>
+        <div style={{ marginBottom: "2px", color: "#e0e0e0" }}>WLAN not available at this site</div>
+        <div><span style={{ color: "#e0a835" }}>{wlan}</span> — showing all WLANs</div>
+      </div>
+      <button onClick={onDismiss} style={{ background: "none", border: "none", color: "#555", cursor: "pointer", fontSize: "16px", padding: 0, lineHeight: 1 }}>×</button>
+    </div>
+  );
+}
+
+function WlanLoadingOverlay() {
+  return (
+    <>
+      <style>{`@keyframes sq-spin { to { transform: rotate(360deg); } }`}</style>
+      <div style={{
+        position: "absolute", inset: 0, zIndex: 50,
+        background: "rgba(17,17,17,0.72)",
+        display: "flex", alignItems: "center", justifyContent: "center",
+        borderRadius: "4px",
+      }}>
+        <div style={{ textAlign: "center" }}>
+          <div style={{
+            width: "22px", height: "22px", margin: "0 auto",
+            border: "2px solid #2a2a3a", borderTopColor: "#7ec8e3",
+            borderRadius: "50%", animation: "sq-spin 0.75s linear infinite",
+          }} />
+          <div style={{ color: "#7ec8e3", fontSize: "12px", marginTop: "10px", letterSpacing: "0.05em" }}>
+            Loading…
+          </div>
+        </div>
+      </div>
+    </>
+  );
 }
 
 function ProgressBar({ progress }) {
@@ -66,10 +115,19 @@ export default function App() {
   const [selectedSite, setSelectedSite] = useState(null); // site ID string
   const [selectedMac, setSelectedMac] = useState(null);
   const [selectedFamily, setSelectedFamily] = useState(null);
-  const [view, setView] = useState("overview"); // "overview" | "findings" | "family" | "mac"
+  const [view, setView] = useState("overview"); // "overview" | "findings" | "family" | "mac" | "ai"
   const [siteSearch, setSiteSearch] = useState("");
   const [siteDropdownOpen, setSiteDropdownOpen] = useState(false);
   const [discoveryRefreshToken, setDiscoveryRefreshToken] = useState(0);
+
+  // WLAN scope
+  const [wlans, setWlans] = useState([]); // list of SSID name strings
+  const [selectedWlan, setSelectedWlan] = useState("__all__");
+  const [wlanLoading, setWlanLoading] = useState(false);
+  const [wlanFallbackToast, setWlanFallbackToast] = useState(null); // WLAN name that was dropped
+  // Ref so the WLAN fetch effect can read the current selection without it being a dep
+  const selectedWlanRef = useRef(selectedWlan);
+  useEffect(() => { selectedWlanRef.current = selectedWlan; }, [selectedWlan]);
 
   // Action bar state
   const [focusSite, setFocusSite] = useState(null); // {site_id, source}
@@ -111,12 +169,38 @@ export default function App() {
       .catch(console.error);
   }, [token]);
 
+  // Fetch available WLANs whenever the selected site changes.
+  // If the previously-selected WLAN doesn't exist at the new site, fall back to __all__ and toast.
+  useEffect(() => {
+    setWlans([]);
+    if (!token || !selectedSite) return;
+    const url = selectedSite === ORG_FOCUS_VALUE
+      ? `${API_BASE}/api/v1/wlans`
+      : `${API_BASE}/api/v1/wlans?site_id=${selectedSite}`;
+    apiFetch(url)
+      .then((r) => r.json())
+      .then((data) => {
+        const newWlans = data.wlans || [];
+        setWlans(newWlans);
+        const prev = selectedWlanRef.current;
+        if (prev !== "__all__" && !newWlans.includes(prev)) {
+          setSelectedWlan("__all__");
+          setWlanFallbackToast(prev);
+          setTimeout(() => setWlanFallbackToast(null), 3500);
+        }
+      })
+      .catch(console.error);
+  }, [token, selectedSite]);
+
   // Poll progress while Full Discovery is running
   useEffect(() => {
     if (!progressPolling || !selectedSite) return;
     const poll = setInterval(async () => {
       try {
-        const r = await apiFetch(`${API_BASE}/api/v1/sites/${selectedSite}/progress`);
+        const progressUrl = selectedSite === ORG_FOCUS_VALUE
+          ? `${API_BASE}/api/v1/org/progress`
+          : `${API_BASE}/api/v1/sites/${selectedSite}/progress`;
+        const r = await apiFetch(progressUrl);
         const data = await r.json();
         setProgress(data);
         if (data.phase === "complete" || data.phase === "error" || data.phase === "idle") {
@@ -152,7 +236,10 @@ export default function App() {
     setAS("discover", "running");
     setProgressPolling(true);
     try {
-      const r = await apiFetch(`${API_BASE}/api/v1/sites/${selectedSite}/run`, { method: "POST" });
+      const endpoint = selectedSite === ORG_FOCUS_VALUE
+        ? `${API_BASE}/api/v1/org/run`
+        : `${API_BASE}/api/v1/sites/${selectedSite}/run`;
+      const r = await apiFetch(endpoint, { method: "POST" });
       if (!r.ok && r.status !== 409) throw new Error(`HTTP ${r.status}`);
     } catch (e) {
       setProgress({ phase: "error", message: e.message });
@@ -168,7 +255,10 @@ export default function App() {
     if (actionState.flush !== "confirm") return;
     setAS("flush", "loading");
     try {
-      await apiFetch(`${API_BASE}/api/v1/sites/${selectedSite}/flush`, { method: "POST" });
+      const endpoint = selectedSite === ORG_FOCUS_VALUE
+        ? `${API_BASE}/api/v1/org/flush`
+        : `${API_BASE}/api/v1/sites/${selectedSite}/flush`;
+      await apiFetch(endpoint, { method: "POST" });
       setAS("flush", "ok");
       setTimeout(() => setAS("flush", "idle"), 2000);
     } catch {
@@ -181,8 +271,12 @@ export default function App() {
     if (!selectedSite) return;
     setAS("detect", "loading");
     try {
-      await apiFetch(`${API_BASE}/api/v1/sites/${selectedSite}/detect`, { method: "POST" });
+      const endpoint = selectedSite === ORG_FOCUS_VALUE
+        ? `${API_BASE}/api/v1/org/detect`
+        : `${API_BASE}/api/v1/sites/${selectedSite}/detect`;
+      await apiFetch(endpoint, { method: "POST" });
       setAS("detect", "ok");
+      setDiscoveryRefreshToken((t) => t + 1);
       setTimeout(() => setAS("detect", "idle"), 2000);
     } catch {
       setAS("detect", "error");
@@ -228,6 +322,19 @@ export default function App() {
     setView("family");
   }
 
+  function handleSiteSelect(siteId) {
+    setSelectedSite(siteId);
+    setView("overview");
+    setSelectedMac(null);
+    setSelectedFamily(null);
+  }
+
+  function handleOrgMacSelect(mac, siteId) {
+    setSelectedSite(siteId);
+    setSelectedMac(mac);
+    setView("mac");
+  }
+
   return (
     <div style={{ fontFamily: "monospace", padding: "16px", background: "#111", minHeight: "100vh", color: "#e0e0e0" }}>
       <header style={{ borderBottom: "1px solid #333", paddingBottom: "12px", marginBottom: "16px" }}>
@@ -239,7 +346,7 @@ export default function App() {
           <div style={{ position: "relative" }}>
             <input
               type="text"
-              value={siteDropdownOpen ? siteSearch : (sites.find(s => s.id === selectedSite)?.name ?? "")}
+              value={siteDropdownOpen ? siteSearch : (selectedSite === ORG_FOCUS_VALUE ? "Organization" : (sites.find(s => s.id === selectedSite)?.name ?? ""))}
               placeholder={sites.length === 0 ? "Loading sites…" : "Search sites…"}
               onFocus={() => { setSiteDropdownOpen(true); setSiteSearch(""); }}
               onChange={(e) => { setSiteSearch(e.target.value); setSiteDropdownOpen(true); }}
@@ -248,6 +355,18 @@ export default function App() {
             />
             {siteDropdownOpen && (
               <div style={{ position: "absolute", top: "100%", left: 0, zIndex: 100, background: "#1a1a1a", border: "1px solid #444", borderRadius: "4px", marginTop: "2px", maxHeight: "260px", overflowY: "auto", width: "320px", boxShadow: "0 4px 12px rgba(0,0,0,0.5)" }}>
+                {/* Organization option */}
+                {"organization".includes(siteSearch.toLowerCase()) || siteSearch === "" ? (
+                  <div
+                    onMouseDown={() => { setSelectedSite(ORG_FOCUS_VALUE); setSiteDropdownOpen(false); setSiteSearch(""); setView("overview"); setSelectedMac(null); setSelectedFamily(null); }}
+                    style={{ padding: "6px 10px", cursor: "pointer", borderBottom: "1px solid #333", background: selectedSite === ORG_FOCUS_VALUE ? "#2a4a5e" : "transparent" }}
+                    onMouseEnter={e => e.currentTarget.style.background = selectedSite === ORG_FOCUS_VALUE ? "#2a4a5e" : "#252525"}
+                    onMouseLeave={e => e.currentTarget.style.background = selectedSite === ORG_FOCUS_VALUE ? "#2a4a5e" : "transparent"}
+                  >
+                    <div style={{ color: "#7ec8e3", fontSize: "13px" }}>Organization</div>
+                    <div style={{ color: "#555", fontSize: "11px" }}>All sites — org-wide polling</div>
+                  </div>
+                ) : null}
                 {sites
                   .filter(s =>
                     s.name.toLowerCase().includes(siteSearch.toLowerCase()) ||
@@ -282,24 +401,53 @@ export default function App() {
               </div>
             )}
           </div>
-          <nav style={{ display: "flex", gap: "8px" }}>
-            {["overview", "findings"].map((v) => (
-              <button
-                key={v}
-                onClick={() => setView(v)}
+          {/* WLAN Scope Selector */}
+          {wlans.length > 0 && (
+            <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+              <span style={{ color: "#888", fontSize: "13px" }}>WLAN:</span>
+              <select
+                value={selectedWlan}
+                onChange={(e) => { setWlanLoading(true); setSelectedWlan(e.target.value); setView("overview"); setSelectedMac(null); setSelectedFamily(null); }}
                 style={{
-                  background: view === v ? "#2a4a5e" : "#1a1a1a",
-                  color: view === v ? "#7ec8e3" : "#888",
-                  border: "1px solid #333",
-                  padding: "4px 12px",
+                  background: "#222",
+                  color: selectedWlan === "__all__" ? "#7ec8e3" : "#e0e0e0",
+                  border: `1px solid ${selectedWlan === "__all__" ? "#2a4a5e" : "#2d7a4f"}`,
+                  padding: "4px 8px",
                   borderRadius: "4px",
                   cursor: "pointer",
-                  textTransform: "capitalize",
+                  fontSize: "13px",
+                  fontFamily: "monospace",
                 }}
               >
-                {v === "overview" ? "Site Overview" : "Findings"}
-              </button>
-            ))}
+                <option value="__all__">All WLANs</option>
+                {wlans.map((w) => (
+                  <option key={w} value={w}>{w}</option>
+                ))}
+              </select>
+            </div>
+          )}
+
+          <nav style={{ display: "flex", gap: "8px" }}>
+            {["overview", "findings"].map((v) => {
+              if (selectedSite === ORG_FOCUS_VALUE && v !== "overview") return null;
+              return (
+                <button
+                  key={v}
+                  onClick={() => setView(v)}
+                  style={{
+                    background: view === v ? "#2a4a5e" : "#1a1a1a",
+                    color: view === v ? "#7ec8e3" : "#888",
+                    border: "1px solid #333",
+                    padding: "4px 12px",
+                    borderRadius: "4px",
+                    cursor: "pointer",
+                    textTransform: "capitalize",
+                  }}
+                >
+                  {v === "overview" ? (selectedSite === ORG_FOCUS_VALUE ? "Organization" : "Site Overview") : "Findings"}
+                </button>
+              );
+            })}
           </nav>
           <button
             onClick={() => { clearToken(); setTokenState(null); }}
@@ -323,7 +471,9 @@ export default function App() {
 
           {/* Site Focus */}
           {(() => {
-            const focusName = focusSite ? (sites.find(s => s.id === focusSite.site_id)?.name || focusSite.site_id) : "—";
+            const focusName = focusSite
+              ? (focusSite.site_id === ORG_FOCUS_VALUE ? "Organization" : (sites.find(s => s.id === focusSite.site_id)?.name || focusSite.site_id))
+              : "—";
             const isAlreadyFocus = focusSite?.site_id === selectedSite;
             const s = actionState.swapFocus;
             return (
@@ -354,10 +504,11 @@ export default function App() {
           {/* Client Refresh */}
           {(() => {
             const s = actionState.clientRefresh;
+            const isOrg = selectedSite === ORG_FOCUS_VALUE;
             return (
               <button
                 onClick={handleClientRefresh}
-                disabled={!selectedSite || s === "loading"}
+                disabled={!selectedSite || isOrg || s === "loading"}
                 style={actionBtnStyle(s)}
               >
                 {s === "loading" ? "Refreshing…" : s === "ok" ? "Refreshed ✓" : s === "error" ? "Error ✗" : "Client Refresh"}
@@ -382,10 +533,11 @@ export default function App() {
           {/* Flush Events */}
           {(() => {
             const s = actionState.flush;
+            const isOrg = selectedSite === ORG_FOCUS_VALUE;
             return (
               <button
                 onClick={handleFlush}
-                disabled={!selectedSite || s === "loading"}
+                disabled={!selectedSite || isOrg || s === "loading"}
                 style={actionBtnStyle(s === "confirm" ? "warn" : s)}
               >
                 {s === "loading" ? "Flushing…" : s === "confirm" ? "Confirm Flush?" : s === "ok" ? "Flushed ✓" : s === "error" ? "Error ✗" : "Flush Events"}
@@ -406,34 +558,68 @@ export default function App() {
               </button>
             );
           })()}
+
+          {/* AI Assist — right-justified */}
+          <button
+            onClick={() => setView("ai")}
+            style={{
+              marginLeft: "auto",
+              border: "1px solid",
+              borderRadius: "4px",
+              padding: "4px 12px",
+              cursor: "pointer",
+              fontSize: "12px",
+              fontFamily: "monospace",
+              background: view === "ai" ? "#1a2a3a" : "#161616",
+              color: view === "ai" ? "#7ec8e3" : "#7ec8e3",
+              borderColor: view === "ai" ? "#2a5a7e" : "#2a4a5e",
+            }}
+          >
+            AI Assist
+          </button>
         </div>
 
         {/* Progress bar for Full Discovery */}
         <ProgressBar progress={progress} />
       </header>
 
-      {selectedSite && view === "overview" && (
-        <SiteOverview siteId={selectedSite} apiBase={API_BASE} onMacSelect={handleMacSelect} onFamilySelect={handleFamilySelect} refreshToken={discoveryRefreshToken} />
+      <div style={{ position: "relative" }}>
+        {wlanLoading && <WlanLoadingOverlay />}
+        {selectedSite === ORG_FOCUS_VALUE && view === "overview" && (
+          <OrgOverview apiBase={API_BASE} onSiteSelect={handleSiteSelect} onMacSiteSelect={handleOrgMacSelect} refreshToken={discoveryRefreshToken} wlan={selectedWlan} onLoaded={() => setWlanLoading(false)} />
+        )}
+        {selectedSite && selectedSite !== ORG_FOCUS_VALUE && view === "overview" && (
+          <SiteOverview siteId={selectedSite} apiBase={API_BASE} onMacSelect={handleMacSelect} onFamilySelect={handleFamilySelect} refreshToken={discoveryRefreshToken} wlan={selectedWlan} onLoaded={() => setWlanLoading(false)} />
+        )}
+      </div>
+      {selectedSite && selectedSite !== ORG_FOCUS_VALUE && view === "findings" && (
+        <FindingsFeed siteId={selectedSite} apiBase={API_BASE} onMacSelect={handleMacSelect} refreshToken={discoveryRefreshToken} wlan={selectedWlan} />
       )}
-      {selectedSite && view === "findings" && (
-        <FindingsFeed siteId={selectedSite} apiBase={API_BASE} onMacSelect={handleMacSelect} />
-      )}
-      {selectedSite && view === "family" && selectedFamily && (
+      {selectedSite && selectedSite !== ORG_FOCUS_VALUE && view === "family" && selectedFamily && (
         <FamilyDrilldown
           siteId={selectedSite}
           family={selectedFamily}
           apiBase={API_BASE}
           onMacSelect={handleMacSelect}
           onBack={() => setView("overview")}
+          refreshToken={discoveryRefreshToken}
+          wlan={selectedWlan}
         />
       )}
-      {selectedSite && view === "mac" && selectedMac && (
+      {selectedSite && selectedSite !== ORG_FOCUS_VALUE && view === "mac" && selectedMac && (
         <MacDrilldown
           siteId={selectedSite}
           mac={selectedMac}
           apiBase={API_BASE}
           onBack={() => selectedFamily ? setView("family") : setView("findings")}
+          wlan={selectedWlan}
         />
+      )}
+      {view === "ai" && (
+        <AiAssist apiBase={API_BASE} sites={sites} />
+      )}
+      {wlanFallbackToast && (
+        <WlanFallbackToast wlan={wlanFallbackToast} onDismiss={() => setWlanFallbackToast(null)} />
       )}
     </div>
   );

@@ -1,7 +1,18 @@
 """
-webhook_dispatcher.py — Evaluate findings against severity threshold and POST to webhook.
+webhook_dispatcher.py — Evaluate findings against dual alert gate and POST to webhook.
 
-Only significant findings (configurable) trigger the webhook.
+A finding triggers the webhook only when BOTH conditions are true:
+  1. The device family is flagged as a family-level outlier by the centroid
+     Isolation Forest (is_family_outlier = True). This means the entire device
+     type is behaving differently from all other families at the site — not just
+     one misconfigured device.
+  2. The family's health score is below ANOMALY_HEALTH_SCORE_THRESHOLD. This
+     confirms that the behavioral anomaly is accompanied by measurable failure
+     degradation, not just an unusual-but-healthy traffic pattern.
+
+Single-device anomalies (per-family IF or DBSCAN outliers for one MAC) produce
+findings visible in the UI but never trigger the webhook.
+
 Retry logic: 3 attempts with exponential backoff (1s, 2s, 4s).
 Never raises — webhook failure does not kill the scheduler job.
 """
@@ -14,17 +25,19 @@ from datetime import datetime, timezone
 
 import httpx
 
-from .anomaly_detector import get_findings
+from .anomaly_detector import get_findings, get_org_findings
+from .health_scorer import get_health
 
 log = logging.getLogger(__name__)
 
 WEBHOOK_URL = os.getenv("ANOMALY_WEBHOOK_URL", "")
 WEBHOOK_SEVERITY_THRESHOLD = os.getenv("ANOMALY_WEBHOOK_SEVERITY_THRESHOLD", "significant")
+HEALTH_SCORE_THRESHOLD = float(os.getenv("ANOMALY_HEALTH_SCORE_THRESHOLD", "0.75"))
 
 _SEVERITY_RANK = {"minimal": 0, "moderate": 1, "significant": 2}
 
 
-def _meets_threshold(severity: str, threshold: str) -> bool:
+def _meets_severity(severity: str, threshold: str) -> bool:
     return _SEVERITY_RANK.get(severity, -1) >= _SEVERITY_RANK.get(threshold, 2)
 
 
@@ -56,23 +69,64 @@ async def _post_with_retry(url: str, payload: dict) -> bool:
     return False
 
 
-async def evaluate_and_dispatch(site_id: str) -> bool:
+async def evaluate_and_dispatch(
+    site_id: str,
+    org_scope: bool = False,
+) -> bool:
     """
-    Load findings from Redis, filter by severity threshold, POST to webhook if any qualify.
+    Load findings and health scores from Redis, apply dual alert gate, POST to
+    webhook if any findings qualify.
+
+    Dual gate — a finding is webhook-eligible only when:
+      - finding["is_family_outlier"] is True  (centroid IF flagged the whole family)
+      - family health_score < HEALTH_SCORE_THRESHOLD (family is also measurably failing)
+      - finding severity >= WEBHOOK_SEVERITY_THRESHOLD
+
+    org_scope=True: read from org-wide findings/health keys instead of per-site keys.
+
     Returns True if webhook was sent (or no qualifying findings), False on delivery failure.
     """
     if not WEBHOOK_URL:
         log.debug("ANOMALY_WEBHOOK_URL not set — skipping webhook dispatch")
         return True
 
-    findings = await get_findings(site_id)
-    qualifying = [
-        f for f in findings if _meets_threshold(f.get("severity", "INFO"), WEBHOOK_SEVERITY_THRESHOLD)
-    ]
+    findings = await (get_org_findings() if org_scope else get_findings(site_id))
+    health = await get_health(site_id)
+
+    qualifying = []
+    for f in findings:
+        family = f.get("device_family", "")
+        severity = f.get("severity", "")
+
+        # Gate 1: must be a family-level behavioral anomaly
+        if not f.get("is_family_outlier", False):
+            continue
+
+        # Gate 2: family health score must be below threshold
+        family_health = health.get(family, {})
+        health_score = family_health.get("health_score", 1.0)
+        if health_score >= HEALTH_SCORE_THRESHOLD:
+            log.debug(
+                f"Skipping webhook for [{family}]: is_family_outlier=True but "
+                f"health_score={health_score:.3f} >= threshold {HEALTH_SCORE_THRESHOLD}"
+            )
+            continue
+
+        # Gate 3: severity threshold
+        if not _meets_severity(severity, WEBHOOK_SEVERITY_THRESHOLD):
+            continue
+
+        # Attach health data to the outbound finding payload
+        qualifying.append({
+            **f,
+            "health_score": health_score,
+            "health_components": family_health.get("components", {}),
+        })
 
     if not qualifying:
         log.info(
-            f"No findings at or above {WEBHOOK_SEVERITY_THRESHOLD} threshold — no webhook sent"
+            f"No findings passed dual alert gate "
+            f"(family_outlier + health < {HEALTH_SCORE_THRESHOLD}) — no webhook sent"
         )
         return True
 
@@ -85,6 +139,7 @@ async def evaluate_and_dispatch(site_id: str) -> bool:
     }
 
     log.info(
-        f"Dispatching webhook: {len(qualifying)} {WEBHOOK_SEVERITY_THRESHOLD}+ findings"
+        f"Dispatching webhook: {len(qualifying)} finding(s) passed dual alert gate "
+        f"(is_family_outlier + health_score < {HEALTH_SCORE_THRESHOLD})"
     )
     return await _post_with_retry(WEBHOOK_URL, payload)

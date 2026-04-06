@@ -29,9 +29,27 @@ function successColor(ratio) {
   return `rgb(${Math.round(18 + t * 12)}, ${Math.round(44 + t * 116)}, ${Math.round(18 + t * 12)})`;
 }
 
-export default function SiteOverview({ siteId, apiBase, onMacSelect, onFamilySelect, refreshToken }) {
+// Health score: 1.0 = fully healthy (green), 0.75 = threshold (yellow), 0.0 = all failing (red)
+function healthScoreColor(score) {
+  if (score == null) return "#444";
+  if (score >= 0.85) return "#2d7a4f";
+  if (score >= 0.75) return "#e0a835";
+  if (score >= 0.55) return "#c87832";
+  return "#e05555";
+}
+
+function healthBarColor(score) {
+  if (score == null) return "#333";
+  if (score >= 0.85) return "#2d9e5f";
+  if (score >= 0.75) return "#e0a835";
+  if (score >= 0.55) return "#c87832";
+  return "#e05555";
+}
+
+export default function SiteOverview({ siteId, apiBase, onMacSelect, onFamilySelect, refreshToken, wlan = "__all__", onLoaded }) {
   const [summary, setSummary] = useState(null);
   const [findings, setFindings] = useState([]);
+  const [health, setHealth] = useState({});
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [lastRefresh, setLastRefresh] = useState(null);
@@ -39,24 +57,28 @@ export default function SiteOverview({ siteId, apiBase, onMacSelect, onFamilySel
   useEffect(() => {
     setSummary(null);
     setFindings([]);
+    setHealth({});
     setError(null);
   }, [siteId]);
 
   const load = useCallback(() => {
     setLoading(true);
+    const q = `?wlan=${encodeURIComponent(wlan)}`;
     Promise.all([
-      apiFetch(`${apiBase}/api/v1/sites/${siteId}/events/summary`).then((r) => r.json()),
-      apiFetch(`${apiBase}/api/v1/sites/${siteId}/findings`).then((r) => r.json()),
+      apiFetch(`${apiBase}/api/v1/sites/${siteId}/events/summary${q}`).then((r) => r.json()),
+      apiFetch(`${apiBase}/api/v1/sites/${siteId}/findings${q}`).then((r) => r.json()),
+      apiFetch(`${apiBase}/api/v1/sites/${siteId}/health${q}`).then((r) => r.json()).catch(() => ({ health: {} })),
     ])
-      .then(([s, f]) => {
+      .then(([s, f, h]) => {
         setSummary({ ...s, family_client_counts: s.family_client_counts || {} });
         setFindings(f.findings || []);
+        setHealth(h.health || {});
         setLastRefresh(new Date().toLocaleTimeString());
         setError(null);
       })
       .catch((e) => setError(e.message))
-      .finally(() => setLoading(false));
-  }, [siteId, apiBase, refreshToken]);
+      .finally(() => { setLoading(false); onLoaded?.(); });
+  }, [siteId, apiBase, refreshToken, wlan]);
 
   useEffect(() => {
     load();
@@ -113,6 +135,9 @@ export default function SiteOverview({ siteId, apiBase, onMacSelect, onFamilySel
             <tr>
               <th style={thStyle}>Device Family</th>
               <th style={thStyle}>Anomaly</th>
+              <th style={{ ...thStyle, whiteSpace: "nowrap", minWidth: "90px" }} title="Family health score — weighted failure rate across AUTH, ROAM, DHCP, DNS, ARP. 1.0 = no failures.">
+                Health
+              </th>
               {CATEGORIES.map((c) => (
                 <th key={c} style={{ ...thStyle, writingMode: "vertical-rl", transform: "rotate(180deg)", padding: "4px 2px", fontSize: "10px" }}>
                   {c}
@@ -132,6 +157,15 @@ export default function SiteOverview({ siteId, apiBase, onMacSelect, onFamilySel
               const severity = finding?.dbscan_severity ?? null;
               const hasIfOutliers = (finding?.if_outlier_count ?? 0) > 0;
               const color = familyColor(family);
+              const familyHealth = health[family];
+              const healthScore = familyHealth?.health_score ?? null;
+              const healthComponents = familyHealth?.components ?? {};
+              const healthTip = healthScore != null
+                ? `Health: ${(healthScore * 100).toFixed(0)}%\n` +
+                  Object.entries(healthComponents)
+                    .map(([k, v]) => `  ${k}: ${(v * 100).toFixed(1)}% failure`)
+                    .join("\n")
+                : "Health score not yet computed";
               return (
                 <tr key={family}>
                   <td style={{ ...tdStyle, whiteSpace: "nowrap" }}>
@@ -187,6 +221,23 @@ export default function SiteOverview({ siteId, apiBase, onMacSelect, onFamilySel
                       <span style={{ color: "#2d7a4f", fontSize: "10px" }}>OK</span>
                     )}
                   </td>
+
+                  {/* Health score */}
+                  <td style={{ ...tdStyle, minWidth: "90px" }} title={healthTip}>
+                    {healthScore != null ? (
+                      <div style={{ display: "flex", alignItems: "center", gap: "5px" }}>
+                        <div style={{ flex: 1, height: "5px", background: "#1a1a1a", borderRadius: "3px", overflow: "hidden" }}>
+                          <div style={{ width: `${(healthScore * 100).toFixed(0)}%`, height: "100%", background: healthBarColor(healthScore), borderRadius: "3px" }} />
+                        </div>
+                        <span style={{ fontSize: "11px", fontWeight: "bold", color: healthScoreColor(healthScore), minWidth: "28px", textAlign: "right" }}>
+                          {(healthScore * 100).toFixed(0)}%
+                        </span>
+                      </div>
+                    ) : (
+                      <span style={{ color: "#333", fontSize: "10px" }}>—</span>
+                    )}
+                  </td>
+
                   {CATEGORIES.map((cat) => {
                     const cell = familyData[cat];
                     const ratio = cell?.ratio ?? 0;
@@ -239,6 +290,7 @@ export default function SiteOverview({ siteId, apiBase, onMacSelect, onFamilySel
                 <td style={{ ...tdStyle, textAlign: "center" }}>
                   <span style={{ color: "#333", fontSize: "10px" }}>—</span>
                 </td>
+                <td style={tdStyle} />
                 {CATEGORIES.map((cat) => {
                   const count = otherCounts[cat] ?? 0;
                   const ratio = otherTotal > 0 ? count / otherTotal : 0;
@@ -276,13 +328,14 @@ export default function SiteOverview({ siteId, apiBase, onMacSelect, onFamilySel
         </div>
 
         <div style={{ flex: "0 0 380px", width: "380px" }}>
-          <ClusterViz siteId={siteId} apiBase={apiBase} onMacSelect={onMacSelect} refreshToken={refreshToken} />
+          <ClusterViz siteId={siteId} apiBase={apiBase} onMacSelect={onMacSelect} refreshToken={refreshToken} wlan={wlan} />
         </div>
       </div>
 
       <div style={{ marginTop: "8px", fontSize: "11px", color: "#444" }}>
         <span style={{ color: "#b06ad4" }}>family</span> = whole device class behaves differently from other families at this site (family centroid IF).
         {" "}<span style={{ color: "#e0a835" }}>moderate</span> / <span style={{ color: "#e05555" }}>significant</span> = fraction of individual MACs in that family flagged by DBSCAN.
+        {" "}Health = weighted failure rate across AUTH · ROAM · DHCP · DNS · ARP (hover for breakdown).
         {" "}Click a family name to see per-device Isolation Forest deviations.
       </div>
     </div>

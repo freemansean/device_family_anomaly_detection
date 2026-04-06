@@ -4,6 +4,7 @@ main.py — FastAPI application entrypoint with APScheduler lifecycle.
 
 import logging
 import os
+from contextlib import asynccontextmanager
 
 from dotenv import load_dotenv
 
@@ -13,6 +14,7 @@ import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from client_anomaly.ai_assist.routes import ai_router
 from client_anomaly.api.auth import auth_router
 from client_anomaly.api.routes import router
 from client_anomaly.scheduler import create_scheduler
@@ -23,7 +25,23 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-app = FastAPI(title="Sasquatch — Client Anomaly Detection", version="1.0.0")
+_scheduler = create_scheduler()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    _scheduler.start()
+    log.info("APScheduler started")
+    yield
+    _scheduler.shutdown(wait=False)
+    log.info("APScheduler stopped")
+
+
+app = FastAPI(
+    title="Sasquatch — Client Anomaly Detection",
+    version="1.0.0",
+    lifespan=lifespan,
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -34,20 +52,7 @@ app.add_middleware(
 
 app.include_router(auth_router)
 app.include_router(router)
-
-_scheduler = create_scheduler()
-
-
-@app.on_event("startup")
-async def startup():
-    _scheduler.start()
-    log.info("APScheduler started")
-
-
-@app.on_event("shutdown")
-async def shutdown():
-    _scheduler.shutdown(wait=False)
-    log.info("APScheduler stopped")
+app.include_router(ai_router)
 
 
 if __name__ == "__main__":

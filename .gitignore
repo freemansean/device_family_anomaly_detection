@@ -18,5 +18,8 @@ env/
 node_modules/
 sasquatch/frontend/dist/
 
+# Redis persistence
+data/
+
 # OS
 .DS_Store
