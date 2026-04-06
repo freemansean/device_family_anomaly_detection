@@ -112,6 +112,11 @@ function AnomalyFindingCard({ finding, healthComponents, isAlert, onFamilyClick 
           <span style={{ color: "#666", fontSize: "12px" }}>
             {PATTERN_LABELS[finding.probable_pattern] || finding.probable_pattern}
           </span>
+          {(finding.wlan && finding.wlan !== "__all__" ? finding.wlan : finding.predominant_wlan) && (
+            <span style={{ background: "#1a2a1a", color: "#7aaa7a", border: "1px solid #3a6a3a", borderRadius: "3px", padding: "2px 7px", fontSize: "10px" }}>
+              {finding.wlan !== "__all__" ? finding.wlan : finding.predominant_wlan}
+            </span>
+          )}
           {finding.is_family_outlier && (
             <span style={{ background: "#2a1a3a", color: "#b06ad4", border: "1px solid #6a3a8a", borderRadius: "3px", padding: "2px 7px", fontSize: "10px" }}>
               family-wide

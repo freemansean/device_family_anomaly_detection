@@ -406,7 +406,7 @@ async def trigger_org_detect_only():
     finally:
         await redis_client.aclose()
 
-    # Phase 1 — build features and health scores for all sites.
+    # Phase 1 — build features, health scores, and per-site findings for all sites.
     wlans_by_site: dict[str, list[str]] = {}
     for sid in site_ids:
         try:
@@ -415,6 +415,7 @@ async def trigger_org_detect_only():
             for wlan in ["__all__"] + wlans:
                 await build_features(sid, wlan)
                 await score_health(sid, wlan)
+                await score(sid, wlan)
         except Exception:
             log.exception(f"Org detect: feature build failed for site {sid}")
             wlans_by_site.setdefault(sid, [])

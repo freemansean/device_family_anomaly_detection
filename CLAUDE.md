@@ -569,6 +569,13 @@ After both stages, roll up to device family findings:
 - Top contributing features: mean comparison of outlier MACs vs non-outlier MACs in
   the same family. For family-wide outliers (all MACs flagged), compares against all
   other families at the site.
+- **`predominant_wlan`**: when `wlan == "__all__"`, the finding includes a `predominant_wlan`
+  field — the SSID that accounts for the majority of events across the outlier MACs,
+  determined by counting `wlan` values in `mac_raw_events` for each outlier MAC. Set to
+  `null` for scoped WLAN queries (where `finding.wlan` is already the exact SSID).
+  In `score_org_wide()`, events are loaded from per-site Redis sets to compute the tally
+  (loaded anyway for pattern classification in the non-family-outlier path; loaded
+  additionally for the family-outlier path when in `__all__` mode).
 
 **Finding severity:**
 - `minimal`: outlier_ratio 0–0.3
@@ -664,6 +671,8 @@ not a valid severity string and will cause `_meets_severity()` to return False f
     {
       "device_family": "iPhone",
       "severity": "significant",
+      "wlan": "__all__",
+      "predominant_wlan": "Corp-WiFi",
       "outlier_ratio": 0.72,
       "affected_mac_count": 18,
       "is_family_outlier": true,
@@ -752,6 +761,9 @@ GET  /api/v1/org/summary                             → per-site event counts, 
                                                        plus org-wide finding counts (org_significant_count,
                                                        org_moderate_count, org_minimal_count, org_alert_count,
                                                        org_finding_count) read from sasquatch:org_findings:{wlan}
+POST /api/v1/org/detect                              → re-runs build_features + score_health + score (per-site) for all
+                                                       sites, then score_org_wide; updates both per-site findings
+                                                       (sasquatch:findings:{site_id}:{wlan}) and org findings
 GET  /api/v1/org/alerts                              → org-wide alerts + per-site alerts in one response;
                                                        org_alerts = org findings with health_score < 0.75;
                                                        site_alerts = per-site findings × per-site health, grouped by site
@@ -809,6 +821,7 @@ computed as a volume-weighted average of per-site health scores across all sites
 - Data source: `/api/v1/org/family-insights`
 
 **3. Findings Feed (`FindingsFeed.jsx`) — site context**
+- Each anomaly card shows a **WLAN/SSID badge** using `finding.wlan` / `finding.predominant_wlan` (same logic as OrgAlerts).
 - Three sections rendered top-to-bottom: **ALERT → HEALTH → ANOMALOUS**
   - **ALERT** (red): device families that are both anomalous (in findings) AND unhealthy (`health_score < 0.75`). This is the dual-gate condition that mirrors the webhook dispatch logic.
   - **HEALTH** (amber): device families from the health endpoint with `health_score < 0.75` that have no anomaly finding — unhealthy but not yet anomalous.
@@ -826,6 +839,7 @@ computed as a volume-weighted average of per-site health scores across all sites
 - Two sections rendered top-to-bottom: **ORG-WIDE ALERTS** → **SITE ALERTS**
   - **ORG-WIDE ALERTS**: org findings (from `sasquatch:org_findings:{wlan}`, cross-site scoring) where `health_score < 0.75`. Each card shows severity, outlier ratio, device count, health score, failure category breakdown, pattern label, and top contributing features. Family name is a clickable link that opens `OrgFamilyDrilldown` in-place.
   - **SITE ALERTS**: per-site findings cross-referenced with per-site health, grouped by site. Only sites with ≥ 1 alert are shown. Family name opens `FamilyDrilldown` (site-scoped) in-place.
+- Each alert card shows a **WLAN/SSID badge** (green pill) after the pattern label. For scoped WLAN queries the badge shows `finding.wlan`; for `__all__` scope it shows `finding.predominant_wlan` — the SSID carrying the majority of outlier MAC events, computed at finding-rollup time from raw event WLAN counts.
 - WLAN dropdown scopes both sections via `?wlan=` query param.
 - No example MACs on cards — click the family name to drilldown instead.
 - Auto-refreshes every 30s. Data source: `GET /api/v1/org/alerts?wlan=`
@@ -836,6 +850,7 @@ computed as a volume-weighted average of per-site health scores across all sites
 - Org findings carry `health_score` directly on the finding object (written by `score_org_wide`)
 - Family name on each card is a clickable link — opens `OrgFamilyDrilldown` in-place.
 - No example MACs on cards — drilldown is the navigation path.
+- Each card shows a **WLAN/SSID badge** using the same `wlan` / `predominant_wlan` logic as OrgAlerts.
 - Data source: `/api/v1/org/findings` + `/api/v1/org/family-insights` (parallel fetch)
 
 **6. Org Overview (`OrgOverview.jsx`)**

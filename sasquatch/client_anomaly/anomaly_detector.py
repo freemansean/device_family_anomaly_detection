@@ -30,7 +30,7 @@ Redis key scheme:
 import json
 import logging
 import os
-from collections import defaultdict
+from collections import Counter, defaultdict
 
 import numpy as np
 import redis.asyncio as aioredis
@@ -501,9 +501,21 @@ async def score(
                         posthoc["event_count"] = len(combined_events)
                         probable_pattern = _classify_probable_pattern(posthoc)
 
+            # For __all__ scope, derive the predominant WLAN from outlier MAC events
+            predominant_wlan: str | None = None
+            if wlan == "__all__" and outlier_macs:
+                wlan_counts: Counter = Counter()
+                for mac in outlier_macs:
+                    for evt in mac_raw_events.get(mac, []):
+                        if evt.get("wlan"):
+                            wlan_counts[evt["wlan"]] += 1
+                if wlan_counts:
+                    predominant_wlan = wlan_counts.most_common(1)[0][0]
+
             finding = {
                 "device_family": family,
                 "wlan": wlan,
+                "predominant_wlan": predominant_wlan,
                 "severity": _severity(outlier_ratio),
                 "outlier_ratio": round(outlier_ratio, 4),
                 "weighted_outlier_score": round(weighted_outlier_score, 4),
@@ -788,11 +800,15 @@ async def score_org_wide(
 
             # Post-hoc pattern: aggregate raw events from ALL outlier MACs across all sites
             is_family_level_outlier = family in flagged_families
+            combined_events: list[dict] = []
             if is_family_level_outlier:
                 probable_pattern = "family_behavioral_outlier"
+                if wlan == "__all__":
+                    for ck in outlier_cks:
+                        site_evts = await _load_site_events(composite_to_site[ck])
+                        combined_events.extend(site_evts.get(composite_to_mac[ck], []))
             else:
                 probable_pattern = "behavioral_outlier"
-                combined_events: list[dict] = []
                 for ck in outlier_cks:
                     site_evts = await _load_site_events(composite_to_site[ck])
                     combined_events.extend(site_evts.get(composite_to_mac[ck], []))
@@ -801,9 +817,19 @@ async def score_org_wide(
                     posthoc["event_count"] = len(combined_events)
                     probable_pattern = _classify_probable_pattern(posthoc)
 
+            # For __all__ scope, derive the predominant WLAN from outlier MAC events
+            predominant_wlan: str | None = None
+            if wlan == "__all__" and combined_events:
+                wlan_counts: Counter = Counter(
+                    evt["wlan"] for evt in combined_events if evt.get("wlan")
+                )
+                if wlan_counts:
+                    predominant_wlan = wlan_counts.most_common(1)[0][0]
+
             finding = {
                 "device_family": family,
                 "wlan": wlan,
+                "predominant_wlan": predominant_wlan,
                 "severity": _severity(outlier_ratio),
                 "outlier_ratio": round(outlier_ratio, 4),
                 "weighted_outlier_score": round(weighted_outlier_score, 4),
