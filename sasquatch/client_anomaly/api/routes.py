@@ -244,6 +244,31 @@ async def set_focus(body: dict):
     return {"site_id": site_id, "source": "override"}
 
 
+@router.get("/org/detection-enabled")
+async def get_org_detection_enabled():
+    """Return whether the scheduled org-wide detection job is enabled."""
+    client = _get_redis()
+    try:
+        val = await client.get("sasquatch:org_detection_enabled")
+    finally:
+        await client.aclose()
+    # Absent key = enabled by default
+    return {"enabled": val != "0"}
+
+
+@router.post("/org/detection-enabled")
+async def set_org_detection_enabled(body: dict):
+    """Enable or disable the scheduled org-wide detection job."""
+    enabled = bool(body.get("enabled", True))
+    client = _get_redis()
+    try:
+        await client.set("sasquatch:org_detection_enabled", "1" if enabled else "0")
+    finally:
+        await client.aclose()
+    log.info(f"Org detection {'enabled' if enabled else 'disabled'} by administrator")
+    return {"enabled": enabled}
+
+
 @router.get("/sites/{site_id}/progress")
 async def get_site_progress(site_id: str):
     """Return the latest detection cycle progress for a site."""

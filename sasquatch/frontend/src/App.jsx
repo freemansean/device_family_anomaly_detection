@@ -136,6 +136,7 @@ export default function App() {
 
   // Action bar state
   const [focusSite, setFocusSite] = useState(null); // {site_id, source}
+  const [orgDetectionEnabled, setOrgDetectionEnabled] = useState(true);
   const [progress, setProgress] = useState(null);
   const [progressPolling, setProgressPolling] = useState(false);
   const [actionState, setActionState] = useState({
@@ -144,6 +145,7 @@ export default function App() {
     detect: "idle",
     discover: "idle",      // idle | running | ok | error
     swapFocus: "idle",
+    orgDetection: "idle",  // idle | loading | ok | error
   });
 
   function setAS(key, val) {
@@ -171,6 +173,10 @@ export default function App() {
         setFocusSite(data);
         if (data?.site_id) setSelectedSite((prev) => prev ?? data.site_id);
       })
+      .catch(console.error);
+    apiFetch(`${API_BASE}/api/v1/org/detection-enabled`)
+      .then((r) => r.json())
+      .then((data) => setOrgDetectionEnabled(data.enabled !== false))
       .catch(console.error);
   }, [token]);
 
@@ -308,6 +314,24 @@ export default function App() {
     } catch {
       setAS("swapFocus", "error");
       setTimeout(() => setAS("swapFocus", "idle"), 3000);
+    }
+  }
+
+  async function handleToggleOrgDetection() {
+    const newVal = !orgDetectionEnabled;
+    setAS("orgDetection", "loading");
+    try {
+      await apiFetch(`${API_BASE}/api/v1/org/detection-enabled`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ enabled: newVal }),
+      });
+      setOrgDetectionEnabled(newVal);
+      setAS("orgDetection", "ok");
+      setTimeout(() => setAS("orgDetection", "idle"), 2000);
+    } catch {
+      setAS("orgDetection", "error");
+      setTimeout(() => setAS("orgDetection", "idle"), 3000);
     }
   }
 
@@ -483,6 +507,33 @@ export default function App() {
                 )}
                 {isAlreadyFocus && <span style={{ color: "#2d7a4f", fontSize: "10px" }}>● active</span>}
               </div>
+            );
+          })()}
+
+          <div style={{ width: "1px", height: "24px", background: "#2a2a2a" }} />
+
+          {/* Org Detection Toggle */}
+          {(() => {
+            const s = actionState.orgDetection;
+            const on = orgDetectionEnabled;
+            return (
+              <button
+                onClick={handleToggleOrgDetection}
+                disabled={s === "loading"}
+                title={on ? "Org-wide scheduled detection is active — click to disable" : "Org-wide scheduled detection is disabled — click to enable"}
+                style={{
+                  background: s === "error" ? "#3a1a1a" : on ? "#1a2a1a" : "#2a1a1a",
+                  color: s === "error" ? "#e05555" : s === "ok" ? "#7ec8e3" : on ? "#2d7a4f" : "#c08030",
+                  border: `1px solid ${s === "error" ? "#5a2a2a" : on ? "#2d4a2d" : "#5a3a1a"}`,
+                  borderRadius: "4px",
+                  padding: "4px 10px",
+                  cursor: s === "loading" ? "default" : "pointer",
+                  fontSize: "12px",
+                  fontFamily: "monospace",
+                }}
+              >
+                {s === "loading" ? "…" : s === "error" ? "Error ✗" : on ? "Org Detection: On" : "Org Detection: Off"}
+              </button>
             );
           })()}
 
