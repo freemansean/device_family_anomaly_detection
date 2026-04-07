@@ -3,7 +3,7 @@ scheduler.py — APScheduler job definitions.
 
 Jobs:
 - client_refresh_job: Daily at 00:00 — refresh client device cache.
-- event_and_detect_job: Every DETECTION_INTERVAL_MINUTES — collect events and run detection.
+- event_and_detect_job: Every SITE_FOCUS_DETECTION_INTERVAL minutes — collect events for the focus site and run detection.
 
 Detection now runs for each unique WLAN present in the site's event data, plus a
 combined "__all__" pass that uses events across all WLANs. This allows the frontend
@@ -27,7 +27,7 @@ from .webhook_dispatcher import evaluate_and_dispatch
 log = logging.getLogger(__name__)
 
 SITE_ID = os.getenv("MIST_SITE_ID", "")
-DETECTION_INTERVAL_MINUTES = int(os.getenv("DETECTION_INTERVAL_MINUTES", "15"))
+SITE_FOCUS_DETECTION_INTERVAL = int(os.getenv("SITE_FOCUS_DETECTION_INTERVAL", "60"))
 ORG_DETECTION_INTERVAL_HOURS = int(os.getenv("ORG_DETECTION_INTERVAL_HOURS", "6"))
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 MIST_API_TOKEN = os.getenv("MIST_API_TOKEN", "")
@@ -450,7 +450,7 @@ def create_scheduler() -> AsyncIOScheduler:
     scheduler.add_job(
         event_and_detect_job,
         "interval",
-        minutes=DETECTION_INTERVAL_MINUTES,
+        minutes=SITE_FOCUS_DETECTION_INTERVAL,
         id="event_and_detect",
         name="Event Collection + Anomaly Detection",
     )

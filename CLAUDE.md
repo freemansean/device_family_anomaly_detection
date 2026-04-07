@@ -774,7 +774,7 @@ scheduler.add_job(client_refresh_job, 'cron', hour=0, minute=0)
 
 # Every N minutes — collect events and run detection
 scheduler.add_job(event_and_detect_job, 'interval',
-                  minutes=int(os.getenv("DETECTION_INTERVAL_MINUTES", "15")))
+                  minutes=int(os.getenv("SITE_FOCUS_DETECTION_INTERVAL", "15")))
 ```
 
 `event_and_detect_job` runs these in sequence per WLAN scope (`__all__` + each unique SSID):
@@ -949,7 +949,7 @@ MIST_ORG_ID=3549f835-42c3-40d1-90cc-5e70ccc537ee
 REDIS_URL=redis://localhost:6379
 
 # Scheduling
-DETECTION_INTERVAL_MINUTES=15
+SITE_FOCUS_DETECTION_INTERVAL=15
 
 # ML Tuning — Isolation Forest + DBSCAN
 ANOMALY_IF_CONTAMINATION=0.05
