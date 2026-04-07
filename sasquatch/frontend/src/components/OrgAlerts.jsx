@@ -3,10 +3,26 @@ import { apiFetch } from "../api";
 import OrgFamilyDrilldown from "./OrgFamilyDrilldown";
 import FamilyDrilldown from "./FamilyDrilldown";
 
+// Format a duration in seconds into "Xd Yh Zm" or "Yh Zm" or "Zm"
+function formatDuration(seconds) {
+  if (!seconds || seconds < 60) return "<1m";
+  const d = Math.floor(seconds / 86400);
+  const h = Math.floor((seconds % 86400) / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  if (d > 0) return `${d}d ${h}h`;
+  if (h > 0) return `${h}h ${m}m`;
+  return `${m}m`;
+}
+
+// Format an ISO8601 UTC string to local time HH:MM
+function fmtTime(iso) {
+  if (!iso) return "";
+  return new Date(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+
 const ALERT_COLOR = "#e05555";
 const ALERT_BG    = "#2a1515";
 const ANOMALY_COLOR = { significant: "#39e84e", moderate: "#2eb845", minimal: "#1a6b27" };
-const ANOMALY_BG    = { significant: "#0d2a15", moderate: "#0b2210", minimal: "#09180a" };
 const HEALTH_COLOR  = "#e0a835";
 
 function healthScoreColor(score) {
@@ -206,14 +222,21 @@ export default function OrgAlerts({ apiBase, onMacSiteSelect, refreshToken, wlan
   const [data, setData]               = useState(null);
   const [loading, setLoading]         = useState(true);
   const [error, setError]             = useState(null);
+  const [history, setHistory]         = useState(null);
   // selectedFamily: { family, siteId } — siteId null means org-wide drilldown
   const [selectedFamily, setSelectedFamily] = useState(null);
 
   const load = useCallback(() => {
     setLoading(true);
-    apiFetch(`${apiBase}/api/v1/org/alerts?wlan=${encodeURIComponent(wlan)}`)
-      .then(r => r.json())
-      .then(d => { setData(d); setError(null); })
+    Promise.all([
+      apiFetch(`${apiBase}/api/v1/org/alerts?wlan=${encodeURIComponent(wlan)}`).then(r => r.json()),
+      apiFetch(`${apiBase}/api/v1/org/alert-history?wlan=${encodeURIComponent(wlan)}&days=7&tz_offset=${new Date().getTimezoneOffset()}`).then(r => r.json()),
+    ])
+      .then(([alertData, histData]) => {
+        setData(alertData);
+        setHistory(histData);
+        setError(null);
+      })
       .catch(e => setError(e.message))
       .finally(() => setLoading(false));
   }, [apiBase, wlan]);
@@ -341,6 +364,248 @@ export default function OrgAlerts({ apiBase, onMacSiteSelect, refreshToken, wlan
               />
             ))}
           </div>
+        </div>
+      )}
+
+      {/* 7-day alert history */}
+      <AlertHistory history={history} />
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Alert History
+// ---------------------------------------------------------------------------
+
+const HIST_COLOR = "#888";
+const RESOLVED_COLOR = "#2d7a4f";
+
+function AlertHistory({ history }) {
+  const [expanded, setExpanded] = useState(true);
+
+  const days = history?.days ?? [];
+  if (days.length === 0) return null;
+
+  // Flatten to count total unique sessions for the header badge
+  const totalSessions = history?.total_sessions ?? 0;
+
+  return (
+    <div style={{ marginTop: "32px" }}>
+      {/* Section header */}
+      <div
+        onClick={() => setExpanded(e => !e)}
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: "10px",
+          marginBottom: expanded ? "12px" : 0,
+          paddingBottom: "6px",
+          borderBottom: "1px solid #2a2a2a",
+          cursor: "pointer",
+          userSelect: "none",
+        }}
+      >
+        <span style={{
+          background: "#1e1e1e",
+          color: HIST_COLOR,
+          padding: "2px 10px",
+          borderRadius: "3px",
+          fontSize: "11px",
+          fontWeight: "bold",
+          letterSpacing: "0.08em",
+          border: "1px solid #333",
+        }}>
+          7-DAY HISTORY
+        </span>
+        <span style={{ color: "#555", fontSize: "11px" }}>
+          {totalSessions} {totalSessions === 1 ? "alarm session" : "alarm sessions"} in the past 7 days
+        </span>
+        <span style={{ color: "#444", fontSize: "11px", marginLeft: "auto" }}>
+          {expanded ? "▲" : "▼"}
+        </span>
+      </div>
+
+      {expanded && (
+        <div style={{ display: "flex", flexDirection: "column", gap: "16px" }}>
+          {days.map(day => (
+            <DayGroup key={day.date} day={day} />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function DayGroup({ day }) {
+  return (
+    <div>
+      {/* Day label */}
+      <div style={{
+        fontSize: "11px",
+        color: "#666",
+        fontWeight: "bold",
+        letterSpacing: "0.06em",
+        marginBottom: "6px",
+        textTransform: "uppercase",
+      }}>
+        {day.label}
+        <span style={{ color: "#444", fontWeight: "normal", marginLeft: "8px" }}>{day.date}</span>
+      </div>
+
+      <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
+        {day.alarms.map((alarm, idx) => (
+          <HistoryRow key={idx} alarm={alarm} />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function HistoryRow({ alarm }) {
+  const isActive    = alarm.status === "active";
+  const accentColor = isActive ? ALERT_COLOR : RESOLVED_COLOR;
+  const duration    = formatDuration(alarm.total_duration_seconds);
+  const sev         = alarm.severity;
+
+  // Time window: "10:22 – 11:47" or "10:22 – now"
+  const timeStr = fmtTime(alarm.window_start) + " – " + (isActive ? "now" : fmtTime(alarm.window_end));
+
+  // "started N days ago" annotation for multi-day sessions
+  const sessionDay   = alarm.session_first_seen ? alarm.session_first_seen.slice(0, 10) : null;
+  const windowDay    = alarm.window_start ? alarm.window_start.slice(0, 10) : null;
+  const startedEarlier = sessionDay && windowDay && sessionDay < windowDay;
+
+  const hs = alarm.health_score ?? null;
+  const failureComponents = alarm.health_components
+    ? Object.entries(alarm.health_components).filter(([, rate]) => rate > 0)
+    : [];
+  const wlanDisplay = alarm.wlan !== "__all__" ? alarm.wlan : alarm.predominant_wlan;
+
+  return (
+    <div style={{
+      border: `1px solid ${accentColor}33`,
+      borderLeft: `3px solid ${accentColor}`,
+      background: isActive ? "#1a1010" : "#111",
+      borderRadius: "4px",
+      padding: "10px 12px",
+      fontSize: "12px",
+    }}>
+      {/* Top row: status + family + site + time + duration */}
+      <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: "8px" }}>
+        {/* Status pip */}
+        <span style={{ width: 7, height: 7, borderRadius: "50%", background: accentColor, flexShrink: 0 }} />
+
+        {/* Family */}
+        <span style={{ color: "#ccc", fontWeight: "bold", fontSize: "13px" }}>
+          {alarm.family}
+        </span>
+
+        {/* Severity badge */}
+        {sev && (
+          <span style={{
+            background: (ANOMALY_COLOR[sev] || "#888") + "22",
+            color: ANOMALY_COLOR[sev] || "#888",
+            border: `1px solid ${(ANOMALY_COLOR[sev] || "#888")}44`,
+            borderRadius: "3px", padding: "1px 7px", fontSize: "10px",
+          }}>
+            {sev}
+          </span>
+        )}
+
+        {/* Pattern */}
+        {alarm.probable_pattern && (
+          <span style={{ color: "#888", fontSize: "11px" }}>
+            {PATTERN_LABELS[alarm.probable_pattern] || alarm.probable_pattern}
+          </span>
+        )}
+
+        {/* WLAN badge */}
+        {wlanDisplay && (
+          <span style={{ background: "#1a2a1a", color: "#7aaa7a", border: "1px solid #3a6a3a", borderRadius: "3px", padding: "1px 6px", fontSize: "10px" }}>
+            {wlanDisplay}
+          </span>
+        )}
+
+        {/* Resolved / active badge */}
+        {isActive ? (
+          <span style={{ marginLeft: "auto", color: ALERT_COLOR, fontSize: "10px", fontWeight: "bold" }}>
+            ACTIVE <span style={{ fontSize: "9px" }}>●</span>
+          </span>
+        ) : (
+          <span style={{ marginLeft: "auto", color: RESOLVED_COLOR, fontSize: "10px", border: `1px solid ${RESOLVED_COLOR}55`, borderRadius: "3px", padding: "1px 6px" }}>
+            resolved
+          </span>
+        )}
+      </div>
+
+      {/* Second row: site + time window + duration */}
+      <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: "12px", marginTop: "6px" }}>
+        <span style={{ color: "#7ec8e3", fontSize: "11px" }}>
+          {alarm.site_name || alarm.site_id}
+        </span>
+        <span style={{ color: "#666", fontSize: "11px" }}>
+          {timeStr}
+        </span>
+        <span style={{ color: isActive ? ALERT_COLOR : "#555", fontSize: "11px", fontWeight: isActive ? "bold" : "normal" }}>
+          {duration}
+        </span>
+        {startedEarlier && (
+          <span style={{ color: "#555", fontSize: "10px" }}>
+            started {new Date(alarm.session_first_seen).toLocaleDateString([], { month: "short", day: "numeric" })}
+          </span>
+        )}
+      </div>
+
+      {/* Third row: device count + health score + failure breakdown */}
+      {(alarm.affected_mac_count != null || hs != null) && (
+        <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: "14px", marginTop: "6px" }}>
+          {alarm.affected_mac_count != null && (
+            <span style={{ fontSize: "11px" }}>
+              <span style={{ color: "#555" }}>devices </span>
+              <span style={{ color: sev ? (ANOMALY_COLOR[sev] || "#ccc") : "#ccc", fontWeight: "bold" }}>
+                {alarm.affected_mac_count}
+              </span>
+              {alarm.total_mac_count != null && (
+                <span style={{ color: "#444" }}>/{alarm.total_mac_count}</span>
+              )}
+              {alarm.outlier_ratio != null && (
+                <span style={{ color: "#555" }}> ({(alarm.outlier_ratio * 100).toFixed(0)}%)</span>
+              )}
+            </span>
+          )}
+          {hs != null && (
+            <span style={{ fontSize: "11px" }}>
+              <span style={{ color: "#555" }}>health </span>
+              <span style={{ color: healthScoreColor(hs), fontWeight: "bold" }}>
+                {(hs * 100).toFixed(0)}%
+              </span>
+            </span>
+          )}
+          {failureComponents.map(([cat, rate]) => (
+            <span key={cat} style={{ fontSize: "10px", color: rate > 0.1 ? HEALTH_COLOR : "#555" }}>
+              {cat} {(rate * 100).toFixed(0)}% fail
+            </span>
+          ))}
+        </div>
+      )}
+
+      {/* Top features */}
+      {alarm.top_features?.length > 0 && (
+        <div style={{ display: "flex", gap: "6px", flexWrap: "wrap", marginTop: "6px" }}>
+          {alarm.top_features.map((f, fi) => (
+            <span
+              key={fi}
+              title={`Outlier: ${f.outlier_mean?.toFixed(3)} vs baseline: ${f.baseline_mean?.toFixed(3)}`}
+              style={{ background: "#1a1a1a", border: "1px solid #2a2a2a", borderRadius: "3px", padding: "2px 7px", fontSize: "10px", color: "#777" }}
+            >
+              {f.feature}
+              {f.outlier_mean != null && f.baseline_mean != null && (
+                <span style={{ color: sev ? (ANOMALY_COLOR[sev] || "#888") : "#888" }}>
+                  {" "}↑{Math.abs(f.outlier_mean - f.baseline_mean).toFixed(3)}
+                </span>
+              )}
+            </span>
+          ))}
         </div>
       )}
     </div>

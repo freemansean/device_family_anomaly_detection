@@ -436,28 +436,6 @@ export default function App() {
             </div>
           )}
 
-          <nav style={{ display: "flex", gap: "8px" }}>
-            {["overview", "findings"].map((v) => {
-              if (selectedSite === ORG_FOCUS_VALUE && v !== "overview") return null;
-              return (
-                <button
-                  key={v}
-                  onClick={() => setView(v)}
-                  style={{
-                    background: view === v ? "#2a4a5e" : "#1a1a1a",
-                    color: view === v ? "#7ec8e3" : "#888",
-                    border: "1px solid #333",
-                    padding: "4px 12px",
-                    borderRadius: "4px",
-                    cursor: "pointer",
-                    textTransform: "capitalize",
-                  }}
-                >
-                  {v === "overview" ? (selectedSite === ORG_FOCUS_VALUE ? "Organization" : "Site Overview") : "Findings"}
-                </button>
-              );
-            })}
-          </nav>
           <button
             onClick={() => { clearToken(); setTokenState(null); }}
             style={{
@@ -574,6 +552,32 @@ export default function App() {
         <ProgressBar progress={progress} />
       </header>
 
+      {selectedSite && selectedSite !== ORG_FOCUS_VALUE && (view === "overview" || view === "findings") && (
+        <div style={{ display: "flex", gap: "8px", marginBottom: "18px" }}>
+          {["overview", "findings"].map((v) => {
+            const label = v === "overview" ? "Site Overview" : "Findings";
+            const active = view === v;
+            return (
+              <button
+                key={v}
+                onClick={() => setView(v)}
+                style={{
+                  padding: "5px 14px",
+                  fontSize: "12px",
+                  borderRadius: "4px",
+                  border: active ? "1px solid #7ec8e3" : "1px solid #333",
+                  background: active ? "#0d2a38" : "#161616",
+                  color: active ? "#7ec8e3" : "#666",
+                  cursor: "pointer",
+                  transition: "all 0.15s",
+                }}
+              >
+                {label}
+              </button>
+            );
+          })}
+        </div>
+      )}
       <div style={{ position: "relative" }}>
         {wlanLoading && <WlanLoadingOverlay />}
         {selectedSite === ORG_FOCUS_VALUE && view === "overview" && (

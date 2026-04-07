@@ -25,6 +25,7 @@ from datetime import datetime, timezone
 
 import httpx
 
+from . import alert_tracker
 from .anomaly_detector import get_findings, get_org_findings
 from .health_scorer import get_health
 
@@ -122,6 +123,16 @@ async def evaluate_and_dispatch(
             "health_score": health_score,
             "health_components": family_health.get("components", {}),
         })
+
+    # Track alert history regardless of webhook configuration or qualifying count.
+    # Skip for org_scope — org findings are cross-site composites, not single-site events.
+    if not org_scope:
+        active_findings = {
+            f["device_family"]: f
+            for f in qualifying
+            if f.get("device_family")
+        }
+        await alert_tracker.record_cycle(site_id, "__all__", active_findings)
 
     if not qualifying:
         log.info(

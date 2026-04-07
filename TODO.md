@@ -108,6 +108,141 @@ health score more than the real-world impact warrants — the failure resolved i
 
 ---
 
+### 17. `MARVIS_EVENT_CLIENT_AUTH_FAILURE` status_code 79 should be excluded from AUTH_FAILURE
+**Files:** `sasquatch/client_anomaly/event_collector.py`, `sasquatch/client_anomaly/feature_engineer.py`, `sasquatch/client_anomaly/health_scorer.py`
+
+Status code 79 on `MARVIS_EVENT_CLIENT_AUTH_FAILURE` is a **transmission failure** (802.11
+frame not acknowledged at the radio layer) — the AP never received the client's frame, so
+there is no meaningful auth decision. It is not a client-side authentication failure. It
+commonly precedes a status_code 62 (GAS/ANQP timeout) in Passpoint environments but is
+structurally distinct: the client did not fail auth, the frame was lost in transit.
+
+Counting these as AUTH_FAILURE inflates `failure_ratio_auth`, depresses health scores, and
+can trigger the `auth_failure_terminal` / `auth_failure_recovering` pattern labels for
+devices that are experiencing only transient RF issues, not authentication problems.
+
+**Fix:**
+- In `event_collector.py` category bucketing (or in `feature_engineer.py` ratio
+  computation): exclude `MARVIS_EVENT_CLIENT_AUTH_FAILURE` events where `status_code == 79`
+  from the `AUTH_FAILURE` category. Move them to `OTHER` or a new `TRANSMISSION_FAILURE`
+  category so they still contribute to the frequency vector without contaminating auth
+  failure ratios.
+- In `health_scorer.py`: ensure the aggregate failure rate does not count status_code 79
+  events as auth failures.
+- In the post-hoc explainer (`_classify_probable_pattern`): confirm status_code 79 events
+  are not counted toward `cat_ratio_auth_failure` when determining pattern labels.
+- Log a count of filtered status_code 79 events at DEBUG level each collection cycle for
+  observability.
+
+---
+
+### 20. Centroid IF flags family outliers relative to other family centroids — not against a grand mean
+
+**Files:** `sasquatch/client_anomaly/anomaly_detector.py` — `_run_family_centroid_if()` (line ~252), `score()` (line ~391), `score_org_wide()` (line ~672)
+
+**How it actually works:**
+For each qualifying family (≥ 2 MACs), `_run_family_centroid_if()` computes a centroid = element-wise mean of all MACs' raw feature vectors (`FEATURE_KEYS` ordering). It then collects all qualifying family centroids into a single matrix, runs `StandardScaler` + `IsolationForest` across those N rows (one row per family), and flags any family whose `decision_function` score is negative. A negative IF score means the centroid was isolated in fewer random partitions than average — i.e., it occupies a sparse region of the family-centroid feature space.
+
+**This is not a distance-from-grand-mean test.** IF does not compute a reference centroid or a threshold distance. It uses random recursive partitioning — a family is flagged because its centroid is hard to "mix in" with the others, not because it exceeds some deviation from the population average.
+
+**Problems to investigate:**
+
+1. **Small N makes IF unreliable.** A typical site has 5–10 qualifying device families. Running IsolationForest on a 5-row matrix is statistically weak — the model has almost no population to learn a normal distribution from. At N=5, contamination=0.05 means 0.25 expected outliers, so the flag-threshold of `score < 0` is doing the real work, not the contamination setting. At N=10, contamination=0.05 still means only 0.5 expected outliers, so the model is biased toward flagging nothing.
+
+2. ~~**Contamination mismatch.**~~ **RESOLVED** — split into two separate constants and env vars: `ANOMALY_IF_CONTAMINATION` (Stage 2 intra-family, default 0.1) and `ANOMALY_CENTROID_IF_CONTAMINATION` (Stage 1b inter-family centroid IF, default 0.15). The centroid IF `IsolationForest` call now uses `CENTROID_IF_CONTAMINATION` instead of the shared `IF_CONTAMINATION`. With N=5–10 families, 0.15 calibrates IF to expect ~1 anomalous family, compared to the previous 0.05 which expected 0–0 and biased the model to never flag anything.
+
+3. **`score < 0` is the effective decision boundary, not contamination.** `IsolationForest.decision_function()` returns 0 at the contamination-derived threshold. The code flags on `score < 0` rather than on `predict() == -1`. These are equivalent when the model is properly calibrated, but at small N they can diverge. Worth confirming whether `predict()` and `score < 0` agree on the same families and which is more appropriate here.
+
+4. ~~**Centroid averaging may suppress the signal.**~~ **RESOLVED** — switched from mean centroid to a dual-representation row (median + max) concatenated into a single IF input. See fix description below.
+
+**Remaining investigation:**
+- Log `centroid_if_scores` (all family scores, not just flagged ones) at INFO level each cycle so the score distribution is observable in production without code changes. **PARTIALLY RESOLVED** — `_dispatch_centroid_detection` now logs all scores (both IF and distance paths) at INFO each cycle.
+- Check whether `predict()` and `score < 0` agree on the same families — if they diverge at this N, prefer `score < 0` and document why. **Only relevant for the IF path (N > 8).**
+- ~~Trial a separate `ANOMALY_CENTROID_IF_CONTAMINATION` env var (decoupled from `ANOMALY_IF_CONTAMINATION`) set to 0.15 or 0.20, and compare which families get flagged vs. the current shared 0.05.~~ **RESOLVED** — see fix description above.
+- ~~For sites with very few families (N < `CENTROID_IF_MIN_FAMILIES`), evaluate whether a distance-based fallback (e.g., cosine distance from the population centroid, threshold-gated) would give more interpretable results than skipping the step entirely.~~ **RESOLVED** — implemented as cosine-distance fallback for 3 ≤ N ≤ 8. See `_run_family_centroid_distance` and `_dispatch_centroid_detection` in `anomaly_detector.py`. New env vars: `ANOMALY_CENTROID_DIST_MAX_FAMILIES` (default 8) and `ANOMALY_CENTROID_DIST_THRESHOLD` (default 0.35).
+
+**Fix applied (`anomaly_detector.py` — `_run_family_centroid_if`):**
+Replaced `vectors.mean(axis=0)` with a concatenation of two vectors per family:
+- **Median vector** (`np.median(vectors, axis=0)`): more robust than the mean for whole-family shift detection — a single anomalous MAC no longer shifts the centroid.
+- **Max vector** (`vectors.max(axis=0)`): component-wise maximum across all MACs. Captures the behavioral ceiling — what the most extreme any member of the family does on each feature dimension.
+
+For a 2-MAC family with 1 healthy + 1 anomalous device: the median still collapses toward the midpoint (unavoidable at N=2), but the max vector preserves the anomalous MAC's feature values on the dimensions where it is extreme. IF can now see that this family's behavioral ceiling is anomalous relative to other families' ceilings, even when the median looks normal. The input to IF is now `2 × len(FEATURE_KEYS)` wide rather than `len(FEATURE_KEYS)` — `StandardScaler` normalizes this before IF sees it.
+
+---
+
+### 18. Evaluate whether 7-day event window improves anomaly detection vs. current 24hr
+**Files:** `sasquatch/client_anomaly/event_collector.py`, `sasquatch/client_anomaly/feature_engineer.py`, `sasquatch/client_anomaly/anomaly_detector.py`
+
+Events and client cache both use a 7-day TTL, but `feature_engineer.build_features()` and
+`anomaly_detector.score()` currently operate on the last 24 hours only. The question is
+whether extending the detection window to 7 days would improve signal quality.
+
+**Arguments for a longer window:**
+- More events per MAC → more stable frequency distributions, especially for low-volume
+  devices (IoT, printers) that may only generate a handful of events per day.
+- DBSCAN and IF both benefit from larger populations — richer peer groups for per-family IF.
+- A device experiencing a slow-onset degradation (gradually increasing PMKID failures over
+  days) would be more detectable against a week of baseline than a single day.
+
+**Arguments for keeping 24hr:**
+- The 24hr window is the natural unit of network behavior — a device that was broken last
+  Tuesday but healthy since Wednesday should not still be flagged today.
+- Longer windows dilute acute anomalies: a 3-minute PMKID storm (see item 14) already gets
+  washed out in a 24hr ratio — a 7-day window makes this worse, not better.
+- Health scores are designed to reflect current state, not historical state. A 7-day health
+  score would lag real recovery.
+- Feature vectors are probability distributions — extending the window shifts the reference
+  point but doesn't change the structural sparsity problem.
+
+**Recommended investigation:**
+- Run both 24hr and 7-day feature builds against the same event set and compare the
+  resulting feature vector distributions (variance, sparsity, inter-MAC distance) to see
+  if the longer window actually stabilises the vectors.
+- Check whether low-volume device families (IoT, printers) have materially different
+  IF scores under a longer window.
+- Consider a hybrid: use 7-day events for the IF training population (better peer baseline)
+  but 24hr events for the scored MAC's own feature vector (current behaviour, not historical).
+  This gives IF a richer reference frame while keeping the anomaly signal time-local.
+
+---
+
+### ~~16. DBSCAN curse of dimensionality — apply PCA reduction before clustering~~ RESOLVED
+**Files:** `sasquatch/client_anomaly/anomaly_detector.py`
+
+DBSCAN uses Euclidean distance, which degrades in high-dimensional space — all points
+tend toward the same inter-point distance, making `eps` hard to tune meaningfully. The
+61-dimension feature vectors are also sparse probability distributions (most clients have
+5–10 non-zero entries out of 59 event-type dimensions), which makes Euclidean distance
+worse: similarity is dominated by whichever few non-zero dimensions happen to overlap
+between two MACs rather than reflecting true behavioral similarity.
+
+Isolation Forest is not affected — it splits on one random feature at a time and never
+computes full-space distances, so it handles sparse high-dimensional vectors well.
+
+**Fix:** Apply PCA before DBSCAN only (not before IF). Reduce to the number of components
+capturing ~95% of variance. Given the sparsity of the frequency vectors, this will likely
+collapse from 61 to 8–15 components in practice.
+
+```python
+from sklearn.decomposition import PCA
+
+pca = PCA(n_components=0.95, random_state=42)
+X_scaled = scaler.fit_transform(feature_matrix)
+X_reduced = pca.fit_transform(X_scaled)   # pass to DBSCAN
+# IF still receives X_scaled — no PCA
+```
+
+Log `pca.n_components_` at INFO level each detection cycle so the actual dimensionality
+reduction is visible in the logs and can be monitored over time. The family centroid IF
+step can also benefit from PCA-reduced vectors since it operates on mean centroids, but
+this is lower priority.
+
+PCA is applied in `_run_dbscan()` between StandardScaler and DBSCAN. Uses
+`n_components=0.95` (capped at n_samples-1 for small populations). IF is unchanged —
+no PCA applied there. `pca.n_components_` is logged at INFO each cycle.
+
+---
+
 ### 14. Feature vectors collapse time — episode-based roam/auth storm detection missing
 **Files:** `sasquatch/client_anomaly/feature_engineer.py`, `sasquatch/client_anomaly/health_scorer.py`
 
@@ -219,65 +354,36 @@ App render. Client Refresh is also now wired for the Org view: calls `POST /api/
 
 ---
 
-### 10. Page load is slow — serial fetch waterfall before any content renders
+### ~~10. Page load is slow — serial fetch waterfall before any content renders~~ PARTIALLY RESOLVED
 **Files:** `sasquatch/frontend/src/App.jsx`, `sasquatch/frontend/src/components/SiteOverview.jsx`
 
-On initial load the browser makes a serial chain of requests before anything is visible:
-1. `GET /api/v1/org/sites` — populate site picker
-2. `GET /api/v1/focus` — determine selected site
-3. `GET /api/v1/wlans?site_id=...` — populate WLAN dropdown
-4. (only now) parallel: `events/summary` + `findings` + `health`
+Steps 1+2 (`/org/sites` and `/focus`) are already parallelized in a single `useEffect` in
+App.jsx. Step 3 (WLAN fetch) fires immediately when `selectedSite` resolves from `/focus`,
+in parallel with SiteOverview's own data fetches.
 
-Steps 1 and 2 are in separate `useEffect` calls in App.jsx and fire sequentially. Step 3 is
-gated on `selectedSite` resolving from step 2. Step 4 is gated on step 3. Until all four
-chains complete, SiteOverview renders only "Loading site overview…" — nothing progressive is
-shown to the user.
+**Skeleton UI:** Implemented in `SiteOverview.jsx` — replaces "Loading site overview…" with
+an animated shimmer skeleton matching the heatmap table layout (18 columns, 6 placeholder rows).
 
-**Fix (in priority order):**
-- **Parallelize steps 1+2:** Fetch `/org/sites` and `/focus` in a single `Promise.all` in one
-  `useEffect` rather than two separate effects that chain.
-- **Parallelize step 3 with steps 1+2:** The WLAN fetch only needs `site_id`, which is available
-  from `/focus` — start it the moment `focus` resolves, not after `sites` resolves too.
-- **Skeleton UI:** Replace the "Loading site overview…" string with a placeholder skeleton
-  (grey bars matching the heatmap layout) so the page feels populated while data loads.
-- **Stale-while-revalidate:** On subsequent navigations to a site already visited in the session,
-  render cached data immediately and refresh in the background rather than showing a loading state.
+**Remaining (not yet done):**
+- **Stale-while-revalidate:** On subsequent navigations to a previously-visited site, render
+  cached data immediately and refresh in the background rather than showing the skeleton again.
 
 ---
 
 ## Frontend — Navigation / Layout
 
-### 9. Site-view tabs ("Site Overview" / "Findings") should be inlined in the view, not the global header nav
-**File:** `sasquatch/frontend/src/App.jsx:429-450`, `sasquatch/frontend/src/components/SiteOverview.jsx`, `sasquatch/frontend/src/components/FindingsFeed.jsx`
-
-The top-level `<nav>` in the header iterates `["overview", "findings"]` and renders
-two buttons whose labels swap between "Site Overview" and "Findings" depending on
-`selectedSite`. For the Org view these buttons disappear entirely (`if (selectedSite === ORG_FOCUS_VALUE && v !== "overview") return null`) because `OrgOverview.jsx` owns its
-own internal four-tab nav bar (`Org Alerts | Org Overview | Org Family Insights | Findings`).
-
-The site-view has no equivalent internal tab bar — its navigation lives in the global
-header. This creates an inconsistency: the org view's sub-navigation is scoped to the
-view component, while the site view's sub-navigation bleeds into the shared header,
-making layout awkward especially as additional tabs are added.
-
-**Fix:** Remove the `["overview", "findings"]` iteration from the global header `<nav>`
-and add an equivalent inline tab bar inside the site-view section (the `div` at
-`App.jsx:567-575`). Pattern it after `OrgOverview.jsx`'s internal tab row. The active
-`view` state and `setView` handler will need to be passed down or co-located. The global
-header nav can then be simplified or removed entirely.
+### ~~9. Site-view tabs ("Site Overview" / "Findings") should be inlined in the view, not the global header nav~~ RESOLVED
+Removed the `["overview", "findings"]` nav from the global header. Added an inline tab
+bar directly in the site-view section of `App.jsx`, rendered only when a site (not org)
+is selected and the view is "overview" or "findings". Styled to match the OrgOverview
+internal tab row pattern — active tab uses `#0d2a38` background with `#7ec8e3` border/text,
+inactive uses `#161616` with `#333` border.
 
 ---
 
-### 10. "Findings" tab in the Org four-tab bar should be labelled "Org Findings"
-**File:** `sasquatch/frontend/src/components/OrgOverview.jsx:136`
-
-The label ternary chain in `OrgOverview` resolves to plain `"Findings"` for
-`view === "findings"`. The other three tabs are prefixed "Org …", making this tab
-inconsistent and ambiguous when comparing to the site-level Findings tab that will
-appear after item 9 is implemented.
-
-**Fix:** Change the last branch of the ternary from `"Findings"` to `"Org Findings"`.
-No backend change required — this is purely a display label.
+### ~~10. "Findings" tab in the Org four-tab bar should be labelled "Org Findings"~~ RESOLVED
+Changed last branch of label ternary in `OrgOverview.jsx:136` from `"Findings"` to
+`"Org Findings"` — consistent with the other three "Org …" prefixed tabs.
 
 ---
 
@@ -336,6 +442,78 @@ rather than raising. In `scheduler.py`, distinguish between `EventCollectionEmpt
 (info) and actual exceptions (warning/error) so the status bar only lights up for
 genuine problems. The `GET /sites/{site_id}/status` response should convey
 `event_count: 0` as a normal state, not an error condition.
+
+---
+
+## Configuration
+
+### 15. Webhook URL in .env is stale — needs reconfiguration
+**File:** `.env` (`ANOMALY_WEBHOOK_URL`)
+
+The current `ANOMALY_WEBHOOK_URL` value in `.env` points to an old endpoint and is no
+longer valid. The webhook dispatch code is correct; only the target URL needs updating.
+
+**Fix:** Determine the correct webhook target and update `ANOMALY_WEBHOOK_URL` in `.env`.
+Also confirm `ANOMALY_WEBHOOK_SEVERITY_THRESHOLD` is set appropriately for the new target
+(default: `significant`). Test with a manual `POST /api/v1/org/detect` after updating.
+
+---
+
+## Alerting / History
+
+### ~~19. Alerts have no persistence — no duration tracking, no history after the detection window expires~~ RESOLVED
+**Files:** `sasquatch/client_anomaly/anomaly_detector.py`, `sasquatch/client_anomaly/webhook_dispatcher.py`, `sasquatch/client_anomaly/api/routes.py`, frontend alert components
+
+Currently a dual-gate alert (is_family_outlier + health < 0.75) exists only for as long
+as the 24hr findings TTL is alive. Once the detection cycle rolls over or the key expires,
+there is no record that the alert ever existed — no way to know when it started, how long
+it persisted, or when it resolved. An operator seeing an alert has no context on whether
+this started 5 minutes ago or has been active for two days.
+
+**What needs to be added:**
+
+*Backend — alert history store:*
+- New Redis key `sasquatch:alert_history:{site_id}` (hash, 7-day TTL, field = `{family}:{wlan}`).
+- On each detection cycle, in `webhook_dispatcher.evaluate_and_dispatch()` (or a new
+  `alert_tracker.py`), for every finding that satisfies the dual gate:
+  - If no existing record: write `{first_seen: now, last_seen: now, status: "active"}`.
+  - If an existing active record: update `last_seen: now` (extend without resetting `first_seen`).
+- For every family that *no longer* satisfies the dual gate but has an active record:
+  write `resolved_at: now, status: "resolved"` — keep the record for at least 7 days
+  so operators can see recently-resolved alerts.
+- Alert duration is computable as `last_seen - first_seen` (for active) or
+  `resolved_at - first_seen` (for resolved).
+- Org-level alert history: `sasquatch:org_alert_history` with field = `{family}:{wlan}`,
+  written by the org-wide detection job using the same logic.
+
+*New API endpoints:*
+```
+GET /api/v1/sites/{site_id}/alert-history?wlan=__all__
+GET /api/v1/org/alert-history?wlan=__all__
+```
+Each returns a list of `{family, wlan, first_seen, last_seen, resolved_at, status, duration_seconds}`.
+
+*Frontend — alert card enhancements:*
+- On every active alert card (in `OrgAlerts.jsx`, `FindingsFeed.jsx`), show a duration
+  badge: **"Active Xh Ym"** using `first_seen` from alert history. This is the most
+  important operator-facing signal — a 3-hour alert is very different from a 3-day alert.
+- Recently-resolved alerts (resolved within the last 24hr) should remain visible in a
+  "Recently Resolved" section below the active alerts, showing duration and resolved
+  timestamp. This prevents operators losing context when a recovery coincides with a
+  detection cycle.
+- For active alerts without a `first_seen` record (history not yet populated), fall back
+  to showing no duration badge rather than erroring.
+
+*Env var:*
+```
+ALERT_HISTORY_TTL_DAYS=7   # How long to retain resolved alert history (default 7)
+```
+
+**Why `last_seen` matters separately from `resolved_at`:** A detection cycle runs every
+15 minutes. If the scheduler misses a cycle (restart, error), the alert should not be
+considered resolved just because `last_seen` is 20 minutes ago. Only write `resolved_at`
+when a cycle completes successfully and the dual-gate condition is no longer met — i.e.,
+absence-of-flag on a successful run, not just absence-of-update.
 
 ---
 

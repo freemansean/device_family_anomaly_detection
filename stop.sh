@@ -23,7 +23,6 @@ stop_pid() {
 
 stop_pid "Frontend" "frontend"
 stop_pid "Backend" "backend"
-stop_pid "Ollama" "ollama"
 
 # Leave Redis running — it's a shared service.
 # To stop Redis: brew services stop redis  OR  redis-cli shutdown

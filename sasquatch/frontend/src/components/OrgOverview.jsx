@@ -133,7 +133,7 @@ export default function OrgOverview({ apiBase, onSiteSelect, onMacSiteSelect, re
       {/* View toggle */}
       <div style={{ display: "flex", gap: "8px", marginBottom: "18px" }}>
         {["alerts", "overview", "insights", "findings"].map(view => {
-          const label = view === "alerts" ? "Org Alerts" : view === "overview" ? "Org Overview" : view === "insights" ? "Org Family Insights" : "Findings";
+          const label = view === "alerts" ? "Org Alerts" : view === "overview" ? "Org Overview" : view === "insights" ? "Org Family Insights" : "Org Findings";
           const active = activeView === view;
           const isAlertTab = view === "alerts";
           const activeColor  = isAlertTab ? "#e05555" : "#7ec8e3";

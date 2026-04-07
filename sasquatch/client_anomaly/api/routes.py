@@ -47,6 +47,7 @@ from ..event_collector import (
 from ..feature_engineer import _features_redis_key, build_features, get_features
 from ..health_scorer import get_health, score_health, _health_redis_key
 from ..scheduler import build_org_pools, run_collect_only, run_detect_only, run_detection_cycle
+from .. import alert_tracker
 from ..webhook_dispatcher import evaluate_and_dispatch
 from .auth import require_auth
 
@@ -60,6 +61,8 @@ DETECTION_INTERVAL_MINUTES = int(os.getenv("DETECTION_INTERVAL_MINUTES", "15"))
 MIST_API_TOKEN = os.getenv("MIST_API_TOKEN", "")
 MIST_CLOUD_HOST = os.getenv("MIST_CLOUD_HOST", "api.mist.com")
 MIST_ORG_ID = os.getenv("MIST_ORG_ID", "")
+_random_state_env = os.getenv("ANOMALY_RANDOM_STATE", "42")
+_VIZ_RANDOM_STATE: int | None = None if _random_state_env.strip() == "-1" else int(_random_state_env)
 
 
 # Module-level connection pool — created on first use after load_dotenv() has run.
@@ -90,7 +93,7 @@ def _run_pca(X: np.ndarray) -> tuple[np.ndarray, list[float]]:
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X)
     n_components = min(2, X_scaled.shape[0], X_scaled.shape[1])
-    pca = PCA(n_components=n_components, random_state=42)
+    pca = PCA(n_components=n_components, random_state=_VIZ_RANDOM_STATE)
     coords = pca.fit_transform(X_scaled)
     if coords.shape[1] == 1:
         coords = np.hstack([coords, np.zeros((coords.shape[0], 1))])
@@ -744,6 +747,160 @@ async def get_org_alerts(wlan: str = Query("__all__")):
     return {
         "org_alerts": org_alerts,
         "site_alerts": site_alerts,
+        "wlan": wlan,
+    }
+
+
+@router.get("/org/alert-history")
+async def get_org_alert_history(
+    wlan: str = Query("__all__"),
+    days: int = Query(7, ge=1, le=30),
+    tz_offset: int = Query(0, description="Browser timezone offset in minutes (JS getTimezoneOffset())"),
+):
+    """
+    Return alert session history for the past N days (default 7), grouped by UTC day.
+
+    Each session represents a contiguous period where a device family at a specific site
+    passed the dual alert gate (is_family_outlier + health_score < threshold).
+
+    Sessions that span multiple days appear in each day they were active, with
+    window_start/window_end clipped to that day's UTC boundaries.
+
+    Response shape:
+      {
+        "days": [
+          {
+            "date": "2026-04-06",
+            "label": "Today" | "Yesterday" | "Mon Apr 5",
+            "alarms": [
+              {
+                "family": str,
+                "site_id": str,
+                "site_name": str,
+                "wlan": str,
+                "window_start": ISO8601,  // clipped to this day's UTC boundaries
+                "window_end":   ISO8601,  // last_seen if active, resolved_at if resolved
+                "status": "active" | "resolved",
+                "session_first_seen": ISO8601,  // actual alarm start (may be earlier day)
+                "total_duration_seconds": int   // full session length so far
+              }
+            ]
+          }
+        ],
+        "total_sessions": int
+      }
+    """
+    from datetime import timedelta
+
+    if not MIST_ORG_ID or not MIST_API_TOKEN:
+        raise HTTPException(status_code=500, detail="MIST_ORG_ID or MIST_API_TOKEN not configured.")
+
+    redis_client = _get_redis()
+    try:
+        try:
+            site_map = await _get_org_site_map(redis_client)
+        except Exception:
+            raise HTTPException(status_code=502, detail="Could not reach Mist API")
+
+        sessions = await alert_tracker.get_recent_sessions(days=days, wlan=wlan, redis_client=redis_client)
+    finally:
+        await redis_client.aclose()
+
+    now_ts = _time.time()
+
+    # Build day buckets for the past `days` days in the browser's local timezone, newest first.
+    # tz_offset is JS getTimezoneOffset(): minutes *behind* UTC (EDT=+240, UTC+5:30=-330).
+    local_offset_sec = -tz_offset * 60  # convert to seconds ahead of UTC
+    local_tz = timezone(timedelta(seconds=local_offset_sec))
+    today_local = datetime.now(local_tz).replace(hour=0, minute=0, second=0, microsecond=0)
+    day_buckets: list[dict] = []
+    for offset in range(days):
+        day_start_dt = today_local - timedelta(days=offset)
+        day_end_dt   = day_start_dt + timedelta(days=1)
+        day_start_ts = day_start_dt.timestamp()
+        day_end_ts   = day_end_dt.timestamp()
+
+        if offset == 0:
+            label = "Today"
+        elif offset == 1:
+            label = "Yesterday"
+        else:
+            label = day_start_dt.strftime("%a %b") + " " + str(day_start_dt.day)
+
+        day_buckets.append({
+            "date":  day_start_dt.strftime("%Y-%m-%d"),  # local date
+            "label": label,
+            "day_start_ts": day_start_ts,
+            "day_end_ts":   day_end_ts,
+            "alarms": [],
+        })
+
+    # Expand each session across the days it spans.
+    for session in sessions:
+        s_start = session.get("first_seen", 0)
+        s_end   = session.get("resolved_at") or session.get("last_seen") or now_ts
+        status  = session.get("status", "resolved")
+        family  = session.get("family", "")
+        site_id = session.get("site_id", "")
+        site_name = site_map.get(site_id, site_id)
+        total_duration = int(s_end - s_start)
+
+        for bucket in day_buckets:
+            d_start = bucket["day_start_ts"]
+            d_end   = bucket["day_end_ts"]
+
+            # Session overlaps with this day
+            if s_start >= d_end or s_end <= d_start:
+                continue
+
+            window_start = max(s_start, d_start)
+            window_end   = min(s_end, d_end)
+
+            # For today's active alarms, extend window_end to now so it reflects
+            # the live duration rather than the last detection cycle timestamp.
+            if status == "active" and d_start <= now_ts < d_end:
+                window_end = min(now_ts, d_end)
+
+            bucket["alarms"].append({
+                "family": family,
+                "site_id": site_id,
+                "site_name": site_name,
+                "wlan": session.get("wlan", wlan),
+                "window_start": datetime.fromtimestamp(window_start, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "window_end":   datetime.fromtimestamp(window_end,   tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "status": status,
+                "session_first_seen": datetime.fromtimestamp(s_start, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "total_duration_seconds": total_duration,
+                # Finding snapshot fields — populated from the last detection cycle
+                "severity":           session.get("severity"),
+                "outlier_ratio":      session.get("outlier_ratio"),
+                "affected_mac_count": session.get("affected_mac_count"),
+                "total_mac_count":    session.get("total_mac_count"),
+                "health_score":       session.get("health_score"),
+                "health_components":  session.get("health_components") or {},
+                "probable_pattern":   session.get("probable_pattern"),
+                "top_features":       session.get("top_features") or [],
+                "predominant_wlan":   session.get("predominant_wlan"),
+            })
+
+    # Sort alarms within each day: active first, then by window_start ascending.
+    for bucket in day_buckets:
+        bucket["alarms"].sort(key=lambda a: (a["status"] != "active", a["window_start"]))
+
+    # Drop the internal timestamp fields before returning; drop empty days.
+    result_days = []
+    for bucket in day_buckets:
+        if not bucket["alarms"]:
+            continue
+        result_days.append({
+            "date":   bucket["date"],
+            "label":  bucket["label"],
+            "alarms": bucket["alarms"],
+        })
+
+    return {
+        "days": result_days,
+        "total_sessions": len(sessions),
         "wlan": wlan,
     }
 
