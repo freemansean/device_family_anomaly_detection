@@ -134,8 +134,8 @@ Copy `.env.example` to `.env`. Variables are grouped below by concern.
 
 | Variable | Default | Description |
 |---|---|---|
-| `DETECTION_INTERVAL_MINUTES` | `60` | How often to pull events and run the full detection pipeline. Lower values catch issues faster but increase Mist API load. |
-| `ORG_DETECTION_INTERVAL_HOURS` | `6` | How often to run the org-wide cross-site detection job. Increase if API rate limits are a concern with many sites. |
+| `SITE_FOCUS_DETECTION_INTERVAL` | `60` | How often (minutes) to pull the latest events from Mist and run the full detection pipeline for the currently focused site. Each run pulls only the **last hour** of events from the Mist API and appends them to the rolling 24-hour Redis dataset — scoring always runs against the full 24-hour window. Lower values = more frequent detection but more Mist API calls. |
+| `ORG_DETECTION_INTERVAL_HOURS` | `6` | How often (hours) to run the org-wide cross-site detection job. Like the per-site job, each run pulls the last hour of events per site from Mist, then scores against each site's full 24-hour Redis window pooled across all org sites. Rate limits are a factor here since the job calls the Mist API once per org site per cycle. |
 
 ### ML Tuning — Isolation Forest
 

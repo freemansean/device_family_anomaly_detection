@@ -57,7 +57,7 @@ router = APIRouter(prefix="/api/v1")
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 SITE_ID = os.getenv("MIST_SITE_ID", "")
-DETECTION_INTERVAL_MINUTES = int(os.getenv("DETECTION_INTERVAL_MINUTES", "15"))
+SITE_FOCUS_DETECTION_INTERVAL = int(os.getenv("SITE_FOCUS_DETECTION_INTERVAL", "60"))
 MIST_API_TOKEN = os.getenv("MIST_API_TOKEN", "")
 MIST_CLOUD_HOST = os.getenv("MIST_CLOUD_HOST", "api.mist.com")
 MIST_ORG_ID = os.getenv("MIST_ORG_ID", "")
@@ -1786,7 +1786,7 @@ async def get_site_status(site_id: str, wlan: str = Query("__all__")):
         "wlan": wlan,
         "event_count": len(site_events),
         "finding_count": finding_count,
-        "detection_interval_minutes": DETECTION_INTERVAL_MINUTES,
+        "detection_interval_minutes": SITE_FOCUS_DETECTION_INTERVAL,
         "redis_ttls": {
             "clients": clients_ttl,
             "features": features_ttl,
