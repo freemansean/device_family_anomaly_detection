@@ -8,7 +8,7 @@ Unsupervised anomaly detection for Juniper Mist wireless networks. Detects devic
 
 ## How It Works
 
-Every 15 minutes, Sasquatch:
+On a configurable interval (default: 60 minutes), Sasquatch:
 
 1. Pulls the last 24 hours of client events from the Mist API (paginated, enriched with device metadata)
 2. Builds a per-MAC behavioral feature vector — normalized event type frequencies, so volume is never the signal
@@ -119,40 +119,86 @@ API docs (Swagger): [http://localhost:8000/docs](http://localhost:8000/docs)
 
 ## Configuration
 
-Copy `.env.example` to `.env` and set the following:
+Copy `.env.example` to `.env`. Variables are grouped below by concern.
 
-```bash
-# Mist API
-MIST_API_TOKEN=your_api_token
-MIST_CLOUD_HOST=api.mist.com        # api.gc4.mist.com, api.eu.mist.com, etc.
-MIST_SITE_ID=<site-uuid>
-MIST_ORG_ID=<org-uuid>
+### Mist API
 
-# Redis
-REDIS_URL=redis://localhost:6379
+| Variable | Description |
+|---|---|
+| `MIST_API_TOKEN` | Mist API token with read access to client events |
+| `MIST_CLOUD_HOST` | Regional API host — `api.mist.com`, `api.gc1.mist.com`, `api.gc4.mist.com`, `api.eu.mist.com`, etc. Do **not** include `/api/v1`. |
+| `MIST_SITE_ID` | UUID of the primary site to monitor |
+| `MIST_ORG_ID` | UUID of the org — enables org-wide cross-site detection |
 
-# Detection schedule
-DETECTION_INTERVAL_MINUTES=15
+### Scheduling
 
-# ML tuning
-ANOMALY_IF_CONTAMINATION=0.05       # Isolation Forest contamination rate
-ANOMALY_DBSCAN_EPS=2.5              # DBSCAN neighborhood radius
-ANOMALY_DBSCAN_MIN_SAMPLES=5        # DBSCAN min cluster size
-ANOMALY_FINDING_THRESHOLD=0.2       # Min outlier ratio to generate a finding
-ANOMALY_MIN_PEERS=5                 # Min family size to run per-family IF
-ANOMALY_HEALTH_SCORE_THRESHOLD=0.75 # Health score below this = unhealthy
+| Variable | Default | Description |
+|---|---|---|
+| `DETECTION_INTERVAL_MINUTES` | `60` | How often to pull events and run the full detection pipeline. Lower values catch issues faster but increase Mist API load. |
+| `ORG_DETECTION_INTERVAL_HOURS` | `6` | How often to run the org-wide cross-site detection job. Increase if API rate limits are a concern with many sites. |
 
-# Webhook — fires only when is_family_outlier AND health < threshold AND severity >= threshold
-ANOMALY_WEBHOOK_URL=https://your-endpoint/webhook/anomaly
-ANOMALY_WEBHOOK_SEVERITY_THRESHOLD=significant  # minimal | moderate | significant
+### ML Tuning — Isolation Forest
 
-# Dashboard auth
-APP_USERNAME=your_username
-APP_PASSWORD=your_password
+| Variable | Default | Description |
+|---|---|---|
+| `ANOMALY_IF_CONTAMINATION` | `0.1` | Fraction of MACs within a device family expected to be outliers (Stage 2 — intra-family IF). Lower = stricter, fewer individual MACs flagged. Range: 0.01–0.5. |
+| `ANOMALY_CENTROID_IF_CONTAMINATION` | `0.15` | Fraction of device families expected to be behavioral outliers (inter-family centroid IF). Intentionally higher than `IF_CONTAMINATION` — at a site with a real problem, 1 in 6–8 families being anomalous is plausible. |
+| `ANOMALY_IF_N_ESTIMATORS` | `100` | Number of trees in every IsolationForest. More trees = more stable scores at diminishing returns. Increase to 200–500 if scores are noisy across consecutive cycles. |
+| `ANOMALY_RANDOM_STATE` | `42` | Global random seed for all ML components (IsolationForest, PCA). Fixed integer gives reproducible scores across cycles. Set to `-1` to use a random seed each run. |
+| `ANOMALY_MIN_PEERS` | `5` | Minimum MACs a device family must have at a site before per-family IF runs. Families below this are eligible for org-level pooling; if still short after pooling, IF is skipped. |
 
-# Frontend
-VITE_API_BASE_URL=http://localhost:8000
-```
+### ML Tuning — DBSCAN
+
+| Variable | Default | Description |
+|---|---|---|
+| `ANOMALY_DBSCAN_PCA_VARIANCE` | `0.95` | Fraction of variance PCA must retain when reducing dimensions before DBSCAN. The 61-dim feature vectors are sparse; PCA typically collapses to 8–15 components at 0.95. Does not affect IsolationForest. |
+| `ANOMALY_DBSCAN_EPS` | `0.5` | Maximum distance between two MACs (in PCA-reduced, StandardScaler-normalized space) to be considered neighbors. Higher = larger clusters (less noise). Lower = tighter clusters (more noise points). |
+| `ANOMALY_DBSCAN_MIN_SAMPLES` | `5` | Minimum neighbors within `eps` for a point to be a core point. Lower = easier to form clusters. |
+| `ANOMALY_DBSCAN_MIN_FAMILY_SIZE` | `5` | Minimum MACs a device family must have to participate in site-wide DBSCAN. Families smaller than this are excluded (too small to anchor a cluster) but still go through Isolation Forest. |
+| `ANOMALY_DBSCAN_FAMILY_NOISE_THRESHOLD` | `0.5` | Fraction of a family's MACs that must be DBSCAN noise before the family is considered a DBSCAN-level outlier. Stored on anomaly records and shown in the UI; does **not** control `is_family_outlier` (that is set by centroid IF). |
+
+### ML Tuning — Family Centroid Detection
+
+| Variable | Default | Description |
+|---|---|---|
+| `ANOMALY_CENTROID_IF_MIN_FAMILIES` | `3` | Minimum qualifying device families (each with ≥ `ANOMALY_MIN_PEERS` MACs) before any inter-family centroid detection runs. Below this the step is skipped and `is_family_outlier` remains False for all families. |
+| `ANOMALY_CENTROID_DIST_MAX_FAMILIES` | `8` | Upper bound for the cosine-distance fallback path. Sites with 3–8 qualifying families use distance-from-median instead of IsolationForest (IF is statistically unreliable at small N). Sites above this use full IF. |
+| `ANOMALY_CENTROID_DIST_THRESHOLD` | `0.35` | Cosine distance from the population median above which a family centroid is flagged as a behavioral outlier (`is_family_outlier = True`). Range: 0.0–1.0. Higher = less sensitive. |
+
+### ML Tuning — Finding Rollup
+
+| Variable | Default | Description |
+|---|---|---|
+| `ANOMALY_FINDING_THRESHOLD` | `0.3` | Minimum fraction of a family's MACs that must be flagged as outliers (by any of IF, DBSCAN, or centroid IF) before a finding is generated. Severity: minimal (0–0.3), moderate (0.3–0.6), significant (>0.6). |
+| `ANOMALY_FINDING_MIN_SIZE` | `2` | Minimum local MACs before a site-level finding is generated. Applies to families that did **not** use org-level IF pooling. Families that did use org pooling use `ANOMALY_MIN_PEERS` as their minimum instead (higher bar — cross-site data was borrowed). |
+
+### ML Tuning — Feature Engineering
+
+| Variable | Default | Description |
+|---|---|---|
+| `ANOMALY_MIN_MAC_EVENTS` | `5` | Minimum events a MAC must have in the 24hr window to be included in the ML feature matrix. Higher = only analyze devices with meaningful activity; lower = include briefly-seen/transient devices. |
+| `CACHE_MISS_REFRESH_THRESHOLD` | `10` | Number of MAC-to-device-family cache misses that can accumulate before the event collector triggers an early client cache refresh. Prevents stale device classification mid-cycle. |
+
+### Health Score
+
+| Variable | Default | Description |
+|---|---|---|
+| `ANOMALY_HEALTH_SCORE_THRESHOLD` | `0.75` | Per-family health score below this value = unhealthy. Webhook alerts require **both** `is_family_outlier = True` **and** `health_score < threshold`. Formula: `1.0 - (failures / (successes + failures))` across AUTH, ROAM, DHCP, DNS, and ARP. **Note:** also hardcoded in `FindingsFeed.jsx`, `OrgFindingsFeed.jsx`, and `OrgAlerts.jsx` — update those if this threshold changes. |
+
+### Webhook
+
+| Variable | Default | Description |
+|---|---|---|
+| `ANOMALY_WEBHOOK_URL` | _(empty)_ | Endpoint to POST alerts. Leave empty to disable dispatch — alert sessions are still recorded in Redis. |
+| `ANOMALY_WEBHOOK_SEVERITY_THRESHOLD` | `significant` | Minimum finding severity to dispatch a webhook. Valid values: `minimal`, `moderate`, `significant`. Severity is derived from `outlier_ratio`: minimal (0–0.3), moderate (0.3–0.6), significant (>0.6). |
+
+### App Auth & Frontend
+
+| Variable | Default | Description |
+|---|---|---|
+| `APP_USERNAME` | — | HTTP Basic Auth username for the dashboard |
+| `APP_PASSWORD` | — | HTTP Basic Auth password for the dashboard |
+| `VITE_API_BASE_URL` | `http://localhost:8000` | Backend URL used by the React frontend at build time |
 
 ---
 
