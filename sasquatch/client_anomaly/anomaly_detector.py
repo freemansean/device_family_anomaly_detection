@@ -88,6 +88,11 @@ CENTROID_DIST_MAX_FAMILIES = int(os.getenv("ANOMALY_CENTROID_DIST_MAX_FAMILIES",
 # Range 0.0–2.0 (practically 0.0–1.0 for typical scaled vectors). Higher = less sensitive.
 CENTROID_DIST_THRESHOLD = float(os.getenv("ANOMALY_CENTROID_DIST_THRESHOLD", "0.35"))
 FINDING_THRESHOLD = float(os.getenv("ANOMALY_FINDING_THRESHOLD", "0.3"))
+# Minimum number of local MACs a family must have before a site-level finding is generated
+# (applies to families that did NOT use org-level IF pooling). Families with fewer MACs
+# than this are skipped in finding rollup even if centroid detection flagged them.
+# Org-pooled families use MIN_PEERS as their minimum instead.
+FINDING_MIN_SIZE = int(os.getenv("ANOMALY_FINDING_MIN_SIZE", "2"))
 
 
 
@@ -615,12 +620,16 @@ async def score(
         for family, family_macs in family_groups.items():
             total = len(family_macs)
 
-            # Families that ran IF via org pooling require at least 2 to avoid
-            # single-device IF noise. All others require MIN_PEERS.
+            # Org-pooled families borrowed cross-site data to run IF, so require
+            # MIN_PEERS local MACs before surfacing a site-level finding (avoids
+            # hallucinated site findings driven by org noise).
+            # Site-only families (IF ran locally or was skipped entirely) use the
+            # lower FINDING_MIN_SIZE threshold — even 2 devices flagged by centroid
+            # detection is real site signal worth reporting.
             if family in families_with_org_if:
-                min_for_finding = 2
-            else:
                 min_for_finding = MIN_PEERS
+            else:
+                min_for_finding = FINDING_MIN_SIZE
             if total < min_for_finding:
                 continue
 

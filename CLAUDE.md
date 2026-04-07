@@ -578,8 +578,8 @@ After both stages, roll up to device family findings:
 - `is_outlier = is_if_outlier OR is_dbscan_outlier OR is_family_outlier`
 - If outlier_ratio >= `ANOMALY_FINDING_THRESHOLD` (default 0.2), generate a finding
 - Minimum family size to generate a finding:
-  - Families that used org-level IF pooling: **2** (avoids single-device IF noise)
-  - All others: **MIN_PEERS** (2)
+  - Families that used org-level IF pooling: **MIN_PEERS** (`ANOMALY_MIN_PEERS`, default 3) — higher bar because cross-site data was borrowed; avoids hallucinated site findings driven by org noise
+  - All others (site-local IF or IF skipped): **`ANOMALY_FINDING_MIN_SIZE`** (default 2) — even 2 devices flagged by centroid detection is real site signal worth reporting
 - Top contributing features: mean comparison of outlier MACs vs non-outlier MACs in
   the same family. For family-wide outliers (all MACs flagged), compares against all
   other families at the site.
