@@ -28,7 +28,7 @@ log = logging.getLogger(__name__)
 
 SITE_ID = os.getenv("MIST_SITE_ID", "")
 SITE_FOCUS_DETECTION_INTERVAL = int(os.getenv("SITE_FOCUS_DETECTION_INTERVAL", "60"))
-ORG_DETECTION_INTERVAL_HOURS = int(os.getenv("ORG_DETECTION_INTERVAL_HOURS", "6"))
+ORG_DETECTION_INTERVAL_HOURS = int(os.getenv("ORG_DETECTION_INTERVAL_HOURS", "1"))
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 MIST_API_TOKEN = os.getenv("MIST_API_TOKEN", "")
 MIST_CLOUD_HOST = os.getenv("MIST_CLOUD_HOST", "api.mist.com")
@@ -341,6 +341,16 @@ async def org_cross_site_detect_job() -> None:
     """
     if not MIST_ORG_ID or not MIST_API_TOKEN:
         log.debug("[org-detect] MIST_ORG_ID or MIST_API_TOKEN not configured — skipping")
+        return
+
+    # Check if org detection has been disabled by the administrator via the GUI.
+    _flag_client = aioredis.from_url(REDIS_URL, decode_responses=True)
+    try:
+        _flag = await _flag_client.get("sasquatch:org_detection_enabled")
+    finally:
+        await _flag_client.aclose()
+    if _flag == "0":
+        log.info("[org-detect] Org detection disabled by administrator — skipping cycle")
         return
 
     # Acquire org-wide lock
