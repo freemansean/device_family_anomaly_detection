@@ -86,12 +86,55 @@ export default function SiteOverview({ siteId, apiBase, onMacSelect, onFamilySel
     return () => clearInterval(interval);
   }, [load]);
 
-  if (loading && !summary) return <div style={{ color: "#888" }}>Loading site overview…</div>;
+  if (loading && !summary) {
+    // Skeleton: 3 fixed cols + 15 CATEGORIES = 18 columns
+    const skeletonColWidths = [110, 62, 80, ...Array(15).fill(18)];
+    const shimmer = "sq-site-shimmer 1.5s ease-in-out infinite";
+    return (
+      <div>
+        <style>{`@keyframes sq-site-shimmer { 0%,100% { opacity: 0.3; } 50% { opacity: 0.55; } }`}</style>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "12px" }}>
+          <div style={{ width: "200px", height: "13px", background: "#2a2a2a", borderRadius: "3px", animation: shimmer }} />
+          <div style={{ width: "160px", height: "11px", background: "#1e1e1e", borderRadius: "3px", animation: shimmer }} />
+        </div>
+        <div style={{ overflowX: "auto" }}>
+          <table style={{ borderCollapse: "collapse", fontSize: "12px" }}>
+            <thead>
+              <tr>
+                {skeletonColWidths.map((w, i) => (
+                  <th key={i} style={{ padding: i >= 3 ? "4px 2px" : "6px 8px", borderBottom: "1px solid #222", textAlign: "left" }}>
+                    <div style={{ width: `${w}px`, height: i >= 3 ? "40px" : "10px", background: "#222", borderRadius: "2px", animation: shimmer }} />
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {[100, 85, 72, 90, 65, 78].map((nameW, ri) => (
+                <tr key={ri}>
+                  {skeletonColWidths.map((w, ci) => (
+                    <td key={ci} style={{ padding: ci >= 3 ? "4px 2px" : "6px 8px", borderBottom: "1px solid #1a1a1a" }}>
+                      <div style={{
+                        width: ci === 0 ? `${nameW}px` : ci >= 3 ? "14px" : `${Math.round(w * 0.65)}px`,
+                        height: "10px",
+                        background: "#1a1a1a",
+                        borderRadius: ci >= 3 ? "2px" : "2px",
+                        animation: shimmer,
+                      }} />
+                    </td>
+                  ))}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    );
+  }
   if (error) return <div style={{ color: "#e05555" }}>Error: {error}</div>;
   if (!summary) return null;
 
   const HIDDEN_FAMILIES = new Set(["Unknown", "IoT (Unknown)"]);
-  const MIN_DISPLAY_CLIENTS = 5;
+  const MIN_DISPLAY_CLIENTS = 1;
   const allFamilies = Object.keys(summary.families || {}).filter((f) => !HIDDEN_FAMILIES.has(f));
   const families = allFamilies
     .filter((f) => (summary.family_client_counts?.[f] ?? 0) >= MIN_DISPLAY_CLIENTS)
@@ -123,7 +166,7 @@ export default function SiteOverview({ siteId, apiBase, onMacSelect, onFamilySel
         <h2 style={{ margin: 0, fontSize: "15px", color: "#aaa" }}>
           Site Overview — {summary.total_events?.toLocaleString()} events
         </h2>
-        <span style={{ fontSize: "12px", color: "#555" }}>
+        <span style={{ fontSize: "12px", color: "#999" }}>
           Refreshed {lastRefresh} · auto-refresh 60s
         </span>
       </div>
@@ -187,7 +230,7 @@ export default function SiteOverview({ siteId, apiBase, onMacSelect, onFamilySel
                       {family}
                     </span>
                     {clientCount > 0 && (
-                      <span style={{ color: "#444", fontSize: "11px", marginLeft: "6px" }}>
+                      <span style={{ color: "#aaa", fontSize: "11px", marginLeft: "6px" }}>
                         ({clientCount})
                       </span>
                     )}
@@ -249,7 +292,7 @@ export default function SiteOverview({ siteId, apiBase, onMacSelect, onFamilySel
                       : ratio > 0 ? "#1a2d1a" : "#111";
                     const textColor = isFailure && ratio > 0.1 ? "#fff"
                       : isSuccess && ratio > 0.15 ? "#fff"
-                      : "#555";
+                      : "#bbb";
                     return (
                       <td
                         key={cat}
@@ -276,19 +319,19 @@ export default function SiteOverview({ siteId, apiBase, onMacSelect, onFamilySel
             })}
             {showOtherRow && (
               <tr style={{ borderTop: "1px solid #2a2a2a" }}>
-                <td style={{ ...tdStyle, whiteSpace: "nowrap", color: "#555", fontStyle: "italic" }}>
+                <td style={{ ...tdStyle, whiteSpace: "nowrap", color: "#aaa", fontStyle: "italic" }}>
                   <span style={{
                     display: "inline-block", width: 8, height: 8,
-                    borderRadius: "50%", background: "#444",
+                    borderRadius: "50%", background: "#666",
                     marginRight: "6px", verticalAlign: "middle",
                   }} />
                   All Other Devices
-                  <span style={{ color: "#333", fontSize: "11px", marginLeft: "6px" }}>
+                  <span style={{ color: "#888", fontSize: "11px", marginLeft: "6px" }}>
                     ({otherClientCount} clients, {otherFamilies.length} types)
                   </span>
                 </td>
                 <td style={{ ...tdStyle, textAlign: "center" }}>
-                  <span style={{ color: "#333", fontSize: "10px" }}>—</span>
+                  <span style={{ color: "#888", fontSize: "10px" }}>—</span>
                 </td>
                 <td style={tdStyle} />
                 {CATEGORIES.map((cat) => {
@@ -345,7 +388,7 @@ export default function SiteOverview({ siteId, apiBase, onMacSelect, onFamilySel
 const thStyle = {
   padding: "6px 8px",
   borderBottom: "1px solid #333",
-  color: "#666",
+  color: "#ccc",
   textAlign: "left",
   fontWeight: "normal",
   background: "#161616",

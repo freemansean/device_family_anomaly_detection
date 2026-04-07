@@ -21,7 +21,7 @@ Every 15 minutes, Sasquatch:
 
 Results are stored in Redis and served through a React dashboard with org-wide and per-site views.
 
-**No data egresses to third-party AI providers.** Detection is pure ML + rule-based. Local Ollama is supported for optional read-only explanation features.
+**No data egresses to third-party AI providers.** Detection is pure ML + rule-based.
 
 ---
 
@@ -63,7 +63,6 @@ Mist API
 - Node.js 18+
 - Redis 7+
 - Juniper Mist API token + site/org IDs
-- [Ollama](https://ollama.ai/) (optional — local LLM for AI Assist)
 
 ---
 
@@ -72,14 +71,14 @@ Mist API
 ```bash
 cd unsupervised_anomaly
 
-# One-time setup: installs venv, npm deps, builds frontend, installs Ollama
+# One-time setup: installs venv, npm deps, builds frontend
 ./setup.sh
 
 # Copy and fill in your credentials
 cp .env.example .env
 $EDITOR .env
 
-# Start everything (Redis, backend on :8000, frontend on :3000, Ollama on :11434)
+# Start everything (Redis, backend on :8000, frontend on :3000)
 ./start.sh
 ```
 

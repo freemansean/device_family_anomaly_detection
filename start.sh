@@ -34,25 +34,6 @@ else
   echo "✓ Redis started"
 fi
 
-# ── Ollama ────────────────────────────────────────────────────────────────────
-if command -v ollama &>/dev/null; then
-  if curl -sf http://localhost:11434/api/tags >/dev/null 2>&1; then
-    echo "✓ Ollama already running"
-  else
-    echo "Starting Ollama..."
-    ollama serve > "$LOG_DIR/ollama.log" 2>&1 &
-    echo $! > "$LOG_DIR/ollama.pid"
-    # Wait for Ollama to be ready (up to 10s)
-    for i in {1..20}; do
-      if curl -sf http://localhost:11434/api/tags >/dev/null 2>&1; then break; fi
-      sleep 0.5
-    done
-    echo "✓ Ollama started (PID $(cat $LOG_DIR/ollama.pid)) → logs/ollama.log"
-  fi
-else
-  echo "  Ollama not installed — AI Assist will be unavailable (run ./setup.sh to install)"
-fi
-
 # ── Backend ───────────────────────────────────────────────────────────────────
 if [ ! -d ".venv" ]; then
   echo "ERROR: Python venv not found. Run ./setup.sh first."
@@ -101,7 +82,6 @@ echo "┌───────────────────────�
 echo "│  Frontend    http://localhost:$FRONTEND_PORT           │"
 echo "│  Backend API http://localhost:$BACKEND_PORT           │"
 echo "│  API docs    http://localhost:$BACKEND_PORT/docs      │"
-echo "│  Ollama LLM  http://localhost:11434          │"
 echo "└─────────────────────────────────────────────┘"
 echo ""
 echo "Run ./stop.sh to shut everything down."

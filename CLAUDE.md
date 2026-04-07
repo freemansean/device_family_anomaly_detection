@@ -23,10 +23,8 @@ Detects anomalous client behavior at a Juniper Mist site by:
 8. Firing a webhook only when a device family is **both** a behavioral outlier (centroid IF) **and**
    unhealthy (health score below threshold) — dual-gate to prevent single-device noise
 
-**This module has NO publicly hosted LLM in the detection path.** Pure ML + rule-based only.
-Publicly hosted LLMs (e.g. Anthropic/OpenAI APIs) must never receive client event data — data must not
-egress to third-party providers. Locally hosted LLMs (e.g. Ollama) are permitted for explanation/comparison
-features that operate read-only on top of existing Redis findings. Do not add any LLM calls to detection or scoring code.
+**This module has NO LLM in the detection path.** Pure ML + rule-based only.
+Client event data must not egress to third-party providers. Do not add any LLM calls to detection or scoring code.
 
 ---
 
@@ -87,6 +85,7 @@ sasquatch/
 │   ├── anomaly_detector.py      # Isolation Forest + DBSCAN scoring
 │   ├── health_scorer.py         # Per-family health score (separate from anomaly pipeline)
 │   ├── webhook_dispatcher.py    # Dual-gate alert dispatch (anomaly + health)
+│   ├── alert_tracker.py         # Persistent alert session history (7-day, per-site)
 │   ├── scheduler.py             # APScheduler job definitions
 │   └── api/
 │       ├── __init__.py
@@ -122,6 +121,9 @@ sasquatch/
 | `sasquatch:findings:{site_id}:{wlan_key}` | 24hr | JSON array: rolled-up findings for GUI + webhook |
 | `sasquatch:org_anomalies:{site_id}:{wlan_key}` | 24hr | JSON dict: per-MAC org-wide scores (written by `score_org_wide`) |
 | `sasquatch:org_findings:{wlan_key}` | 24hr | JSON array: org-wide findings (one entry per device family across all sites) |
+| `sasquatch:alert_active:{site_id}:{wlan_key}` | none (managed explicitly) | Hash: family → `{first_seen, last_seen}` for currently-active alert sessions |
+| `sasquatch:alert_sessions` | none (pruned on write) | Sorted set: session keys scored by `first_seen` unix timestamp; entries older than 8 days are pruned each cycle |
+| `sasquatch:alert_session:{session_key}` | 8 days | JSON: `{site_id, family, wlan, first_seen, last_seen, resolved_at, status}` for one alert session |
 
 **TTL note:** Client cache and events are both 7 days — the cache survives across the full
 event retention window, so a cache miss on a historical event is not possible due to TTL
@@ -528,18 +530,20 @@ DBSCAN sets `dbscan_label`, `is_dbscan_outlier`, and `dbscan_family_noise_ratio`
 each MAC record. These values are stored on anomaly records and used by the frontend,
 but DBSCAN noise ratio no longer determines which families are flagged at the family level.
 
-**`is_family_outlier` is set by family centroid Isolation Forest (separate step):**
+**`is_family_outlier` is set by the inter-family centroid detection step (separate from Stage 2):**
 
-After DBSCAN, a second IF pass runs across family-level centroids. For each device family
-with ≥ 2 MACs, one mean feature vector (centroid) is computed from all MACs in that family
-using `FEATURE_KEYS` for consistent column ordering. IF is then run across all qualifying
-family centroids. Families whose centroid is an outlier among other family centroids are
-flagged (`is_family_outlier = True`). This catches the case where an entire device family
-behaves differently from all other families at the site.
+After DBSCAN, a centroid detection pass runs across family-level centroids. For each device
+family with ≥ 2 MACs, a dual-representation row is built: element-wise median of all per-MAC
+feature vectors concatenated with the component-wise maximum. This is then fed into one of
+two methods depending on how many qualifying families are present:
 
-Requires at least `ANOMALY_CENTROID_IF_MIN_FAMILIES` (default 3) qualifying families
-(≥ 2 MACs each) to run. If fewer qualify, centroid IF is skipped and `flagged_families`
-remains empty.
+- **N < `ANOMALY_CENTROID_IF_MIN_FAMILIES` (default 3):** Step skipped entirely. `is_family_outlier` remains False.
+- **`ANOMALY_CENTROID_IF_MIN_FAMILIES` ≤ N ≤ `ANOMALY_CENTROID_DIST_MAX_FAMILIES` (default 8):** Cosine-distance fallback. The element-wise median of all scaled family centroid rows is used as the population reference point (median rather than mean to resist the masking effect — an anomalous family shifts the mean toward itself). Each family's cosine distance from that reference is computed. Families exceeding `ANOMALY_CENTROID_DIST_THRESHOLD` (default 0.35) are flagged.
+- **N > `ANOMALY_CENTROID_DIST_MAX_FAMILIES`:** Full `IsolationForest` run across all family centroid rows. Families with `decision_function < 0` are flagged.
+
+The cosine-distance path exists because IF is statistically unreliable at small N (5–8 rows): contamination-derived thresholds carry little statistical meaning and scores can be noisy between cycles. The distance approach is simpler, more stable, and produces interpretable scores that can be logged and monitored.
+
+Both paths populate `centroid_if_score` / `centroid_dist_score` and `centroid_detection_method` on anomaly records and findings so the method used is always observable.
 
 **Stage 2 — Isolation Forest (per device family):**
 
@@ -723,6 +727,41 @@ lookup — NO LLM (rule-based only, no network calls). Evaluated in priority ord
 **Retry logic:** 3 attempts with exponential backoff (1s, 2s, 4s). Log failures.
 Do not raise exceptions that would kill the scheduler job on webhook failure.
 
+**Alert history tracking:** After computing `qualifying`, `evaluate_and_dispatch` calls
+`alert_tracker.record_cycle(site_id, "__all__", active_families)` regardless of whether
+`ANOMALY_WEBHOOK_URL` is configured, so history is always recorded. An empty `active_families`
+set resolves any previously-active sessions for that site. Skipped for `org_scope=True`
+since org findings are composite cross-site records, not single-site events.
+
+---
+
+### `alert_tracker.py`
+
+**Purpose:** Track contiguous alert sessions — periods where a device family at a site
+continuously passes the dual gate (is_family_outlier + health_score < threshold).
+
+**Called by:** `webhook_dispatcher.evaluate_and_dispatch()` after every successful
+detection cycle. Must not raise — failures are logged and swallowed.
+
+**Session lifecycle:**
+- A session opens when a family first appears in `qualifying` for a site.
+- Each subsequent cycle where the family is still qualifying extends `last_seen`.
+- A session closes (`resolved_at = now`) when a successful cycle completes with the
+  family absent from `qualifying`. Absence after a failed/skipped cycle does NOT close
+  the session — only a successful cycle with explicit absence does.
+
+**Key design notes:**
+- `last_seen` is updated every cycle; `resolved_at` is only written on explicit resolution.
+  This prevents a scheduler restart or missed cycle from falsely closing active sessions.
+- Sessions that span multiple UTC days appear in each day in the history API, with
+  `window_start`/`window_end` clipped to each day's boundaries.
+- Org-scope (`org_scope=True`) is not tracked — org findings are composites; per-site
+  tracking captures the same signal at the site level.
+
+**Key functions:**
+- `record_cycle(site_id, wlan, active_families, redis_client=None)` — write path, called each cycle
+- `get_recent_sessions(days, wlan, redis_client=None)` — read path, called by history API
+
 ---
 
 ### `scheduler.py`
@@ -777,6 +816,9 @@ POST /api/v1/org/detect                              → re-runs build_features 
 GET  /api/v1/org/alerts                              → org-wide alerts + per-site alerts in one response;
                                                        org_alerts = org findings with health_score < 0.75;
                                                        site_alerts = per-site findings × per-site health, grouped by site
+GET  /api/v1/org/alert-history?days=7&wlan=__all__   → alert session history grouped by UTC day; sessions spanning
+                                                       multiple days appear in each day with window clipped to day
+                                                       boundaries; response: {days: [{date, label, alarms: [...]}]}
 GET  /api/v1/org/findings                            → org-wide findings (cross-site scoring)
 GET  /api/v1/org/family-insights                     → per-family heatmap + health scores org-wide
 GET  /api/v1/org/families/{family}/drilldown         → per-MAC drilldown for a family across all sites
@@ -918,6 +960,8 @@ ANOMALY_FINDING_THRESHOLD=0.2
 ANOMALY_MIN_PEERS=5
 ANOMALY_MIN_MAC_EVENTS=20
 ANOMALY_CENTROID_IF_MIN_FAMILIES=3
+ANOMALY_CENTROID_DIST_MAX_FAMILIES=8   # sites with ≤ this many families use cosine-distance; above uses IF
+ANOMALY_CENTROID_DIST_THRESHOLD=0.35   # cosine distance above which a family centroid is flagged
 
 # Health Score (health_scorer.py)
 # Families with health_score below this value are considered degraded for webhook gating.
