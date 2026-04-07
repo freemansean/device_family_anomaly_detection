@@ -362,13 +362,16 @@ async def org_cross_site_detect_job() -> None:
         log.info(f"[org-detect] Starting cross-site detection for {len(site_ids)} sites")
 
         # Step 1: Ensure client caches are warm, then collect events for all sites.
+        # Use the org job's interval as the collection window so non-focused sites
+        # receive complete event coverage between org cycles (not just the last hour).
+        org_duration = f"{ORG_DETECTION_INTERVAL_HOURS}h"
         for sid in site_ids:
             try:
                 cache = await get_client_cache(sid)
                 if not cache:
                     log.info(f"[org-detect] Client cache missing for site {sid} — refreshing")
                     await refresh_client_cache(sid)
-                await collect(sid)
+                await collect(sid, duration=org_duration)
             except Exception:
                 log.exception(f"[org-detect] Event collection failed for site {sid}")
 

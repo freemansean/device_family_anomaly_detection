@@ -573,11 +573,15 @@ async def reenrich_stale_events(site_id: str, client_cache: dict[str, dict]) -> 
         await redis_client.aclose()
 
 
-async def collect(site_id: str) -> int:
+async def collect(site_id: str, duration: str = "1h") -> int:
     """
-    Incremental collect: pull last 1hr of events from Mist and append to the global
-    sorted set. Used by the scheduler. Fails fast if client cache is missing.
+    Incremental collect: pull the last `duration` of events from Mist and append to
+    the global sorted set. Used by the scheduler. Fails fast if client cache is missing.
     Returns total count of events written (new + already-present).
+
+    `duration` should match the calling job's interval so no events are missed between
+    cycles. The per-site job uses the default "1h"; the org job passes its interval
+    (e.g. "6h") so all non-focused sites have complete coverage between org cycles.
     """
     redis_client = aioredis.from_url(REDIS_URL, decode_responses=True)
     try:
@@ -588,9 +592,9 @@ async def collect(site_id: str) -> int:
                 "Run client_cache.refresh_client_cache() first."
             )
 
-        new_raw = await fetch_all_events(site_id, duration="1h")
+        new_raw = await fetch_all_events(site_id, duration=duration)
         if not new_raw:
-            log.info(f"No new events in last 1hr for site {site_id}")
+            log.info(f"No new events in last {duration} for site {site_id}")
             return 0
 
         new_enriched, unknown_types, miss_macs = _enrich_batch(new_raw, client_cache)
