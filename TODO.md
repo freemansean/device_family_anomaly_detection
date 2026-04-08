@@ -499,8 +499,7 @@ The current `ANOMALY_WEBHOOK_URL` value in `.env` points to an old endpoint and 
 longer valid. The webhook dispatch code is correct; only the target URL needs updating.
 
 **Fix:** Determine the correct webhook target and update `ANOMALY_WEBHOOK_URL` in `.env`.
-Also confirm `ANOMALY_WEBHOOK_SEVERITY_THRESHOLD` is set appropriately for the new target
-(default: `significant`). Test with a manual `POST /api/v1/org/detect` after updating.
+Test with a manual `POST /api/v1/org/detect` after updating.
 
 ---
 
@@ -562,8 +561,8 @@ absence-of-flag on a successful run, not just absence-of-update.
 
 ---
 
-### 21. Automated troubleshooting for impacted device family — include TSHOOT API results in webhook payload
-**Files:** `sasquatch/client_anomaly/webhook_dispatcher.py`, `sasquatch/client_anomaly/api/routes.py` (optional trigger endpoint)
+### ~~21. Automated troubleshooting for impacted device family — include TSHOOT API results in webhook payload~~ RESOLVED
+**Files:** `sasquatch/client_anomaly/webhook_dispatcher.py`, `sasquatch/client_anomaly/api/routes.py`
 
 When a device family clears the dual gate (is_family_outlier + health < 0.75), the webhook
 fires with behavioral findings but no network-side corroboration. Mist's Troubleshooting API
@@ -617,19 +616,26 @@ TSHOOT_TIMEOUT_SECONDS=30          # Max wait for async troubleshoot job complet
 TSHOOT_STALENESS_SECONDS=300       # Skip TSHOOT if client last_seen older than this
 ```
 
-*Implementation order:*
-1. Stub the TSHOOT call with `MIST_TSHOOT_ENABLED=false` default so existing tests pass.
-2. Implement async TSHOOT dispatch in `webhook_dispatcher.py` — call the API, poll for
-   completion, attach results or timeout sentinel to the finding dict before `_build_payload()`.
-3. Update `_build_payload()` to include the `tshoot` field when present.
-4. Add a `POST /api/v1/sites/{site_id}/families/{family}/tshoot` endpoint in `routes.py`
-   for on-demand manual triggering from the dashboard (separate from the automated path).
-
-**Why this matters:** The ML pipeline detects the client-side behavioral pattern. The TSHOOT
-API provides the network-side answer — AP logs, RADIUS responses, DHCP server replies — at
-the moment the anomaly is detected, before the client reconnects or the evidence rotates out
-of AP memory. Combining both in one webhook payload gives L2/L3 engineers everything they
-need to triage without a second tool.
+**Implemented:**
+- `_get_mac_last_event_ts()` — scans `sasquatch:events:{site_id}` for events within
+  `TSHOOT_STALENESS_SECONDS`; returns most recent timestamp for the MAC, or None if
+  the client is offline.
+- `_run_client_tshoot(site_id, mac)` — POSTs to
+  `POST /api/v1/sites/{site_id}/clients/{mac}/troubleshoot`. If the response contains
+  `results` directly (synchronous path), returns immediately. Otherwise polls
+  `GET /api/v1/sites/{site_id}/jobs/{job_id}` until the job reaches a terminal state
+  or `TSHOOT_TIMEOUT_SECONDS` elapses.
+- `_enrich_with_client_tshoot(qualifying, site_id, wlan)` — orchestrates the
+  staleness check + concurrent TSHOOT dispatch for all `worst_health_macs` across
+  all qualifying findings. Attaches `tshoot` list (per-MAC `{mac, ap, status, results}`)
+  to each finding. Skips offline MACs with `status: "skipped", reason: "client_offline"`.
+  Called in `evaluate_and_dispatch` after Marvis TSHOOT, only when
+  `MIST_TSHOOT_ENABLED=true` and `org_scope=False`.
+- `run_family_tshoot(site_id, family, wlan)` — public function for the manual trigger.
+  Skips the staleness check (operator intent assumed). Called by:
+  `POST /api/v1/sites/{site_id}/families/{family}/tshoot` in `routes.py`.
+- Three new env vars added to `.env`: `MIST_TSHOOT_ENABLED=false`,
+  `TSHOOT_TIMEOUT_SECONDS=30`, `TSHOOT_STALENESS_SECONDS=300`.
 
 ---
 
