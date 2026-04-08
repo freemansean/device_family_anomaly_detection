@@ -12,12 +12,13 @@ On a configurable interval (default: 60 minutes), Sasquatch:
 
 1. Pulls the last 24 hours of client events from the Mist API (paginated, enriched with device metadata)
 2. Builds a per-MAC behavioral feature vector — normalized event type frequencies, so volume is never the signal
-3. Runs a three-stage ML pipeline:
+3. Runs a four-stage ML pipeline:
    - **DBSCAN** across all MACs site-wide (finds clients that don't fit any cluster)
    - **Family Centroid Isolation Forest** across device-family centroids (finds families behaving differently from all other families)
    - **Per-family Isolation Forest** within each device type (finds individual devices anomalous relative to their peers)
+   - **Markov Chain episode analysis** — scores event-transition sequences within episodes against a 24hr site baseline; flags families where a large fraction of clients show anomalous connection patterns or repeated short (failed) episodes
 4. Computes a **separate** per-family health score from failure ratios — independent of anomaly detection
-5. Fires a webhook only when a family is **both** anomalous (centroid IF) **and** unhealthy (health score < 0.75) — dual-gate to prevent single-device noise
+5. Fires a webhook only when a family carries **any** anomaly label (centroid IF, DBSCAN noise, or Markov) **and** is unhealthy (health score < 0.75) — dual-gate to prevent single-device noise
 
 Results are stored in Redis and served through a React dashboard with org-wide and per-site views.
 
@@ -37,7 +38,7 @@ Mist API
            Redis: per-MAC feature vectors + health scores
 
                     anomaly_detector.py
-                    (DBSCAN → Centroid IF → Per-family IF)
+                    (DBSCAN → Centroid IF → Per-family IF → Markov)
                           ↓
               Redis: anomaly scores + findings
 
@@ -51,7 +52,7 @@ Mist API
 | Backend | FastAPI + APScheduler (Python) |
 | Frontend | React + Vite |
 | State / Cache | Redis 7+ |
-| ML | scikit-learn — IsolationForest, DBSCAN, StandardScaler |
+| ML | scikit-learn — IsolationForest, DBSCAN; numpy Markov Chain |
 | Feature Engineering | pandas, numpy |
 | Mist API Client | httpx (async) |
 
@@ -163,7 +164,16 @@ Copy `.env.example` to `.env`. Variables are grouped below by concern.
 |---|---|---|
 | `ANOMALY_CENTROID_IF_MIN_FAMILIES` | `3` | Minimum qualifying device families (each with ≥ `ANOMALY_MIN_PEERS` MACs) before any inter-family centroid detection runs. Below this the step is skipped and `is_family_outlier` remains False for all families. |
 | `ANOMALY_CENTROID_DIST_MAX_FAMILIES` | `8` | Upper bound for the cosine-distance fallback path. Sites with 3–8 qualifying families use distance-from-median instead of IsolationForest (IF is statistically unreliable at small N). Sites above this use full IF. |
-| `ANOMALY_CENTROID_DIST_THRESHOLD` | `0.35` | Cosine distance from the population median above which a family centroid is flagged as a behavioral outlier (`is_family_outlier = True`). Range: 0.0–1.0. Higher = less sensitive. |
+| `ANOMALY_CENTROID_DIST_THRESHOLD` | `0.55` | Cosine distance from the L2-normalized population median above which a family centroid is flagged as a behavioral outlier (`is_family_outlier = True`). Vectors are L2-normalized (not StandardScaler) before distance computation. Range: 0.0–1.0. Higher = less sensitive. |
+
+### ML Tuning — Markov Chain
+
+| Variable | Default | Description |
+|---|---|---|
+| `MARKOV_MIN_EPISODE_LENGTH` | `3` | Episodes shorter than this number of events go into the short-episode state machine and are not scored against the transition matrix. Short episodes represent connection attempts that never completed a full connectivity chain. |
+| `MARKOV_EPISODE_LOG_PROB_THRESHOLD` | `-4.0` | Mean log-probability per transition below which an episode is flagged anomalous. More negative = stricter. Default of -4.0 means geometric-mean per-transition probability below e⁻⁴ ≈ 0.018. |
+| `MARKOV_OUTLIER_EPISODE_RATIO` | `0.5` | Fraction of a MAC's scoreable normal episodes that must be anomalous to flag the MAC as a Markov outlier. |
+| `MARKOV_FAMILY_OUTLIER_RATIO` | `0.5` | Fraction of a family's evaluatable MACs that must be Markov outliers to flag the family (`is_family_markov_outlier = True`). A flagged family can generate a finding even if its combined IF/DBSCAN outlier ratio is below `ANOMALY_FINDING_THRESHOLD`. |
 
 ### ML Tuning — Finding Rollup
 
@@ -219,11 +229,14 @@ PMKID failure ratio, DHCP XID counts, roam failure types — used to generate hu
 
 Webhooks fire only when **all three** conditions are met for a device family:
 
-1. `is_family_outlier == True` — centroid IF flagged the whole family as behaviorally different from all other device types
+1. Any family-level anomaly label is set — at least one of:
+   - `is_family_outlier` — centroid IF/distance flagged the whole family as behaviorally different from all other device types
+   - `is_family_dbscan_outlier` — fraction of DBSCAN-noise MACs in the family exceeds the noise threshold
+   - `is_family_markov_outlier` — Markov Chain analysis found anomalous event-chain patterns in ≥ `MARKOV_FAMILY_OUTLIER_RATIO` of the family's clients
 2. `health_score < 0.75` — family is also measurably failing
 3. `severity >= significant` (configurable)
 
-Single-device IF or DBSCAN outliers appear in the UI but never trigger webhooks.
+Single-device IF outliers without a family-level flag appear in the UI but never trigger webhooks.
 
 ### Marvis TSHOOT Enrichment
 
@@ -260,11 +273,11 @@ TSHOOT failures for individual MACs return an empty `tshoot_results` list withou
 
 | View | Description |
 |---|---|
-| **Site Overview** | Heatmap of device families × event categories with health bar per row. Auto-refreshes every 60s. |
-| **Findings Feed** | Three sections: ALERT (anomalous + unhealthy), HEALTH (unhealthy only), ANOMALOUS (anomalous only). |
+| **Site Overview** | Heatmap of device families × event categories. Separate IF / DB / Markov anomaly columns and a health bar per row. Auto-refreshes every 60s. |
+| **Findings Feed** | Four detector sections: IF CENTROID (centroid/distance outliers), DBSCAN % OF FAMILY, MARKOV % OF FAMILY, and HEALTH (unhealthy families with no anomaly finding). |
 | **Org Overview** | Four-tab shell: Org Alerts, Org Overview, Org Family Insights, Org Findings. |
 | **Org Alerts** | Org-wide alerts grouped by family; site alerts grouped by site. Default org view. |
-| **MAC Drilldown** | 24hr event timeline + feature vector vs family baseline + IF score + DBSCAN label. |
+| **MAC Drilldown** | 24hr event timeline + feature vector vs family baseline + IF score + DBSCAN label + Markov episode stats. |
 | **Family Drilldown** | Per-MAC breakdown for a device family at a site or across the org. |
 
 ---
@@ -301,8 +314,9 @@ POST /api/v1/org/detect
 | `sasquatch:health:{site_id}:{wlan}` | 24 hr | Per-family health scores + category breakdown |
 | `sasquatch:findings:{site_id}:{wlan}` | 24 hr | Rolled-up per-family findings |
 | `sasquatch:org_findings:{wlan}` | 24 hr | Cross-site findings (one entry per family across all sites) |
+| `sasquatch:markov_baseline:{site_id}:{wlan}` | 48 hr | Markov transition matrices + episode-type state machine built from 24hr events |
 
-Detection runs for `__all__` (combined) plus each unique SSID, enabling per-WLAN scoped dashboards.
+Detection runs independently for each unique SSID — there is no combined cross-WLAN scope. All API endpoints require an explicit `?wlan=` parameter.
 
 ---
 
@@ -315,7 +329,8 @@ unsupervised_anomaly/
 │   │   ├── client_cache.py          # Daily MAC → device metadata refresh
 │   │   ├── event_collector.py       # 24hr event pull, enrichment, deduplication
 │   │   ├── feature_engineer.py      # Per-MAC behavioral feature vectors
-│   │   ├── anomaly_detector.py      # Three-stage ML pipeline + finding rollup
+│   │   ├── anomaly_detector.py      # Four-stage ML pipeline + finding rollup
+│   │   ├── markov_analyzer.py       # Markov Chain episode analysis (Stage 4)
 │   │   ├── health_scorer.py         # Per-family failure rate scoring (independent)
 │   │   ├── webhook_dispatcher.py    # Dual-gate alert dispatch
 │   │   ├── scheduler.py             # APScheduler job definitions
@@ -351,7 +366,7 @@ See [TODO.md](unsupervised_anomaly/TODO.md) for the tracked backlog. Active item
 - `device_family` classification uses first event only (should use majority vote)
 - Auth burst → recovery sequences inflate health scores (transient retries before success)
 - "Collecting Events" progress bar no longer updates in the UI
-- Feature vectors collapse time — episode-based detection for PMKID storms not yet implemented
+- Markov baseline requires one full detection cycle to warm up — first run after deployment skips Markov scoring
 
 ---
 
