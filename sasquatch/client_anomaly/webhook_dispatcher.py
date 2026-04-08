@@ -35,7 +35,31 @@ WEBHOOK_URL = os.getenv("ANOMALY_WEBHOOK_URL", "")
 WEBHOOK_SEVERITY_THRESHOLD = os.getenv("ANOMALY_WEBHOOK_SEVERITY_THRESHOLD", "significant")
 HEALTH_SCORE_THRESHOLD = float(os.getenv("ANOMALY_HEALTH_SCORE_THRESHOLD", "0.75"))
 
+MIST_CLOUD_HOST = os.getenv("MIST_CLOUD_HOST", "api.mist.com")
+MIST_API_TOKEN = os.getenv("MIST_API_TOKEN", "")
+MIST_ORG_ID = os.getenv("MIST_ORG_ID", "")
+
 _SEVERITY_RANK = {"minimal": 0, "moderate": 1, "significant": 2}
+
+
+async def _fetch_marvis_tshoot(mac: str) -> list[dict]:
+    """
+    Call the Marvis TSHOOT API for a single client MAC.
+    Returns the 'results' list from the response, or [] on any failure.
+    Never raises — a TSHOOT failure must not block webhook delivery.
+    """
+    if not MIST_ORG_ID or not MIST_API_TOKEN:
+        return []
+    url = f"https://{MIST_CLOUD_HOST}/api/v1/orgs/{MIST_ORG_ID}/troubleshoot?mac={mac}"
+    headers = {"Authorization": f"Token {MIST_API_TOKEN}"}
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.get(url, headers=headers)
+            resp.raise_for_status()
+            return resp.json().get("results", [])
+    except Exception as exc:
+        log.warning("Marvis TSHOOT fetch failed for %s: %s", mac, exc)
+        return []
 
 
 def _meets_severity(severity: str, threshold: str) -> bool:
@@ -72,6 +96,7 @@ async def _post_with_retry(url: str, payload: dict) -> bool:
 
 async def evaluate_and_dispatch(
     site_id: str,
+    wlan: str = "__all__",
     org_scope: bool = False,
 ) -> bool:
     """
@@ -81,8 +106,9 @@ async def evaluate_and_dispatch(
     Dual gate — a finding is webhook-eligible only when:
       - finding["is_family_outlier"] is True  (centroid IF flagged the whole family)
       - family health_score < HEALTH_SCORE_THRESHOLD (family is also measurably failing)
-      - finding severity >= WEBHOOK_SEVERITY_THRESHOLD
 
+    wlan: WLAN scope to evaluate. Defaults to "__all__" (cross-WLAN findings).
+      Pass a specific SSID to evaluate that WLAN's scoped findings independently.
     org_scope=True: read from org-wide findings/health keys instead of per-site keys.
 
     Returns True if webhook was sent (or no qualifying findings), False on delivery failure.
@@ -91,8 +117,8 @@ async def evaluate_and_dispatch(
         log.debug("ANOMALY_WEBHOOK_URL not set — skipping webhook dispatch")
         return True
 
-    findings = await (get_org_findings() if org_scope else get_findings(site_id))
-    health = await get_health(site_id)
+    findings = await (get_org_findings() if org_scope else get_findings(site_id, wlan))
+    health = await get_health(site_id, wlan)
 
     qualifying = []
     for f in findings:
@@ -108,7 +134,7 @@ async def evaluate_and_dispatch(
         health_score = family_health.get("health_score", 1.0)
         if health_score >= HEALTH_SCORE_THRESHOLD:
             log.debug(
-                f"Skipping webhook for [{family}]: is_family_outlier=True but "
+                f"[{wlan}] Skipping webhook for [{family}]: is_family_outlier=True but "
                 f"health_score={health_score:.3f} >= threshold {HEALTH_SCORE_THRESHOLD}"
             )
             continue
@@ -132,25 +158,55 @@ async def evaluate_and_dispatch(
             for f in qualifying
             if f.get("device_family")
         }
-        await alert_tracker.record_cycle(site_id, "__all__", active_findings)
+        await alert_tracker.record_cycle(site_id, wlan, active_findings)
 
     if not qualifying:
         log.info(
-            f"No findings passed dual alert gate "
+            f"[{wlan}] No findings passed dual alert gate "
             f"(family_outlier + health < {HEALTH_SCORE_THRESHOLD}) — no webhook sent"
         )
         return True
 
+    # Enrich each qualifying finding with Marvis TSHOOT results for its worst MACs.
+    # All TSHOOT calls across all findings are dispatched concurrently.
+    if MIST_ORG_ID and MIST_API_TOKEN:
+        # Build a flat list of (finding_index, mac_entry) pairs so we can scatter/gather.
+        tshoot_tasks: list[tuple[int, dict]] = []
+        for i, finding in enumerate(qualifying):
+            for mac_entry in finding.get("worst_health_macs", []):
+                tshoot_tasks.append((i, mac_entry))
+
+        if tshoot_tasks:
+            results = await asyncio.gather(
+                *[_fetch_marvis_tshoot(t[1]["mac"]) for t in tshoot_tasks]
+            )
+            # Group results back onto each finding.
+            finding_tshoot: dict[int, list[dict]] = {i: [] for i in range(len(qualifying))}
+            for (i, mac_entry), tshoot_results in zip(tshoot_tasks, results):
+                finding_tshoot[i].append({
+                    "mac": mac_entry["mac"],
+                    "tshoot_results": tshoot_results,
+                })
+            for i, finding in enumerate(qualifying):
+                finding["marvis_tshoot"] = finding_tshoot[i]
+            log.info(
+                "[%s] Marvis TSHOOT enrichment complete: %d MACs queried across %d finding(s)",
+                wlan, len(tshoot_tasks), len(qualifying),
+            )
+    else:
+        log.debug("[%s] Marvis TSHOOT skipped — MIST_ORG_ID or MIST_API_TOKEN not configured", wlan)
+
     payload = {
         "source": "sasquatch_client_anomaly",
         "site_id": site_id,
+        "wlan": wlan,
         "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "finding_count": len(qualifying),
         "findings": qualifying,
     }
 
     log.info(
-        f"Dispatching webhook: {len(qualifying)} finding(s) passed dual alert gate "
+        f"[{wlan}] Dispatching webhook: {len(qualifying)} finding(s) passed dual alert gate "
         f"(is_family_outlier + health_score < {HEALTH_SCORE_THRESHOLD})"
     )
     return await _post_with_retry(WEBHOOK_URL, payload)

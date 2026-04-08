@@ -674,6 +674,22 @@ appear at a small number of sites.
 Valid severity values: `minimal`, `moderate`, `significant`. Do not use `CRITICAL` — it is
 not a valid severity string and will cause `_meets_severity()` to return False for everything.
 
+**Marvis TSHOOT enrichment:** After findings pass the dual gate but before the payload is
+POSTed, the dispatcher calls the Mist Marvis TSHOOT API for each of the top three worst-health
+MACs in every qualifying finding. Calls are issued concurrently across all findings using
+`asyncio.gather`. Each call hits:
+
+```
+GET https://{MIST_CLOUD_HOST}/api/v1/orgs/{MIST_ORG_ID}/troubleshoot?mac={mac}
+```
+
+Results are attached to each finding as `marvis_tshoot` — a list of `{mac, tshoot_results}`
+objects. `tshoot_results` is the raw `results` array from the Marvis API response (list of
+`{category, reason, text, recommendation, site_id}` dicts). TSHOOT failures for individual
+MACs return an empty `tshoot_results` list rather than blocking the webhook. If `MIST_ORG_ID`
+or `MIST_API_TOKEN` are not configured, the enrichment step is skipped and `marvis_tshoot`
+is omitted from the payload.
+
 **Webhook payload:**
 ```json
 {
@@ -693,11 +709,38 @@ not a valid severity string and will cause `_meets_severity()` to return False f
       "health_score": 0.61,
       "health_components": {"auth": 0.42, "roam": 0.08, "dhcp": 0.02, "dns": 0.01, "arp": 0.0},
       "example_macs": ["aa:bb:cc:dd:ee:ff", "11:22:33:44:55:66"],
+      "worst_health_macs": [
+        {"mac": "aabbccddee01", "health_score": 0.21, "health_components": {"auth": 0.42}},
+        {"mac": "aabbccddee02", "health_score": 0.34, "health_components": {"roam": 0.28}},
+        {"mac": "aabbccddee03", "health_score": 0.41, "health_components": {"dhcp": 0.19}}
+      ],
       "top_features": [
         {"feature": "AUTH_FAILURE", "outlier_mean": 0.38, "baseline_mean": 0.03},
         {"feature": "AUTH_SUCCESS", "outlier_mean": 0.12, "baseline_mean": 0.41}
       ],
-      "probable_pattern": "auth_failure_terminal"
+      "probable_pattern": "auth_failure_terminal",
+      "marvis_tshoot": [
+        {
+          "mac": "aabbccddee01",
+          "tshoot_results": [
+            {
+              "category": "Client",
+              "reason": "Failed Fast Roam",
+              "text": "The client failed fast roam. Client experienced poor roaming 25% of the time.",
+              "site_id": "12f333fe-4a11-44a2-8dc4-0ea5e725016f"
+            },
+            {
+              "category": "Connectivity",
+              "reason": "Poor Coverage",
+              "text": "Due to the device connecting at a low signal strength.",
+              "recommendation": "1. Ensure there are sufficient access points. 2. Check if the device is sticky.",
+              "site_id": "12f333fe-4a11-44a2-8dc4-0ea5e725016f"
+            }
+          ]
+        },
+        {"mac": "aabbccddee02", "tshoot_results": [...]},
+        {"mac": "aabbccddee03", "tshoot_results": [...]}
+      ]
     }
   ]
 }

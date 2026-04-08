@@ -225,6 +225,35 @@ Webhooks fire only when **all three** conditions are met for a device family:
 
 Single-device IF or DBSCAN outliers appear in the UI but never trigger webhooks.
 
+### Marvis TSHOOT Enrichment
+
+Before posting the webhook, Sasquatch calls the Mist Marvis TSHOOT API for the three worst-health MACs in each qualifying finding. All TSHOOT calls are issued concurrently. Results are attached to the finding payload as `marvis_tshoot`:
+
+```json
+"marvis_tshoot": [
+  {
+    "mac": "aabbccddee01",
+    "tshoot_results": [
+      {
+        "category": "Client",
+        "reason": "Failed Fast Roam",
+        "text": "The client failed fast roam 25% of the time...",
+        "site_id": "12f333fe-..."
+      },
+      {
+        "category": "Connectivity",
+        "reason": "Poor Coverage",
+        "text": "Due to the device connecting at a low signal strength.",
+        "recommendation": "1. Ensure sufficient AP coverage. 2. Check for sticky client behavior.",
+        "site_id": "12f333fe-..."
+      }
+    ]
+  }
+]
+```
+
+TSHOOT failures for individual MACs return an empty `tshoot_results` list without blocking the webhook. The field is omitted entirely if `MIST_ORG_ID` or `MIST_API_TOKEN` are not set.
+
 ---
 
 ## Dashboard
