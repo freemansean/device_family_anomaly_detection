@@ -322,7 +322,7 @@ export default function MacDrilldown({ siteId, mac, apiBase, onBack, wlan = "__a
       <div style={cardStyle}>
         <h3 style={cardTitleStyle}>24hr Event Timeline ({events.length} events)</h3>
         <div style={{ maxHeight: "400px", overflowY: "auto", fontFamily: "monospace", fontSize: "12px" }}>
-          {events.map((evt, i) => {
+          {[...events].reverse().map((evt, i) => {
             const cat = evt.event_category || "OTHER";
             const color = EVENT_COLOR[cat] || "#555";
             return (

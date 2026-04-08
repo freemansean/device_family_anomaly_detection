@@ -21,5 +21,9 @@ sasquatch/frontend/dist/
 # Redis persistence
 data/
 
+# Runtime artifacts
+logs/
+dump.rdb
+
 # OS
 .DS_Store

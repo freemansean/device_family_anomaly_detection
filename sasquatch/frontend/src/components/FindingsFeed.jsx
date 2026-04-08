@@ -241,25 +241,56 @@ function AnomalyFindingCard({ finding, healthData, isAlert, expanded, onToggle, 
         />
       </div>
 
-      <button
-        onClick={onToggle}
-        style={{ background: "transparent", border: "none", color: "#555", cursor: "pointer", padding: "6px 0 0 0", fontSize: "12px" }}
-      >
-        {expanded ? "▲ Hide affected MACs" : `▼ Show ${finding.example_macs?.length || 0} example MACs`}
-      </button>
-
-      {expanded && finding.example_macs?.length > 0 && (
-        <div style={{ marginTop: "6px", display: "flex", gap: "6px", flexWrap: "wrap" }}>
-          {finding.example_macs.map((mac) => (
-            <button
-              key={mac}
-              onClick={() => onMacSelect(mac)}
-              style={{ background: "#1a1a2e", border: "1px solid #2a2a5e", color: "#7ec8e3", borderRadius: "3px", padding: "3px 10px", cursor: "pointer", fontSize: "12px", fontFamily: "monospace" }}
-            >
-              {mac}
-            </button>
-          ))}
+      {isAlert && finding.worst_health_macs?.length > 0 ? (
+        <div style={{ marginTop: "10px" }}>
+          <div style={{ color: "#555", fontSize: "11px", marginBottom: "5px" }}>Worst-health devices</div>
+          <div style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
+            {finding.worst_health_macs.map(({ mac, health_score, health_components }) => {
+              const worstCat = Object.entries(health_components || {}).sort(([, a], [, b]) => b - a)[0];
+              return (
+                <div key={mac} style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                  <button
+                    onClick={() => onMacSelect(mac)}
+                    style={{ background: "#1a1a2e", border: "1px solid #2a2a5e", color: "#7ec8e3", borderRadius: "3px", padding: "3px 10px", cursor: "pointer", fontSize: "12px", fontFamily: "monospace" }}
+                  >
+                    {mac}
+                  </button>
+                  <span style={{ color: healthScoreColor(health_score), fontSize: "11px", fontWeight: "bold" }}>
+                    {(health_score * 100).toFixed(0)}%
+                  </span>
+                  {worstCat && (
+                    <span style={{ color: "#666", fontSize: "10px" }}>
+                      {worstCat[0]} {(worstCat[1] * 100).toFixed(0)}% fail
+                    </span>
+                  )}
+                </div>
+              );
+            })}
+          </div>
         </div>
+      ) : (
+        <>
+          <button
+            onClick={onToggle}
+            style={{ background: "transparent", border: "none", color: "#555", cursor: "pointer", padding: "6px 0 0 0", fontSize: "12px" }}
+          >
+            {expanded ? "▲ Hide affected MACs" : `▼ Show ${finding.example_macs?.length || 0} example MACs`}
+          </button>
+
+          {expanded && finding.example_macs?.length > 0 && (
+            <div style={{ marginTop: "6px", display: "flex", gap: "6px", flexWrap: "wrap" }}>
+              {finding.example_macs.map((mac) => (
+                <button
+                  key={mac}
+                  onClick={() => onMacSelect(mac)}
+                  style={{ background: "#1a1a2e", border: "1px solid #2a2a5e", color: "#7ec8e3", borderRadius: "3px", padding: "3px 10px", cursor: "pointer", fontSize: "12px", fontFamily: "monospace" }}
+                >
+                  {mac}
+                </button>
+              ))}
+            </div>
+          )}
+        </>
       )}
     </div>
   );

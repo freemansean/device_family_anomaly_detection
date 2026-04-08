@@ -93,7 +93,9 @@ async def _run_wlan_detection(
 ) -> dict:
     """
     Build features and run anomaly scoring for __all__ WLANs plus each unique WLAN
-    found in the site's event data.
+    found in the site's event data. Webhook dispatch runs per WLAN scope so that
+    WLAN-scoped anomalies (e.g. Windows anomalous on COWS but not All WLANs) are
+    independently evaluated and can trigger alerts.
 
     org_pools: optional {wlan: {family: [feature_records from OTHER sites]}} used to
       supplement small device families that would otherwise be skipped by IF.
@@ -114,6 +116,7 @@ async def _run_wlan_detection(
             log.info(f"[wlan detection] site={site_id} wlan={wlan}: {scored} MACs scored")
             if wlan == "__all__":
                 total_macs = scored
+            await evaluate_and_dispatch(site_id, wlan=wlan)
         except Exception:
             log.exception(f"[wlan detection] Failed for site={site_id} wlan={wlan}")
 
@@ -206,11 +209,6 @@ async def run_detection_cycle(site_id: str, full_refresh: bool = False) -> dict:
         wlan_summary = await _run_wlan_detection(site_id)
         log.info(f"[cycle] WLAN detection complete: {wlan_summary}")
 
-        try:
-            await evaluate_and_dispatch(site_id)
-        except Exception:
-            log.exception("[cycle] webhook_dispatcher failed (non-fatal)")
-
         return {
             "events": event_count,
             "macs_scored": wlan_summary["macs_scored"],
@@ -268,11 +266,6 @@ async def run_detect_only(
 
         wlan_summary = await _run_wlan_detection(site_id, org_pools=org_pools)
         log.info(f"[detect] WLAN detection complete: {wlan_summary}")
-
-        try:
-            await evaluate_and_dispatch(site_id)
-        except Exception:
-            log.exception("[detect] webhook_dispatcher failed (non-fatal)")
 
         return {
             "macs_with_features": wlan_summary["macs_scored"],

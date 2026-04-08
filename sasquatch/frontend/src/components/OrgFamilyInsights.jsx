@@ -58,11 +58,18 @@ const tdStyle = {
   borderBottom: "1px solid #1e1e1e",
 };
 
+function SortIndicator({ active, dir }) {
+  if (!active) return <span style={{ color: "#333", marginLeft: "3px", fontSize: "9px" }}>⇅</span>;
+  return <span style={{ color: "#7ec8e3", marginLeft: "3px", fontSize: "9px" }}>{dir === "asc" ? "▲" : "▼"}</span>;
+}
+
 export default function OrgFamilyInsights({ apiBase, refreshToken, onMacSiteSelect, wlan = "__all__" }) {
   const [data, setData]               = useState(null);
   const [loading, setLoading]         = useState(true);
   const [error, setError]             = useState(null);
   const [selectedFamily, setSelectedFamily] = useState(null);
+  const [sortKey, setSortKey]         = useState("anomaly");
+  const [sortDir, setSortDir]         = useState("desc");
 
   const load = useCallback(() => {
     setLoading(true);
@@ -103,11 +110,40 @@ export default function OrgFamilyInsights({ apiBase, refreshToken, onMacSiteSele
   const display     = allFamilies.filter(f => (families[f].total_events ?? 0) >= MIN_DISPLAY_EVENTS);
   const other       = allFamilies.filter(f => (families[f].total_events ?? 0) < MIN_DISPLAY_EVENTS);
 
-  // Sort: anomalous families first (severity rank desc), then by total_events desc
-  display.sort((a, b) => {
-    const ra = SEVERITY_RANK[families[a].worst_severity] ?? 0;
-    const rb = SEVERITY_RANK[families[b].worst_severity] ?? 0;
-    if (rb !== ra) return rb - ra;
+  const handleSort = (key) => {
+    setSortKey(prev => {
+      if (prev === key) { setSortDir(d => d === "asc" ? "desc" : "asc"); return key; }
+      setSortDir(key === "family" ? "asc" : "desc");
+      return key;
+    });
+  };
+
+  // Anomaly sort rank: family outlier > significant > moderate > minimal > ok
+  const anomalyRank = (f) => {
+    if (families[f].is_family_outlier_any_site) return 4;
+    return SEVERITY_RANK[families[f].worst_severity] ?? 0;
+  };
+
+  const sortedDisplay = [...display].sort((a, b) => {
+    let va, vb;
+    if (sortKey === "family") {
+      va = a.toLowerCase(); vb = b.toLowerCase();
+    } else if (sortKey === "anomaly") {
+      va = anomalyRank(a); vb = anomalyRank(b);
+    } else if (sortKey === "health") {
+      va = families[a].health_score ?? -1; vb = families[b].health_score ?? -1;
+    } else if (sortKey === "events") {
+      va = families[a].total_events ?? 0; vb = families[b].total_events ?? 0;
+    } else if (sortKey === "sites") {
+      va = families[a].site_count ?? 0; vb = families[b].site_count ?? 0;
+    } else {
+      // category column — sort by raw event count
+      va = families[a].categories?.[sortKey]?.count ?? 0;
+      vb = families[b].categories?.[sortKey]?.count ?? 0;
+    }
+    if (va < vb) return sortDir === "asc" ? -1 : 1;
+    if (va > vb) return sortDir === "asc" ? 1 : -1;
+    // tiebreak: total_events desc
     return (families[b].total_events ?? 0) - (families[a].total_events ?? 0);
   });
 
@@ -143,13 +179,37 @@ export default function OrgFamilyInsights({ apiBase, refreshToken, onMacSiteSele
         <table style={{ borderCollapse: "collapse", fontSize: "12px" }}>
           <thead>
             <tr>
-              <th style={thStyle}>Device Family</th>
-              <th style={{ ...thStyle, whiteSpace: "nowrap" }}>Org Anomaly</th>
-              <th style={{ ...thStyle, whiteSpace: "nowrap", minWidth: "90px" }} title="Family health score — volume-weighted failure rate across AUTH, ROAM, DHCP, DNS, ARP org-wide. 1.0 = no failures.">
-                Health
+              <th
+                style={{ ...thStyle, cursor: "pointer", userSelect: "none" }}
+                onClick={() => handleSort("family")}
+              >
+                Device Family<SortIndicator active={sortKey === "family"} dir={sortDir} />
               </th>
-              <th style={{ ...thStyle, whiteSpace: "nowrap", color: "#444" }}>Events</th>
-              <th style={{ ...thStyle, whiteSpace: "nowrap", color: "#444" }}>Sites</th>
+              <th
+                style={{ ...thStyle, whiteSpace: "nowrap", cursor: "pointer", userSelect: "none" }}
+                onClick={() => handleSort("anomaly")}
+              >
+                Org Anomaly<SortIndicator active={sortKey === "anomaly"} dir={sortDir} />
+              </th>
+              <th
+                style={{ ...thStyle, whiteSpace: "nowrap", minWidth: "90px", cursor: "pointer", userSelect: "none" }}
+                title="Family health score — volume-weighted failure rate across AUTH, ROAM, DHCP, DNS, ARP org-wide. 1.0 = no failures."
+                onClick={() => handleSort("health")}
+              >
+                Health<SortIndicator active={sortKey === "health"} dir={sortDir} />
+              </th>
+              <th
+                style={{ ...thStyle, whiteSpace: "nowrap", color: "#444", cursor: "pointer", userSelect: "none" }}
+                onClick={() => handleSort("events")}
+              >
+                Events<SortIndicator active={sortKey === "events"} dir={sortDir} />
+              </th>
+              <th
+                style={{ ...thStyle, whiteSpace: "nowrap", color: "#444", cursor: "pointer", userSelect: "none" }}
+                onClick={() => handleSort("sites")}
+              >
+                Sites<SortIndicator active={sortKey === "sites"} dir={sortDir} />
+              </th>
               {CATEGORIES.map(c => (
                 <th
                   key={c}
@@ -159,7 +219,11 @@ export default function OrgFamilyInsights({ apiBase, refreshToken, onMacSiteSele
                     transform: "rotate(180deg)",
                     padding: "4px 2px",
                     fontSize: "10px",
+                    cursor: "pointer",
+                    userSelect: "none",
+                    color: sortKey === c ? "#7ec8e3" : undefined,
                   }}
+                  onClick={() => handleSort(c)}
                 >
                   {c}
                 </th>
@@ -167,7 +231,7 @@ export default function OrgFamilyInsights({ apiBase, refreshToken, onMacSiteSele
             </tr>
           </thead>
           <tbody>
-            {display.map(family => {
+            {sortedDisplay.map(family => {
               const fdata     = families[family];
               const sev       = fdata.worst_severity;
               const isFamOut  = fdata.is_family_outlier_any_site;

@@ -108,31 +108,19 @@ health score more than the real-world impact warrants — the failure resolved i
 
 ---
 
-### 17. `MARVIS_EVENT_CLIENT_AUTH_FAILURE` status_code 79 should be excluded from AUTH_FAILURE
-**Files:** `sasquatch/client_anomaly/event_collector.py`, `sasquatch/client_anomaly/feature_engineer.py`, `sasquatch/client_anomaly/health_scorer.py`
+### ~~17. `MARVIS_EVENT_CLIENT_AUTH_FAILURE` status_code -79 should be excluded from AUTH_FAILURE~~ RESOLVED
+**Files:** `sasquatch/client_anomaly/event_collector.py`
 
-Status code 79 on `MARVIS_EVENT_CLIENT_AUTH_FAILURE` is a **transmission failure** (802.11
+Status code -79 on `MARVIS_EVENT_CLIENT_AUTH_FAILURE` is a **transmission failure** (802.11
 frame not acknowledged at the radio layer) — the AP never received the client's frame, so
-there is no meaningful auth decision. It is not a client-side authentication failure. It
-commonly precedes a status_code 62 (GAS/ANQP timeout) in Passpoint environments but is
-structurally distinct: the client did not fail auth, the frame was lost in transit.
+there is no meaningful auth decision. These are caused by poor RF coverage, not device-level
+authentication behavior.
 
-Counting these as AUTH_FAILURE inflates `failure_ratio_auth`, depresses health scores, and
-can trigger the `auth_failure_terminal` / `auth_failure_recovering` pattern labels for
-devices that are experiencing only transient RF issues, not authentication problems.
-
-**Fix:**
-- In `event_collector.py` category bucketing (or in `feature_engineer.py` ratio
-  computation): exclude `MARVIS_EVENT_CLIENT_AUTH_FAILURE` events where `status_code == 79`
-  from the `AUTH_FAILURE` category. Move them to `OTHER` or a new `TRANSMISSION_FAILURE`
-  category so they still contribute to the frequency vector without contaminating auth
-  failure ratios.
-- In `health_scorer.py`: ensure the aggregate failure rate does not count status_code 79
-  events as auth failures.
-- In the post-hoc explainer (`_classify_probable_pattern`): confirm status_code 79 events
-  are not counted toward `cat_ratio_auth_failure` when determining pattern labels.
-- Log a count of filtered status_code 79 events at DEBUG level each collection cycle for
-  observability.
+`_AUTH_FAILURE_IGNORED_STATUS_CODES = frozenset({-79})` added to `event_collector.py`.
+In `_enrich_batch()`, any `MARVIS_EVENT_CLIENT_AUTH_FAILURE` event whose `status_code` is in
+this set is dropped before enrichment and storage — it never reaches Redis, so `feature_engineer.py`
+and `health_scorer.py` require no changes. A DEBUG-level log records the count of skipped
+events per batch for observability.
 
 ---
 
@@ -514,6 +502,77 @@ ALERT_HISTORY_TTL_DAYS=7   # How long to retain resolved alert history (default 
 considered resolved just because `last_seen` is 20 minutes ago. Only write `resolved_at`
 when a cycle completes successfully and the dual-gate condition is no longer met — i.e.,
 absence-of-flag on a successful run, not just absence-of-update.
+
+---
+
+### 21. Automated troubleshooting for impacted device family — include TSHOOT API results in webhook payload
+**Files:** `sasquatch/client_anomaly/webhook_dispatcher.py`, `sasquatch/client_anomaly/api/routes.py` (optional trigger endpoint)
+
+When a device family clears the dual gate (is_family_outlier + health < 0.75), the webhook
+fires with behavioral findings but no network-side corroboration. Mist's Troubleshooting API
+(`POST /api/v1/sites/{site_id}/devices/{device_id}/troubleshoot` and the client equivalent)
+can run automated diagnostics against the AP/client at the time of the alert, providing
+live network-side context alongside the ML finding.
+
+**What to add:**
+
+*TSHOOT API call (per impacted site + family):*
+- For each site where the family is flagged, identify a representative example MAC
+  (`example_macs[0]` from the finding) and the AP it was last seen on (`last_ap` from the
+  client cache).
+- Fire `POST /api/v1/sites/{site_id}/clients/{mac}/troubleshoot` (or the equivalent
+  Mist Marvis client troubleshoot endpoint) immediately after the dual-gate check, before
+  composing the webhook payload.
+- Poll or await the async result (Mist troubleshoot jobs are typically async with a job ID).
+  Cap the wait at a configurable timeout (default `TSHOOT_TIMEOUT_SECONDS=30`).
+
+*Webhook payload additions:*
+```json
+{
+  "findings": [
+    {
+      "device_family": "iPhone",
+      ...existing fields...,
+      "tshoot": {
+        "site_id": "04edb3ac-...",
+        "mac": "aa:bb:cc:dd:ee:ff",
+        "ap": "5c5b35f16ee0",
+        "status": "completed",   // "completed" | "timeout" | "skipped" | "error"
+        "results": { ... }       // raw Mist troubleshoot response, site-dependent
+      }
+    }
+  ]
+}
+```
+
+*When to skip:*
+- If `MIST_TSHOOT_ENABLED=false` (new env var, default false until tested) — skip silently.
+- If the example MAC is no longer connected (last_seen > `TSHOOT_STALENESS_SECONDS=300`),
+  set `status: "skipped"` with reason `"client_offline"` and omit `results`.
+- If the TSHOOT API returns an error or times out, set `status: "timeout"` or `"error"`,
+  include the error message, and proceed with webhook dispatch — TSHOOT failure must never
+  block the alert.
+
+*New env vars:*
+```
+MIST_TSHOOT_ENABLED=false          # Safety gate — off by default until validated
+TSHOOT_TIMEOUT_SECONDS=30          # Max wait for async troubleshoot job completion
+TSHOOT_STALENESS_SECONDS=300       # Skip TSHOOT if client last_seen older than this
+```
+
+*Implementation order:*
+1. Stub the TSHOOT call with `MIST_TSHOOT_ENABLED=false` default so existing tests pass.
+2. Implement async TSHOOT dispatch in `webhook_dispatcher.py` — call the API, poll for
+   completion, attach results or timeout sentinel to the finding dict before `_build_payload()`.
+3. Update `_build_payload()` to include the `tshoot` field when present.
+4. Add a `POST /api/v1/sites/{site_id}/families/{family}/tshoot` endpoint in `routes.py`
+   for on-demand manual triggering from the dashboard (separate from the automated path).
+
+**Why this matters:** The ML pipeline detects the client-side behavioral pattern. The TSHOOT
+API provides the network-side answer — AP logs, RADIUS responses, DHCP server replies — at
+the moment the anomaly is detected, before the client reconnects or the evidence rotates out
+of AP memory. Combining both in one webhook payload gives L2/L3 engineers everything they
+need to triage without a second tool.
 
 ---
 

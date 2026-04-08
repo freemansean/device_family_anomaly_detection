@@ -53,6 +53,13 @@ IGNORED_EVENT_TYPES: frozenset[str] = frozenset({
     "MARVIS_EVENT_CLIENT_DHCPV6_STUCK",
 })
 
+# MARVIS_EVENT_CLIENT_AUTH_FAILURE events with these status codes are transmission
+# failures at the radio layer (frame not acknowledged) — the AP never received the
+# client's frame, so there is no auth decision. These are caused by poor RF coverage,
+# not device-level authentication behavior. Counting them as AUTH_FAILURE inflates
+# failure ratios and depresses health scores for devices in marginal coverage areas.
+_AUTH_FAILURE_IGNORED_STATUS_CODES: frozenset[int] = frozenset({-79})
+
 # Known Mist client event types — used to define the ML feature vector dimensions.
 # Fetched live from /api/v1/const/client_events at startup and cached in Redis,
 # but this list serves as a safe fallback.
@@ -407,9 +414,16 @@ def _enrich_batch(
     unknown_types: set[str] = set()
     cache_miss_macs: set[str] = set()
     enriched = []
+    transmission_failure_skipped = 0
     for event in events:
         event_type = event.get("type", "")
         if event_type in IGNORED_EVENT_TYPES:
+            continue
+        if (
+            event_type == "MARVIS_EVENT_CLIENT_AUTH_FAILURE"
+            and event.get("status_code") in _AUTH_FAILURE_IGNORED_STATUS_CODES
+        ):
+            transmission_failure_skipped += 1
             continue
         if event_type and event_type not in known_types:
             unknown_types.add(event_type)
@@ -417,6 +431,11 @@ def _enrich_batch(
         if mac and mac not in client_cache:
             cache_miss_macs.add(mac)
         enriched.append(_enrich_event(event, client_cache))
+    if transmission_failure_skipped:
+        log.debug(
+            f"Skipped {transmission_failure_skipped} AUTH_FAILURE events with "
+            f"status_code in {set(_AUTH_FAILURE_IGNORED_STATUS_CODES)} (transmission failures)"
+        )
     return enriched, unknown_types, cache_miss_macs
 
 
