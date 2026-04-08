@@ -63,7 +63,7 @@ function SortIndicator({ active, dir }) {
   return <span style={{ color: "#7ec8e3", marginLeft: "3px", fontSize: "9px" }}>{dir === "asc" ? "▲" : "▼"}</span>;
 }
 
-export default function OrgFamilyInsights({ apiBase, refreshToken, onMacSiteSelect, wlan = "__all__" }) {
+export default function OrgFamilyInsights({ apiBase, refreshToken, onMacSiteSelect, wlan }) {
   const [data, setData]               = useState(null);
   const [loading, setLoading]         = useState(true);
   const [error, setError]             = useState(null);
@@ -118,10 +118,14 @@ export default function OrgFamilyInsights({ apiBase, refreshToken, onMacSiteSele
     });
   };
 
-  // Anomaly sort rank: family outlier > significant > moderate > minimal > ok
+  // IF sort rank: family outlier > ok
+  const ifRank = (f) => families[f].is_family_outlier_any_site ? 1 : 0;
+  // Anomaly sort rank combines all three classifiers for the default sort
   const anomalyRank = (f) => {
-    if (families[f].is_family_outlier_any_site) return 4;
-    return SEVERITY_RANK[families[f].worst_severity] ?? 0;
+    if (families[f].is_family_outlier_any_site) return 10;
+    const dbRank = SEVERITY_RANK[families[f].worst_dbscan_severity] ?? 0;
+    const mRank  = families[f].is_family_markov_outlier_any_site ? 1 : 0;
+    return dbRank * 2 + mRank;
   };
 
   const sortedDisplay = [...display].sort((a, b) => {
@@ -130,6 +134,12 @@ export default function OrgFamilyInsights({ apiBase, refreshToken, onMacSiteSele
       va = a.toLowerCase(); vb = b.toLowerCase();
     } else if (sortKey === "anomaly") {
       va = anomalyRank(a); vb = anomalyRank(b);
+    } else if (sortKey === "dbscan") {
+      va = SEVERITY_RANK[families[a].worst_dbscan_severity] ?? 0;
+      vb = SEVERITY_RANK[families[b].worst_dbscan_severity] ?? 0;
+    } else if (sortKey === "markov") {
+      va = families[a].worst_markov_ratio ?? 0;
+      vb = families[b].worst_markov_ratio ?? 0;
     } else if (sortKey === "health") {
       va = families[a].health_score ?? -1; vb = families[b].health_score ?? -1;
     } else if (sortKey === "events") {
@@ -187,9 +197,24 @@ export default function OrgFamilyInsights({ apiBase, refreshToken, onMacSiteSele
               </th>
               <th
                 style={{ ...thStyle, whiteSpace: "nowrap", cursor: "pointer", userSelect: "none" }}
+                title="Isolation Forest centroid detection — flags the whole family as behaving differently from all other families (any site)."
                 onClick={() => handleSort("anomaly")}
               >
-                Org Anomaly<SortIndicator active={sortKey === "anomaly"} dir={sortDir} />
+                IF<SortIndicator active={sortKey === "anomaly"} dir={sortDir} />
+              </th>
+              <th
+                style={{ ...thStyle, whiteSpace: "nowrap", cursor: "pointer", userSelect: "none" }}
+                title="DBSCAN — worst fraction of individual MACs flagged as site-wide behavioral outliers across all sites."
+                onClick={() => handleSort("dbscan")}
+              >
+                DB<SortIndicator active={sortKey === "dbscan"} dir={sortDir} />
+              </th>
+              <th
+                style={{ ...thStyle, whiteSpace: "nowrap", cursor: "pointer", userSelect: "none" }}
+                title="Markov Chain episode analysis — flags families where clients show anomalous event chain patterns."
+                onClick={() => handleSort("markov")}
+              >
+                Markov<SortIndicator active={sortKey === "markov"} dir={sortDir} />
               </th>
               <th
                 style={{ ...thStyle, whiteSpace: "nowrap", minWidth: "90px", cursor: "pointer", userSelect: "none" }}
@@ -233,7 +258,6 @@ export default function OrgFamilyInsights({ apiBase, refreshToken, onMacSiteSele
           <tbody>
             {sortedDisplay.map(family => {
               const fdata     = families[family];
-              const sev       = fdata.worst_severity;
               const isFamOut  = fdata.is_family_outlier_any_site;
               const siteCount = fdata.site_count ?? 0;
               const sitesTotal = total_sites;
@@ -257,7 +281,7 @@ export default function OrgFamilyInsights({ apiBase, refreshToken, onMacSiteSele
                       borderRadius: "50%", background: color,
                       marginRight: "6px", verticalAlign: "middle",
                     }} />
-                    <span style={{ color: sev || isFamOut ? "#e0e0e0" : "#ccc", textDecoration: "underline", textDecorationColor: "#444" }}>{family}</span>
+                    <span style={{ color: (fdata.worst_dbscan_severity || isFamOut || fdata.is_family_markov_outlier_any_site) ? "#e0e0e0" : "#ccc", textDecoration: "underline", textDecorationColor: "#444" }}>{family}</span>
                     {fdata.client_count > 0 && (
                       <span style={{ color: "#444", fontSize: "11px", marginLeft: "6px" }}>
                         ({fdata.client_count})
@@ -265,7 +289,7 @@ export default function OrgFamilyInsights({ apiBase, refreshToken, onMacSiteSele
                     )}
                   </td>
 
-                  {/* Anomaly badge */}
+                  {/* IF: Centroid Isolation Forest — whole-family outlier any site */}
                   <td style={{ ...tdStyle, textAlign: "center" }}>
                     {isFamOut ? (
                       <span
@@ -278,28 +302,61 @@ export default function OrgFamilyInsights({ apiBase, refreshToken, onMacSiteSele
                       >
                         family
                       </span>
-                    ) : sev ? (
-                      <span
-                        title={anomalyTip}
-                        style={{
-                          background: SEVERITY_COLOR[sev] + "33",
-                          color: SEVERITY_COLOR[sev],
-                          border: `1px solid ${SEVERITY_COLOR[sev]}55`,
-                          borderRadius: "3px", padding: "1px 6px",
-                          fontSize: "10px", fontWeight: "bold", cursor: "default",
-                        }}
-                      >
-                        {sev}
-                        {outlierSites.length > 0 && (
-                          <span style={{ opacity: 0.7, marginLeft: "4px" }}>
-                            ({[...new Set(outlierSites)].length})
-                          </span>
-                        )}
-                      </span>
                     ) : (
                       <span style={{ color: "#2d7a4f", fontSize: "10px" }}>OK</span>
                     )}
                   </td>
+
+                  {/* DB: DBSCAN — worst severity across sites */}
+                  {(() => {
+                    const dbSev = fdata.worst_dbscan_severity;
+                    return (
+                      <td style={{ ...tdStyle, textAlign: "center" }}>
+                        {dbSev ? (
+                          <span
+                            title={anomalyTip}
+                            style={{
+                              background: SEVERITY_COLOR[dbSev] + "33",
+                              color: SEVERITY_COLOR[dbSev],
+                              border: `1px solid ${SEVERITY_COLOR[dbSev]}55`,
+                              borderRadius: "3px", padding: "1px 6px",
+                              fontSize: "10px", fontWeight: "bold", cursor: "default",
+                            }}
+                          >
+                            {dbSev}
+                            {outlierSites.length > 0 && (
+                              <span style={{ opacity: 0.7, marginLeft: "4px" }}>
+                                ({[...new Set(outlierSites)].length})
+                              </span>
+                            )}
+                          </span>
+                        ) : (
+                          <span style={{ color: "#2d7a4f", fontSize: "10px" }}>OK</span>
+                        )}
+                      </td>
+                    );
+                  })()}
+
+                  {/* Markov: chain episode anomaly any site */}
+                  {(() => {
+                    const isMarkov = fdata.is_family_markov_outlier_any_site;
+                    const mRatio   = fdata.worst_markov_ratio;
+                    return (
+                      <td style={{ ...tdStyle, textAlign: "center" }}>
+                        {isMarkov ? (
+                          <span style={{
+                            background: "#1a2a3a", color: "#4ab0e8",
+                            border: "1px solid #2a6a8a", borderRadius: "3px",
+                            padding: "1px 6px", fontSize: "10px", fontWeight: "bold", whiteSpace: "nowrap",
+                          }}>
+                            {mRatio != null ? `${(mRatio * 100).toFixed(0)}%` : "chain"}
+                          </span>
+                        ) : (
+                          <span style={{ color: "#2d7a4f", fontSize: "10px" }}>OK</span>
+                        )}
+                      </td>
+                    );
+                  })()}
 
                   {/* Health score */}
                   {(() => {
@@ -389,6 +446,12 @@ export default function OrgFamilyInsights({ apiBase, refreshToken, onMacSiteSele
                 <td style={{ ...tdStyle, textAlign: "center" }}>
                   <span style={{ color: "#333", fontSize: "10px" }}>—</span>
                 </td>
+                <td style={{ ...tdStyle, textAlign: "center" }}>
+                  <span style={{ color: "#333", fontSize: "10px" }}>—</span>
+                </td>
+                <td style={{ ...tdStyle, textAlign: "center" }}>
+                  <span style={{ color: "#333", fontSize: "10px" }}>—</span>
+                </td>
                 <td style={tdStyle} />
                 <td style={{ ...tdStyle, textAlign: "right", color: "#444", fontSize: "11px" }}>
                   {otherTotal > 999 ? `${(otherTotal / 1000).toFixed(1)}k` : otherTotal}
@@ -423,10 +486,10 @@ export default function OrgFamilyInsights({ apiBase, refreshToken, onMacSiteSele
 
       <div style={{ marginTop: "8px", fontSize: "11px", color: "#444" }}>
         Cell ratios are % of that family's org-wide event pool.
-        {" "}<span style={{ color: "#b06ad4" }}>family</span> = device class flagged as a family-level outlier at one or more sites.
-        {" "}<span style={{ color: "#e0a835" }}>moderate</span> / <span style={{ color: "#e05555" }}>significant</span> = worst individual-MAC finding across all sites.
+        {" "}<span style={{ color: "#b06ad4" }}>IF: family</span> = device class flagged as a centroid outlier at one or more sites.
+        {" "}<span style={{ fontWeight: "bold", color: "#666" }}>DB:</span> <span style={{ color: "#e0a835" }}>moderate</span> / <span style={{ color: "#e05555" }}>significant</span> = worst DBSCAN finding across all sites (badge = distinct site count).
+        {" "}<span style={{ color: "#4ab0e8" }}>Markov %</span> = highest anomalous-chain ratio seen across sites.
         {" "}Health = volume-weighted failure rate org-wide (hover for per-category breakdown).
-        {" "}Badge count = number of distinct sites with a finding for that family.
         {" "}Hover cells for exact counts.
       </div>
     </div>

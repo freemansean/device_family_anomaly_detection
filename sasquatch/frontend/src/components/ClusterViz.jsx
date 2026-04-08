@@ -24,7 +24,7 @@ function scaleCoords(points) {
   }));
 }
 
-export default function ClusterViz({ siteId, apiBase, onMacSelect, refreshToken, wlan = "__all__" }) {
+export default function ClusterViz({ siteId, apiBase, onMacSelect, refreshToken, wlan }) {
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
@@ -58,18 +58,8 @@ export default function ClusterViz({ siteId, apiBase, onMacSelect, refreshToken,
   );
 
   const HIDDEN_FAMILIES = new Set(["Unknown", "IoT (Unknown)"]);
-  const MIN_DISPLAY_CLIENTS = 5;
-  // Count MACs per family to match the SiteOverview threshold
-  const familyPointCounts = {};
-  for (const p of data.points) {
-    if (!HIDDEN_FAMILIES.has(p.device_family)) {
-      familyPointCounts[p.device_family] = (familyPointCounts[p.device_family] ?? 0) + 1;
-    }
-  }
   const scaled = scaleCoords(
-    data.points.filter(
-      (p) => !HIDDEN_FAMILIES.has(p.device_family) && (familyPointCounts[p.device_family] ?? 0) >= MIN_DISPLAY_CLIENTS
-    )
+    data.points.filter((p) => !HIDDEN_FAMILIES.has(p.device_family))
   );
 
   // Unique families sorted for legend
@@ -117,17 +107,17 @@ export default function ClusterViz({ siteId, apiBase, onMacSelect, refreshToken,
         <line x1={PAD} y1={H - PAD} x2={W - PAD} y2={H - PAD} stroke="#222" strokeWidth={1} />
         <line x1={PAD} y1={PAD} x2={PAD} y2={H - PAD} stroke="#222" strokeWidth={1} />
 
-        {/* Points — normal first, outliers on top */}
-        {[false, true].map((outlierPass) =>
+        {/* Points — non-IF-outliers first, IF outliers on top */}
+        {[false, true].map((ifOutlierPass) =>
           visiblePoints
-            .filter((p) => p.is_outlier === outlierPass)
+            .filter((p) => !!p.is_if_outlier === ifOutlierPass)
             .map((p, i) => {
               const color = familyColor(p.device_family);
-              const r = p.is_outlier ? 5 : 3.5;
+              const r = p.is_if_outlier ? 5 : 3.5;
               const clickable = !!onMacSelect;
               return (
-                <g key={`${outlierPass}-${i}`} style={{ cursor: clickable ? "pointer" : "default" }} onClick={() => handleDotClick(p)}>
-                  {p.is_outlier && (
+                <g key={`${ifOutlierPass}-${i}`} style={{ cursor: clickable ? "pointer" : "default" }} onClick={() => handleDotClick(p)}>
+                  {p.is_if_outlier && (
                     <circle cx={p.sx} cy={p.sy} r={r + 3} fill="none" stroke={color} strokeWidth={1} opacity={0.5} />
                   )}
                   <circle
@@ -135,7 +125,7 @@ export default function ClusterViz({ siteId, apiBase, onMacSelect, refreshToken,
                     cy={p.sy}
                     r={r}
                     fill={color}
-                    opacity={p.is_outlier ? 1.0 : 0.7}
+                    opacity={p.is_if_outlier ? 1.0 : 0.7}
                     onMouseEnter={(e) => {
                       const rect = svgRef.current?.getBoundingClientRect();
                       setTooltip({
@@ -158,14 +148,14 @@ export default function ClusterViz({ siteId, apiBase, onMacSelect, refreshToken,
           const by = Math.min(y - 10, H - 68);
           return (
             <g style={{ pointerEvents: "none" }}>
-              <rect x={bx} y={by} width={150} height={point.is_outlier ? 60 : 48} rx={3} fill="#1a1a1a" stroke="#333" strokeWidth={1} />
+              <rect x={bx} y={by} width={150} height={point.is_if_outlier ? 60 : 48} rx={3} fill="#1a1a1a" stroke="#333" strokeWidth={1} />
               <text x={bx + 8} y={by + 15} fontSize={10} fill="#aaa">{point.device_family}</text>
               <text x={bx + 8} y={by + 28} fontSize={9} fill="#555">{point.mac}</text>
-              {point.is_outlier && (
-                <text x={bx + 8} y={by + 41} fontSize={9} fill="#e05555">⚠ outlier</text>
+              {point.is_if_outlier && (
+                <text x={bx + 8} y={by + 41} fontSize={9} fill="#e05555">⚠ IF outlier</text>
               )}
               {onMacSelect && (
-                <text x={bx + 8} y={by + (point.is_outlier ? 54 : 41)} fontSize={9} fill="#4a90c4">click to open →</text>
+                <text x={bx + 8} y={by + (point.is_if_outlier ? 54 : 41)} fontSize={9} fill="#4a90c4">click to open →</text>
               )}
             </g>
           );

@@ -19,12 +19,24 @@ Stage 3: Rule-based absolute threshold detection. Runs on every MAC regardless o
          anomalous in absolute terms — e.g. a client whose events are 70% auth failures
          — which peer-comparison methods miss when the family is too small to score.
 
+Stage 4: Markov Chain episode analysis (see markov_analyzer.py).
+         Two-layer analysis: event-level transition scoring within episodes, plus an
+         episode-type state machine tracking short (failed) vs normal episode sequences.
+         Requires a pre-built 24hr baseline (sasquatch:markov_baseline:{site_id}:{wlan_key})
+         populated by the daily markov_baseline_job. Skipped silently on first run until
+         the baseline is available.
+
 Finding rollup: aggregate per-family outlier ratios → findings list.
+
+Anomaly labels on findings:
+  is_family_outlier       — centroid IF/distance (IF Stage)
+  is_family_dbscan_outlier — DBSCAN family noise ratio above threshold
+  is_family_markov_outlier — Markov Chain family anomaly
 
 Redis key scheme:
   sasquatch:anomalies:{site_id}:{wlan_key}
   sasquatch:findings:{site_id}:{wlan_key}
-  where wlan_key = "__all__" or sanitized SSID name.
+  where wlan_key is a sanitized SSID name.
 """
 
 import json
@@ -47,6 +59,7 @@ from .feature_engineer import (
     get_features,
 )
 from .health_scorer import _mac_health_score
+from .markov_analyzer import run_markov_analysis, MARKOV_FAMILY_OUTLIER_RATIO
 
 log = logging.getLogger(__name__)
 
@@ -87,7 +100,7 @@ CENTROID_DIST_MAX_FAMILIES = int(os.getenv("ANOMALY_CENTROID_DIST_MAX_FAMILIES",
 # Cosine distance from the population centroid (element-wise median of all family centroid
 # rows) above which a family is flagged as a behavioral outlier.
 # Range 0.0–2.0 (practically 0.0–1.0 for typical scaled vectors). Higher = less sensitive.
-CENTROID_DIST_THRESHOLD = float(os.getenv("ANOMALY_CENTROID_DIST_THRESHOLD", "0.35"))
+CENTROID_DIST_THRESHOLD = float(os.getenv("ANOMALY_CENTROID_DIST_THRESHOLD", "0.55"))
 FINDING_THRESHOLD = float(os.getenv("ANOMALY_FINDING_THRESHOLD", "0.3"))
 # Minimum number of local MACs a family must have before a site-level finding is generated
 # (applies to families that did NOT use org-level IF pooling). Families with fewer MACs
@@ -97,19 +110,19 @@ FINDING_MIN_SIZE = int(os.getenv("ANOMALY_FINDING_MIN_SIZE", "2"))
 
 
 
-def _anomalies_redis_key(site_id: str, wlan: str = "__all__") -> str:
+def _anomalies_redis_key(site_id: str, wlan: str) -> str:
     return f"sasquatch:anomalies:{site_id}:{sanitize_wlan_key(wlan)}"
 
 
-def _findings_redis_key(site_id: str, wlan: str = "__all__") -> str:
+def _findings_redis_key(site_id: str, wlan: str) -> str:
     return f"sasquatch:findings:{site_id}:{sanitize_wlan_key(wlan)}"
 
 
-def _org_anomalies_redis_key(site_id: str, wlan: str = "__all__") -> str:
+def _org_anomalies_redis_key(site_id: str, wlan: str) -> str:
     return f"sasquatch:org_anomalies:{site_id}:{sanitize_wlan_key(wlan)}"
 
 
-def _org_findings_redis_key(wlan: str = "__all__") -> str:
+def _org_findings_redis_key(wlan: str) -> str:
     """Single org-wide findings key — one entry per device family across all sites."""
     return f"sasquatch:org_findings:{sanitize_wlan_key(wlan)}"
 
@@ -399,15 +412,26 @@ def _run_family_centroid_distance(
     family_names = [name for name, _ in qualifying]
     X = np.array([vec for _, vec in qualifying])
 
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
+    # L2-normalize each row so cosine distance is geometrically meaningful
+    # (measures angle between family behavior profiles, not magnitude).
+    # Do NOT apply StandardScaler here: StandardScaler makes each feature zero-mean
+    # across the small set of family rows, so the median reference becomes ≈ the zero
+    # vector — cosine distance from a near-zero vector is undefined and produces
+    # distances near 1.0 for everything, causing mass false-positive flagging.
+    norms = np.linalg.norm(X, axis=1, keepdims=True)
+    norms = np.where(norms == 0, 1.0, norms)
+    X_norm = X / norms
 
-    # Element-wise median of all family centroid rows.
+    # Element-wise median of all L2-normalized family rows.
     # More resistant to outlier pull than the mean — a single anomalous family
     # shifts the median far less, preserving its apparent distance.
-    reference = np.median(X_scaled, axis=0).reshape(1, -1)
+    reference = np.median(X_norm, axis=0).reshape(1, -1)
+    # Re-normalize the median reference so it is also a unit vector.
+    ref_norm = np.linalg.norm(reference)
+    if ref_norm > 0:
+        reference = reference / ref_norm
 
-    dists = cosine_distances(X_scaled, reference).flatten()
+    dists = cosine_distances(X_norm, reference).flatten()
     return {family_names[i]: float(dists[i]) for i in range(len(family_names))}
 
 
@@ -455,7 +479,7 @@ def _dispatch_centroid_detection(
 
 async def score(
     site_id: str,
-    wlan: str = "__all__",
+    wlan: str,
     org_family_contexts: dict[str, list[dict]] | None = None,
 ) -> int:
     """
@@ -475,6 +499,9 @@ async def score(
     Stage 2 — Isolation Forest per device family:
       Identifies specific endpoint MACs anomalous within their family peer group.
 
+    Stage 4 — Markov Chain episode analysis (see markov_analyzer.py):
+      Two-layer analysis runs against the 24hr baseline. Skipped if no baseline exists.
+
     Store per-MAC anomaly scores and rolled-up findings in Redis.
     Returns count of MACs scored.
     """
@@ -490,7 +517,7 @@ async def score(
         # Load raw events for post-hoc explainer (only used for outliers)
         events = await get_events(
             site_id=site_id,
-            wlan=wlan if wlan != "__all__" else None,
+            wlan=wlan,
         )
         mac_raw_events: dict[str, list[dict]] = defaultdict(list)
         for evt in events:
@@ -503,6 +530,21 @@ async def score(
         for mac, record in features.items():
             family = record.get("device_family", "Unknown")
             family_groups[family].append(mac)
+
+        # --- Stage 4: Markov Chain episode analysis ---
+        # Requires a pre-built 24hr baseline; skipped silently if absent.
+        # event_type_index is loaded inside run_markov_analysis via the baseline.
+        from .event_collector import ensure_event_type_index
+        event_type_index = await ensure_event_type_index(redis_client)
+        markov_results = await run_markov_analysis(
+            site_id=site_id,
+            wlan=wlan,
+            mac_raw_events=dict(mac_raw_events),
+            family_groups=dict(family_groups),
+            redis_client=redis_client,
+            event_type_index=event_type_index,
+        )
+        markov_family_flags: dict[str, dict] = markov_results.pop("__family_markov__", {})
 
         # --- Stage 1: DBSCAN across all MACs in WLAN scope ---
         # Only include MACs from families large enough to contribute meaningful signal.
@@ -595,6 +637,8 @@ async def score(
             is_db = dbscan_results[mac]["is_dbscan_outlier"]
             family = features[mac].get("device_family", "Unknown")
             is_family = family in flagged_families
+            markov_rec = markov_results.get(mac, {})
+            is_markov = markov_rec.get("is_markov_outlier", False)
             anomalies[mac] = {
                 "if_score": if_results[mac]["if_score"],
                 "is_if_outlier": is_if,
@@ -605,7 +649,18 @@ async def score(
                 "family_centroid_dist_score": centroid_dist_scores.get(family),
                 "centroid_detection_method": centroid_method,
                 "dbscan_family_noise_ratio": round(family_dbscan_noise_ratio.get(family, 0.0), 4),
-                "is_outlier": is_if or is_db or is_family,
+                # Markov Chain fields
+                "is_markov_outlier": is_markov,
+                "markov_total_episodes": markov_rec.get("markov_total_episodes", 0),
+                "markov_scoreable_episodes": markov_rec.get("markov_scoreable_episodes", 0),
+                "markov_anomalous_episodes": markov_rec.get("markov_anomalous_episodes", 0),
+                "markov_episode_anomaly_ratio": markov_rec.get("markov_episode_anomaly_ratio", 0.0),
+                "markov_short_episodes": markov_rec.get("markov_short_episodes", 0),
+                "markov_short_episode_ratio": markov_rec.get("markov_short_episode_ratio", 0.0),
+                "has_repeated_short_episodes": markov_rec.get("has_repeated_short_episodes", False),
+                "short_episode_dominant_pattern": markov_rec.get("short_episode_dominant_pattern"),
+                "markov_episode_seq_score": markov_rec.get("markov_episode_seq_score", 0.0),
+                "is_outlier": is_if or is_db or is_family or is_markov,
                 "device_family": family,
                 "event_count": features[mac].get("event_count", 0),
                 "random_mac": features[mac].get("random_mac", False),
@@ -638,7 +693,17 @@ async def score(
             outlier_count = len(outlier_macs)
             outlier_ratio = outlier_count / total if total > 0 else 0.0
 
-            if outlier_ratio < FINDING_THRESHOLD:
+            # Evaluate Markov family flag here so it can bypass the finding threshold.
+            # A family where enough MACs have anomalous episode patterns warrants a
+            # finding even if the combined IF/DBSCAN/Markov MAC-level outlier ratio
+            # is below FINDING_THRESHOLD.
+            fam_markov = markov_family_flags.get(family, {})
+            is_family_markov_outlier = fam_markov.get("is_family_markov_outlier", False)
+            markov_family_anomaly_ratio = fam_markov.get("markov_family_anomaly_ratio", 0.0)
+            markov_evaluatable_count = fam_markov.get("markov_evaluatable_count", 0)
+            markov_family_anomalous_count = fam_markov.get("markov_family_anomalous_count", 0)
+
+            if outlier_ratio < FINDING_THRESHOLD and not is_family_markov_outlier:
                 continue
 
             # DBSCAN-specific rollup (used by Site Overview severity badge)
@@ -684,17 +749,6 @@ async def score(
                         posthoc["event_count"] = len(combined_events)
                         probable_pattern = _classify_probable_pattern(posthoc)
 
-            # For __all__ scope, derive the predominant WLAN from outlier MAC events
-            predominant_wlan: str | None = None
-            if wlan == "__all__" and outlier_macs:
-                wlan_counts: Counter = Counter()
-                for mac in outlier_macs:
-                    for evt in mac_raw_events.get(mac, []):
-                        if evt.get("wlan"):
-                            wlan_counts[evt["wlan"]] += 1
-                if wlan_counts:
-                    predominant_wlan = wlan_counts.most_common(1)[0][0]
-
             # Worst-health MACs: top 3 across all family MACs by health score (ascending).
             # Used by alert cards in the UI and webhook payload to surface the specific
             # devices experiencing the most failures — independent of outlier scoring.
@@ -716,16 +770,25 @@ async def score(
                 key=lambda x: x["health_score"],
             )[:3]
 
+            # Markov family-level flags — already computed above before the threshold check.
+
+            # DBSCAN family-level flag: families where > DBSCAN_FAMILY_NOISE_THRESHOLD
+            # fraction of eligible MACs are DBSCAN noise are considered family-level anomalies.
+            is_family_dbscan_outlier = (
+                family_dbscan_noise_ratio.get(family, 0.0) >= DBSCAN_FAMILY_NOISE_THRESHOLD
+            )
+
             finding = {
                 "device_family": family,
                 "wlan": wlan,
-                "predominant_wlan": predominant_wlan,
                 "severity": _severity(outlier_ratio),
                 "outlier_ratio": round(outlier_ratio, 4),
                 "weighted_outlier_score": round(weighted_outlier_score, 4),
                 "affected_mac_count": outlier_count,
                 "total_mac_count": total,
                 "is_family_outlier": is_family_level_outlier,
+                "is_family_dbscan_outlier": is_family_dbscan_outlier,
+                "is_family_markov_outlier": is_family_markov_outlier,
                 "centroid_if_score": centroid_if_scores.get(family),
                 "centroid_dist_score": centroid_dist_scores.get(family),
                 "centroid_detection_method": centroid_method,
@@ -735,6 +798,9 @@ async def score(
                 "dbscan_outlier_count": dbscan_outlier_count,
                 "if_outlier_macs": if_outlier_macs,
                 "if_outlier_count": len(if_outlier_macs),
+                "markov_family_anomaly_ratio": round(markov_family_anomaly_ratio, 4),
+                "markov_evaluatable_count": markov_evaluatable_count,
+                "markov_family_anomalous_count": markov_family_anomalous_count,
                 "example_macs": sorted(
                     outlier_macs,
                     key=lambda m: anomalies[m]["volume_concentration_weight"],
@@ -767,7 +833,7 @@ async def score(
 
 async def score_org_wide(
     all_features_by_site: "dict[str, dict[str, dict]]",
-    wlan: str = "__all__",
+    wlan: str,
 ) -> "dict[str, int]":
     """
     Run DBSCAN, Family Centroid IF, Isolation Forest, and rule-based thresholds across
@@ -898,6 +964,8 @@ async def score_org_wide(
             "family_centroid_dist_score": centroid_dist_scores.get(family),
             "centroid_detection_method": centroid_method,
             "dbscan_family_noise_ratio": round(family_dbscan_noise_ratio.get(family, 0.0), 4),
+            # Markov fields populated below from per-site anomaly records
+            "is_markov_outlier": False,
             "is_outlier": if_results[key]["is_if_outlier"]
                 or dbscan_results[key]["is_dbscan_outlier"]
                 or (family in flagged_families),
@@ -909,6 +977,49 @@ async def score_org_wide(
             ),
         }
 
+    # --- Merge per-site Markov anomaly data into org_anomalies_flat ---
+    # Per-site anomaly records (sasquatch:anomalies:{site_id}:{wlan_key}) contain
+    # is_markov_outlier if the focused detection cycle has run for that site.
+    # If the records are absent or stale, is_markov_outlier stays False.
+    # Family-level Markov flags are recomputed below from the merged MAC-level results.
+    _org_markov_redis = aioredis.from_url(REDIS_URL, decode_responses=True)
+    try:
+        for site_id_m, site_features_m in all_features_by_site.items():
+            site_anoms_raw = await _org_markov_redis.get(
+                _anomalies_redis_key(site_id_m, wlan)
+            )
+            if not site_anoms_raw:
+                continue
+            try:
+                site_anoms: dict[str, dict] = json.loads(site_anoms_raw)
+            except Exception:
+                continue
+            for mac_m, rec in site_anoms.items():
+                ck = f"{site_id_m}:{mac_m}"
+                if ck in org_anomalies_flat and rec.get("is_markov_outlier"):
+                    org_anomalies_flat[ck]["is_markov_outlier"] = True
+                    # Update composite is_outlier to reflect Markov
+                    org_anomalies_flat[ck]["is_outlier"] = (
+                        org_anomalies_flat[ck]["is_outlier"] or True
+                    )
+    finally:
+        await _org_markov_redis.aclose()
+
+    # Org-wide family Markov rollup — derived from merged MAC-level is_markov_outlier
+    org_family_markov_flags: dict[str, bool] = {}
+    for family, family_cks in org_family_groups.items():
+        # Only count MACs that had any Markov data (is_markov_outlier is explicitly set)
+        # As a proxy for "evaluatable", we count all composite keys — if the per-site
+        # anomaly record was absent, is_markov_outlier defaulted to False, so this is
+        # a conservative estimate.
+        total_cks = len(family_cks)
+        if total_cks == 0:
+            org_family_markov_flags[family] = False
+            continue
+        markov_outlier_cks = [k for k in family_cks if org_anomalies_flat[k].get("is_markov_outlier")]
+        ratio = len(markov_outlier_cks) / total_cks
+        org_family_markov_flags[family] = ratio >= MARKOV_FAMILY_OUTLIER_RATIO
+
     # Raw events cache for post-hoc explainer — loaded once per site on demand
     raw_events_cache: dict[str, dict[str, list[dict]]] = {}
 
@@ -916,7 +1027,7 @@ async def score_org_wide(
         if sid not in raw_events_cache:
             evts = await get_events(
                 site_id=sid,
-                wlan=wlan if wlan != "__all__" else None,
+                wlan=wlan,
             )
             mac_raw: dict[str, list[dict]] = defaultdict(list)
             for evt in evts:
@@ -1021,10 +1132,9 @@ async def score_org_wide(
             combined_events: list[dict] = []
             if is_family_level_outlier:
                 probable_pattern = "family_behavioral_outlier"
-                if wlan == "__all__":
-                    for ck in outlier_cks:
-                        site_evts = await _load_site_events(composite_to_site[ck])
-                        combined_events.extend(site_evts.get(composite_to_mac[ck], []))
+                for ck in outlier_cks:
+                    site_evts = await _load_site_events(composite_to_site[ck])
+                    combined_events.extend(site_evts.get(composite_to_mac[ck], []))
             else:
                 probable_pattern = "behavioral_outlier"
                 for ck in outlier_cks:
@@ -1035,19 +1145,14 @@ async def score_org_wide(
                     posthoc["event_count"] = len(combined_events)
                     probable_pattern = _classify_probable_pattern(posthoc)
 
-            # For __all__ scope, derive the predominant WLAN from outlier MAC events
-            predominant_wlan: str | None = None
-            if wlan == "__all__" and combined_events:
-                wlan_counts: Counter = Counter(
-                    evt["wlan"] for evt in combined_events if evt.get("wlan")
-                )
-                if wlan_counts:
-                    predominant_wlan = wlan_counts.most_common(1)[0][0]
+            is_family_dbscan_outlier = (
+                family_dbscan_noise_ratio.get(family, 0.0) >= DBSCAN_FAMILY_NOISE_THRESHOLD
+            )
+            is_family_markov_outlier = org_family_markov_flags.get(family, False)
 
             finding = {
                 "device_family": family,
                 "wlan": wlan,
-                "predominant_wlan": predominant_wlan,
                 "severity": _severity(outlier_ratio),
                 "outlier_ratio": round(outlier_ratio, 4),
                 "weighted_outlier_score": round(weighted_outlier_score, 4),
@@ -1057,6 +1162,8 @@ async def score_org_wide(
                 "sites_affected": sites_affected,
                 "example_macs": example_macs,
                 "is_family_outlier": is_family_level_outlier,
+                "is_family_dbscan_outlier": is_family_dbscan_outlier,
+                "is_family_markov_outlier": is_family_markov_outlier,
                 "centroid_if_score": centroid_if_scores.get(family),
                 "centroid_dist_score": centroid_dist_scores.get(family),
                 "centroid_detection_method": centroid_method,
@@ -1093,7 +1200,7 @@ async def score_org_wide(
     return site_macs_scored
 
 
-async def get_anomalies(site_id: str, wlan: str = "__all__") -> dict[str, dict]:
+async def get_anomalies(site_id: str, wlan: str) -> dict[str, dict]:
     redis_client = aioredis.from_url(REDIS_URL, decode_responses=True)
     try:
         raw = await redis_client.get(_anomalies_redis_key(site_id, wlan))
@@ -1104,7 +1211,7 @@ async def get_anomalies(site_id: str, wlan: str = "__all__") -> dict[str, dict]:
     return json.loads(raw)
 
 
-async def get_findings(site_id: str, wlan: str = "__all__") -> list[dict]:
+async def get_findings(site_id: str, wlan: str) -> list[dict]:
     redis_client = aioredis.from_url(REDIS_URL, decode_responses=True)
     try:
         raw = await redis_client.get(_findings_redis_key(site_id, wlan))
@@ -1115,7 +1222,7 @@ async def get_findings(site_id: str, wlan: str = "__all__") -> list[dict]:
     return json.loads(raw)
 
 
-async def get_org_findings(wlan: str = "__all__") -> list[dict]:
+async def get_org_findings(wlan: str) -> list[dict]:
     redis_client = aioredis.from_url(REDIS_URL, decode_responses=True)
     try:
         raw = await redis_client.get(_org_findings_redis_key(wlan))

@@ -112,11 +112,14 @@ async def refresh_client_cache(site_id: str) -> int:
     """
     Fetch all clients from Mist API, build MAC → metadata dict, store in Redis.
     Returns count of clients stored.
+
+    Always writes to Redis — even when the API returns zero clients — so that
+    subsequent get_client_cache calls can distinguish "cache populated but empty
+    site" from "cache key never written". An empty dict is a valid cache state
+    for a site with no recently-seen clients; collect() will proceed with
+    OUI-only enrichment rather than failing.
     """
     clients = await fetch_all_clients(site_id)
-    if not clients:
-        log.warning(f"No clients returned for site {site_id}")
-        return 0
 
     lookup: dict[str, dict] = {}
     for c in clients:
@@ -129,17 +132,27 @@ async def refresh_client_cache(site_id: str) -> int:
     try:
         key = f"sasquatch:clients:{site_id}"
         await redis_client.set(key, json.dumps(lookup), ex=CLIENT_CACHE_TTL)
-        log.info(f"Stored {len(lookup)} client records → {key} (TTL {CLIENT_CACHE_TTL}s)")
+        if lookup:
+            log.info(f"Stored {len(lookup)} client records → {key} (TTL {CLIENT_CACHE_TTL}s)")
+        else:
+            log.warning(f"No clients returned for site {site_id} — empty cache written to {key}")
     finally:
         await redis_client.aclose()
 
     return len(lookup)
 
 
-async def get_client_cache(site_id: str) -> dict[str, dict]:
+async def get_client_cache(site_id: str) -> dict[str, dict] | None:
     """
-    Load client cache from Redis. Returns empty dict if missing.
-    Callers that depend on this data should fail fast if the result is empty.
+    Load client cache from Redis.
+
+    Returns:
+      None  — key is absent (refresh_client_cache has never run for this site).
+      {}    — key exists but contains zero clients (empty site, or API returned nothing).
+      {...} — normal populated cache.
+
+    Callers that must distinguish "never refreshed" from "refreshed but empty"
+    should check `if result is None` rather than `if not result`.
     """
     redis_client = aioredis.from_url(REDIS_URL, decode_responses=True)
     try:
@@ -147,6 +160,6 @@ async def get_client_cache(site_id: str) -> dict[str, dict]:
     finally:
         await redis_client.aclose()
 
-    if not raw:
-        return {}
+    if raw is None:
+        return None
     return json.loads(raw)

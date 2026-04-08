@@ -26,26 +26,6 @@ function actionBtnStyle(state) {
   return { ...base, background: "#1a1a1a", color: "#888", borderColor: "#333" };
 }
 
-function WlanFallbackToast({ wlan, onDismiss }) {
-  return (
-    <div style={{
-      position: "fixed", bottom: "24px", right: "24px", zIndex: 200,
-      background: "#221a0a", border: "1px solid #e0a83560",
-      borderRadius: "6px", padding: "10px 14px",
-      color: "#e0a835", fontSize: "12px", fontFamily: "monospace",
-      maxWidth: "300px", boxShadow: "0 4px 16px rgba(0,0,0,0.6)",
-      display: "flex", alignItems: "flex-start", gap: "10px",
-    }}>
-      <span style={{ fontSize: "13px", lineHeight: "1.4" }}>⚠</span>
-      <div style={{ flex: 1 }}>
-        <div style={{ marginBottom: "2px", color: "#e0e0e0" }}>WLAN not available at this site</div>
-        <div><span style={{ color: "#e0a835" }}>{wlan}</span> — showing all WLANs</div>
-      </div>
-      <button onClick={onDismiss} style={{ background: "none", border: "none", color: "#555", cursor: "pointer", fontSize: "16px", padding: 0, lineHeight: 1 }}>×</button>
-    </div>
-  );
-}
-
 function WlanLoadingOverlay() {
   return (
     <>
@@ -127,9 +107,8 @@ export default function App() {
 
   // WLAN scope
   const [wlans, setWlans] = useState([]); // list of SSID name strings
-  const [selectedWlan, setSelectedWlan] = useState("__all__");
+  const [selectedWlan, setSelectedWlan] = useState(null); // null until WLANs are loaded
   const [wlanLoading, setWlanLoading] = useState(false);
-  const [wlanFallbackToast, setWlanFallbackToast] = useState(null); // WLAN name that was dropped
   // Ref so the WLAN fetch effect can read the current selection without it being a dep
   const selectedWlanRef = useRef(selectedWlan);
   useEffect(() => { selectedWlanRef.current = selectedWlan; }, [selectedWlan]);
@@ -181,9 +160,11 @@ export default function App() {
   }, [token]);
 
   // Fetch available WLANs whenever the selected site changes.
-  // If the previously-selected WLAN doesn't exist at the new site, fall back to __all__ and toast.
+  // Auto-select the first WLAN alphabetically. If the previously-selected WLAN
+  // exists at the new site, keep it; otherwise fall back to the first available.
   useEffect(() => {
     setWlans([]);
+    setSelectedWlan(null);
     if (!token || !selectedSite) return;
     const url = selectedSite === ORG_FOCUS_VALUE
       ? `${API_BASE}/api/v1/wlans`
@@ -191,14 +172,14 @@ export default function App() {
     apiFetch(url)
       .then((r) => r.json())
       .then((data) => {
-        const newWlans = data.wlans || [];
+        const newWlans = [...(data.wlans || [])].sort();
         setWlans(newWlans);
-        const prev = selectedWlanRef.current;
-        if (prev !== "__all__" && !newWlans.includes(prev)) {
-          setSelectedWlan("__all__");
-          setWlanFallbackToast(prev);
-          setTimeout(() => setWlanFallbackToast(null), 3500);
+        if (newWlans.length === 0) {
+          setSelectedWlan(null);
+          return;
         }
+        const prev = selectedWlanRef.current;
+        setSelectedWlan(newWlans.includes(prev) ? prev : newWlans[0]);
       })
       .catch(console.error);
   }, [token, selectedSite]);
@@ -435,28 +416,45 @@ export default function App() {
             )}
           </div>
           {/* WLAN Scope Selector */}
-          {wlans.length > 0 && (
+          {selectedSite && (
             <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
               <span style={{ color: "#888", fontSize: "13px" }}>WLAN:</span>
-              <select
-                value={selectedWlan}
-                onChange={(e) => { setWlanLoading(true); setSelectedWlan(e.target.value); setView("overview"); setSelectedMac(null); setSelectedFamily(null); }}
-                style={{
-                  background: "#222",
-                  color: selectedWlan === "__all__" ? "#7ec8e3" : "#e0e0e0",
-                  border: `1px solid ${selectedWlan === "__all__" ? "#2a4a5e" : "#2d7a4f"}`,
-                  padding: "4px 8px",
-                  borderRadius: "4px",
-                  cursor: "pointer",
-                  fontSize: "13px",
-                  fontFamily: "monospace",
-                }}
-              >
-                <option value="__all__">All WLANs</option>
-                {wlans.map((w) => (
-                  <option key={w} value={w}>{w}</option>
-                ))}
-              </select>
+              {wlans.length === 0 ? (
+                <select
+                  disabled
+                  style={{
+                    background: "#1a1a1a",
+                    color: "#555",
+                    border: "1px solid #2a2a2a",
+                    padding: "4px 8px",
+                    borderRadius: "4px",
+                    cursor: "default",
+                    fontSize: "13px",
+                    fontFamily: "monospace",
+                  }}
+                >
+                  <option>No WLANs detected yet</option>
+                </select>
+              ) : (
+                <select
+                  value={selectedWlan ?? ""}
+                  onChange={(e) => { setWlanLoading(true); setSelectedWlan(e.target.value); setView("overview"); setSelectedMac(null); setSelectedFamily(null); }}
+                  style={{
+                    background: "#222",
+                    color: "#e0e0e0",
+                    border: "1px solid #2d7a4f",
+                    padding: "4px 8px",
+                    borderRadius: "4px",
+                    cursor: "pointer",
+                    fontSize: "13px",
+                    fontFamily: "monospace",
+                  }}
+                >
+                  {wlans.map((w) => (
+                    <option key={w} value={w}>{w}</option>
+                  ))}
+                </select>
+              )}
             </div>
           )}
 
@@ -631,17 +629,17 @@ export default function App() {
       )}
       <div style={{ position: "relative" }}>
         {wlanLoading && <WlanLoadingOverlay />}
-        {selectedSite === ORG_FOCUS_VALUE && view === "overview" && (
+        {selectedSite === ORG_FOCUS_VALUE && view === "overview" && selectedWlan && (
           <OrgOverview apiBase={API_BASE} onSiteSelect={handleSiteSelect} onMacSiteSelect={handleOrgMacSelect} refreshToken={discoveryRefreshToken} wlan={selectedWlan} onLoaded={() => setWlanLoading(false)} />
         )}
-        {selectedSite && selectedSite !== ORG_FOCUS_VALUE && view === "overview" && (
+        {selectedSite && selectedSite !== ORG_FOCUS_VALUE && view === "overview" && selectedWlan && (
           <SiteOverview siteId={selectedSite} apiBase={API_BASE} onMacSelect={handleMacSelect} onFamilySelect={handleFamilySelect} refreshToken={discoveryRefreshToken} wlan={selectedWlan} onLoaded={() => setWlanLoading(false)} />
         )}
       </div>
-      {selectedSite && selectedSite !== ORG_FOCUS_VALUE && view === "findings" && (
+      {selectedSite && selectedSite !== ORG_FOCUS_VALUE && view === "findings" && selectedWlan && (
         <FindingsFeed siteId={selectedSite} apiBase={API_BASE} onMacSelect={handleMacSelect} refreshToken={discoveryRefreshToken} wlan={selectedWlan} />
       )}
-      {selectedSite && selectedSite !== ORG_FOCUS_VALUE && view === "family" && selectedFamily && (
+      {selectedSite && selectedSite !== ORG_FOCUS_VALUE && view === "family" && selectedFamily && selectedWlan && (
         <FamilyDrilldown
           siteId={selectedSite}
           family={selectedFamily}
@@ -652,7 +650,7 @@ export default function App() {
           wlan={selectedWlan}
         />
       )}
-      {selectedSite && selectedSite !== ORG_FOCUS_VALUE && view === "mac" && selectedMac && (
+      {selectedSite && selectedSite !== ORG_FOCUS_VALUE && view === "mac" && selectedMac && selectedWlan && (
         <MacDrilldown
           siteId={selectedSite}
           mac={selectedMac}
@@ -660,9 +658,6 @@ export default function App() {
           onBack={() => selectedFamily ? setView("family") : setView("findings")}
           wlan={selectedWlan}
         />
-      )}
-      {wlanFallbackToast && (
-        <WlanFallbackToast wlan={wlanFallbackToast} onDismiss={() => setWlanFallbackToast(null)} />
       )}
     </div>
   );

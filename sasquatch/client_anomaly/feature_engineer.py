@@ -16,7 +16,7 @@ Post-hoc explainer features are computed separately, only for flagged MACs.
 
 Redis key scheme:
   sasquatch:features:{site_id}:{wlan_key}
-  where wlan_key = "__all__" for all WLANs, or a sanitized SSID name.
+  where wlan_key is a sanitized SSID name.
 """
 
 import json
@@ -69,7 +69,7 @@ _FAILURE_CATEGORIES: frozenset[str] = frozenset({
 FEATURE_KEYS: list[str] = _ML_CATEGORIES + ["top_category_fraction", "top_failure_category_fraction"]
 
 
-def _features_redis_key(site_id: str, wlan: str = "__all__") -> str:
+def _features_redis_key(site_id: str, wlan: str) -> str:
     return f"sasquatch:features:{site_id}:{sanitize_wlan_key(wlan)}"
 
 
@@ -228,17 +228,16 @@ def build_posthoc_features(mac_events: list[dict]) -> dict:
     }
 
 
-async def build_features(site_id: str, wlan: str = "__all__") -> int:
+async def build_features(site_id: str, wlan: str) -> int:
     """
     Read events from the global Redis sorted set (filtered by site and WLAN),
     build per-MAC feature vectors, store in Redis.
 
-    wlan="__all__" uses all events for the site regardless of WLAN.
     Returns count of MACs processed.
     """
     redis_client = aioredis.from_url(REDIS_URL, decode_responses=True)
     try:
-        events = await get_events(site_id=site_id, wlan=wlan if wlan != "__all__" else None)
+        events = await get_events(site_id=site_id, wlan=wlan)
         if not events:
             raise RuntimeError(
                 f"No events found for site {site_id} / wlan={wlan}. "
@@ -282,7 +281,7 @@ async def build_features(site_id: str, wlan: str = "__all__") -> int:
         await redis_client.aclose()
 
 
-async def get_features(site_id: str, wlan: str = "__all__") -> dict[str, dict]:
+async def get_features(site_id: str, wlan: str) -> dict[str, dict]:
     redis_client = aioredis.from_url(REDIS_URL, decode_responses=True)
     try:
         raw = await redis_client.get(_features_redis_key(site_id, wlan))

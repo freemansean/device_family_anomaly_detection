@@ -46,7 +46,7 @@ function healthBarColor(score) {
   return "#e05555";
 }
 
-export default function SiteOverview({ siteId, apiBase, onMacSelect, onFamilySelect, refreshToken, wlan = "__all__", onLoaded }) {
+export default function SiteOverview({ siteId, apiBase, onMacSelect, onFamilySelect, refreshToken, wlan, onLoaded }) {
   const [summary, setSummary] = useState(null);
   const [findings, setFindings] = useState([]);
   const [health, setHealth] = useState({});
@@ -87,8 +87,8 @@ export default function SiteOverview({ siteId, apiBase, onMacSelect, onFamilySel
   }, [load]);
 
   if (loading && !summary) {
-    // Skeleton: 3 fixed cols + 15 CATEGORIES = 18 columns
-    const skeletonColWidths = [110, 62, 80, ...Array(15).fill(18)];
+    // Skeleton: 5 fixed cols (Family, IF, DB, Markov, Health) + 15 CATEGORIES = 20 columns
+    const skeletonColWidths = [110, 44, 62, 62, 80, ...Array(15).fill(18)];
     const shimmer = "sq-site-shimmer 1.5s ease-in-out infinite";
     return (
       <div>
@@ -177,7 +177,15 @@ export default function SiteOverview({ siteId, apiBase, onMacSelect, onFamilySel
           <thead>
             <tr>
               <th style={thStyle}>Device Family</th>
-              <th style={thStyle}>Anomaly</th>
+              <th style={{ ...thStyle, whiteSpace: "nowrap" }} title="Isolation Forest centroid detection — flags the whole family as behaving differently from all other families at this site.">
+                IF
+              </th>
+              <th style={{ ...thStyle, whiteSpace: "nowrap" }} title="DBSCAN — fraction of individual MACs in this family flagged as site-wide behavioral outliers.">
+                DB
+              </th>
+              <th style={{ ...thStyle, whiteSpace: "nowrap" }} title="Markov Chain episode analysis — flags families where clients show anomalous event chain patterns or repeated connection failures.">
+                Markov
+              </th>
               <th style={{ ...thStyle, whiteSpace: "nowrap", minWidth: "90px" }} title="Family health score — weighted failure rate across AUTH, ROAM, DHCP, DNS, ARP. 1.0 = no failures.">
                 Health
               </th>
@@ -199,6 +207,13 @@ export default function SiteOverview({ siteId, apiBase, onMacSelect, onFamilySel
               const isFamilyOutlier = finding?.is_family_outlier ?? false;
               const severity = finding?.dbscan_severity ?? null;
               const hasIfOutliers = (finding?.if_outlier_count ?? 0) > 0;
+              // Markov data: prefer the per-family aggregation from events/summary so all
+              // families are covered, not just those with a finding.
+              const familyMarkov = summary.family_markov?.[family] ?? {};
+              const isFamilyMarkovOutlier = familyMarkov.is_family_markov_outlier ?? finding?.is_family_markov_outlier ?? false;
+              const markovRatio = familyMarkov.markov_family_anomaly_ratio ?? finding?.markov_family_anomaly_ratio ?? null;
+              const markovAnomalousCount = familyMarkov.markov_family_anomalous_count ?? finding?.markov_family_anomalous_count ?? 0;
+              const markovEvaluatableCount = familyMarkov.markov_evaluatable_count ?? finding?.markov_evaluatable_count ?? 0;
               const color = familyColor(family);
               const familyHealth = health[family];
               const healthScore = familyHealth?.health_score ?? null;
@@ -235,6 +250,7 @@ export default function SiteOverview({ siteId, apiBase, onMacSelect, onFamilySel
                       </span>
                     )}
                   </td>
+                  {/* IF: Centroid Isolation Forest — whole-family behavioral outlier */}
                   <td style={{ ...tdStyle, textAlign: "center" }}>
                     {isFamilyOutlier ? (
                       <span style={{
@@ -248,7 +264,13 @@ export default function SiteOverview({ siteId, apiBase, onMacSelect, onFamilySel
                       }}>
                         family
                       </span>
-                    ) : severity ? (
+                    ) : (
+                      <span style={{ color: "#2d7a4f", fontSize: "10px" }}>OK</span>
+                    )}
+                  </td>
+                  {/* DB: DBSCAN — fraction of individual MACs flagged site-wide */}
+                  <td style={{ ...tdStyle, textAlign: "center" }}>
+                    {severity ? (
                       <span style={{
                         background: SEVERITY_COLOR[severity] + "33",
                         color: SEVERITY_COLOR[severity],
@@ -262,6 +284,37 @@ export default function SiteOverview({ siteId, apiBase, onMacSelect, onFamilySel
                       </span>
                     ) : (
                       <span style={{ color: "#2d7a4f", fontSize: "10px" }}>OK</span>
+                    )}
+                  </td>
+
+                  {/* Markov Chain episode analysis */}
+                  <td
+                    style={{ ...tdStyle, textAlign: "center" }}
+                    title={
+                      isFamilyMarkovOutlier
+                        ? `Markov anomaly: ${markovAnomalousCount}/${markovEvaluatableCount} clients have anomalous event chain patterns (${markovRatio != null ? (markovRatio * 100).toFixed(0) + "%" : ""})`
+                        : markovEvaluatableCount > 0
+                          ? `Markov: ${markovAnomalousCount}/${markovEvaluatableCount} clients evaluated — no family-level anomaly`
+                          : "Markov baseline not yet available or no scoreable episodes"
+                    }
+                  >
+                    {isFamilyMarkovOutlier ? (
+                      <span style={{
+                        background: "#1a2a3a",
+                        color: "#4ab0e8",
+                        border: "1px solid #2a6a8a",
+                        borderRadius: "3px",
+                        padding: "1px 6px",
+                        fontSize: "10px",
+                        fontWeight: "bold",
+                        whiteSpace: "nowrap",
+                      }}>
+                        {markovRatio != null ? `${(markovRatio * 100).toFixed(0)}%` : "chain"}
+                      </span>
+                    ) : markovEvaluatableCount > 0 ? (
+                      <span style={{ color: "#2d7a4f", fontSize: "10px" }}>OK</span>
+                    ) : (
+                      <span style={{ color: "#333", fontSize: "10px" }}>—</span>
                     )}
                   </td>
 
@@ -333,6 +386,9 @@ export default function SiteOverview({ siteId, apiBase, onMacSelect, onFamilySel
                 <td style={{ ...tdStyle, textAlign: "center" }}>
                   <span style={{ color: "#888", fontSize: "10px" }}>—</span>
                 </td>
+                <td style={{ ...tdStyle, textAlign: "center" }}>
+                  <span style={{ color: "#888", fontSize: "10px" }}>—</span>
+                </td>
                 <td style={tdStyle} />
                 {CATEGORIES.map((cat) => {
                   const count = otherCounts[cat] ?? 0;
@@ -376,8 +432,8 @@ export default function SiteOverview({ siteId, apiBase, onMacSelect, onFamilySel
       </div>
 
       <div style={{ marginTop: "8px", fontSize: "11px", color: "#444" }}>
-        <span style={{ color: "#b06ad4" }}>family</span> = whole device class behaves differently from other families at this site (family centroid IF).
-        {" "}<span style={{ color: "#e0a835" }}>moderate</span> / <span style={{ color: "#e05555" }}>significant</span> = fraction of individual MACs in that family flagged by DBSCAN.
+        <span style={{ color: "#b06ad4" }}>IF: family</span> = whole device class behaves differently from other families at this site (centroid IF).
+        {" "}<span style={{ fontWeight: "bold", color: "#666" }}>DB:</span> <span style={{ color: "#e0a835" }}>moderate</span> / <span style={{ color: "#e05555" }}>significant</span> = fraction of individual MACs in that family flagged by DBSCAN.
         {" "}Health = weighted failure rate across AUTH · ROAM · DHCP · DNS · ARP (hover for breakdown).
         {" "}Click a family name to see per-device Isolation Forest deviations.
       </div>

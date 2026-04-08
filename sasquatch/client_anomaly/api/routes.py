@@ -4,9 +4,9 @@ routes.py — FastAPI route definitions.
 All reads come from Redis — no real-time Mist API calls in the request path.
 The API is read-only except for the manual refresh POST.
 
-WLAN scoping: endpoints that return findings, anomalies, or event summaries accept an
-optional ?wlan= query parameter. Default is "__all__" (all WLANs combined). Pass a
-specific SSID name to scope the result to that WLAN only.
+WLAN scoping: endpoints that return findings, anomalies, or event summaries require a
+?wlan= query parameter specifying the SSID to scope results to. The parameter is
+mandatory — omitting it returns a 422 error.
 """
 
 import asyncio
@@ -40,12 +40,15 @@ from ..client_cache import get_client_cache, refresh_client_cache
 from ..event_collector import (
     EVENT_CATEGORIES,
     collect_full,
+    get_event_type_index,
     get_events,
     get_wlans,
     sanitize_wlan_key,
 )
 from ..feature_engineer import _features_redis_key, build_features, get_features
 from ..health_scorer import get_health, score_health, _health_redis_key
+from ..markov_analyzer import baseline_exists as markov_baseline_exists
+from ..markov_analyzer import build_and_store_baseline as build_markov_baseline
 from ..scheduler import build_org_pools, run_collect_only, run_detect_only, run_detection_cycle
 from .. import alert_tracker
 from ..webhook_dispatcher import evaluate_and_dispatch
@@ -116,14 +119,44 @@ async def _redis_get(key: str):
 
 async def _run_wlan_detection_bg(site_id: str, redis_client, progress_key: str, wp) -> dict:
     """
-    Run build_features + score_health + score for __all__ + each unique WLAN.
+    Run build_features + score_health + score for each unique WLAN.
     Used by background detection tasks. Returns summary dict.
     """
     wlans = await get_wlans(site_id=site_id)
-    scopes = ["__all__"] + wlans
+    if not wlans:
+        log.info(f"No WLANs detected for site={site_id} — skipping detection")
+        return {"macs_scored": 0, "wlan_scopes": 0}
+
     total_macs = 0
 
-    for wlan in scopes:
+    # Build any missing Markov baselines before scoring. Mirrors the same fallback
+    # in scheduler._run_wlan_detection so full-discovery runs don't silently skip Markov.
+    try:
+        event_type_index = await get_event_type_index(site_id)
+        for wlan in wlans:
+            if not await markov_baseline_exists(site_id, wlan, redis_client):
+                log.info(
+                    "[bg detection] No Markov baseline for site=%s wlan=%s — building now",
+                    site_id, wlan,
+                )
+                try:
+                    result = await build_markov_baseline(site_id, wlan, event_type_index)
+                    log.info(
+                        "[bg detection] Markov baseline built: site=%s wlan=%s macs=%d events=%d episodes=%d",
+                        site_id, wlan,
+                        result.get("macs", 0),
+                        result.get("events", 0),
+                        result.get("normal_episodes", 0),
+                    )
+                except Exception:
+                    log.exception(
+                        "[bg detection] Failed to build Markov baseline for site=%s wlan=%s",
+                        site_id, wlan,
+                    )
+    except Exception:
+        log.exception("[bg detection] Markov baseline pre-check failed for site=%s — continuing", site_id)
+
+    for wlan in wlans:
         try:
             mac_count = await build_features(site_id, wlan)
             if mac_count == 0:
@@ -131,19 +164,18 @@ async def _run_wlan_detection_bg(site_id: str, redis_client, progress_key: str, 
                 continue
             await score_health(site_id, wlan)
             scored = await score(site_id, wlan)
-            if wlan == "__all__":
-                total_macs = scored
+            total_macs = max(total_macs, scored)
         except Exception:
             log.exception(f"WLAN detection failed for site={site_id} wlan={wlan}")
 
-    return {"macs_scored": total_macs, "wlan_scopes": len(scopes)}
+    return {"macs_scored": total_macs, "wlan_scopes": len(wlans)}
 
 
 async def _detection_background_task(site_id: str) -> None:
     """
     Full 24hr detection pipeline run as a FastAPI background task.
     Writes phase-by-phase progress to Redis key sasquatch:progress:{site_id}.
-    Runs feature engineering + scoring for __all__ + each unique WLAN.
+    Runs feature engineering + scoring for each unique WLAN.
     """
     lock_key = f"sasquatch:lock:detection:{site_id}"
     progress_key = f"sasquatch:progress:{site_id}"
@@ -165,12 +197,12 @@ async def _detection_background_task(site_id: str) -> None:
         await wp({"phase": "starting", "events_fetched": 0, "total_estimated": None, "pages": 0})
 
         client_cache = await get_client_cache(site_id)
-        if not client_cache:
+        if client_cache is None:
             log.info(f"Client cache missing for site {site_id} — refreshing before full run")
             await refresh_client_cache(site_id)
-            client_cache = await get_client_cache(site_id)
-            if not client_cache:
-                log.warning(f"Client cache still empty after refresh for site {site_id} — skipping")
+            client_cache = await get_client_cache(site_id) or {}
+            if client_cache is None:
+                log.warning(f"Client cache still missing after refresh for site {site_id} — skipping")
                 await wp({"phase": "error", "message": f"No clients found for site {site_id} after refresh"})
                 return
 
@@ -295,7 +327,7 @@ async def list_wlans(site_id: Optional[str] = Query(None)):
 
 
 @router.get("/org/summary")
-async def get_org_summary(wlan: str = Query("__all__")):
+async def get_org_summary(wlan: str = Query(..., description="WLAN (SSID) name to scope results to. Required.")):
     """
     Per-site findings and event counts for the org overview.
     Reads from Redis — no real-time Mist API calls for the data itself.
@@ -318,7 +350,7 @@ async def get_org_summary(wlan: str = Query("__all__")):
         events_per_site: Counter = Counter(
             e["site_id"]
             for e in all_events
-            if e.get("site_id") and (wlan == "__all__" or e.get("wlan") == wlan)
+            if e.get("site_id") and e.get("wlan") == wlan
         )
 
         # Fetch per-site findings, per-site health, and org-wide findings in one pipeline round trip
@@ -440,7 +472,7 @@ async def trigger_org_detect_only():
         try:
             wlans = await get_wlans(site_id=sid)
             wlans_by_site[sid] = wlans
-            for wlan in ["__all__"] + wlans:
+            for wlan in wlans:
                 await build_features(sid, wlan)
                 await score_health(sid, wlan)
                 await score(sid, wlan)
@@ -449,7 +481,7 @@ async def trigger_org_detect_only():
             wlans_by_site.setdefault(sid, [])
 
     # Phase 2 — pool all site features and run org-wide cross-site scoring.
-    all_wlans: set[str] = {"__all__"}
+    all_wlans: set[str] = set()
     for wlans in wlans_by_site.values():
         all_wlans.update(wlans)
 
@@ -520,7 +552,11 @@ async def flush_org_redis():
             ]
             deleted += await redis_client.delete(*static_keys)
             pattern_keys: list[str] = []
-            for prefix in ["sasquatch:features:", "sasquatch:anomalies:", "sasquatch:findings:"]:
+            # Exclude markov_baseline keys — they are expensive to rebuild (require 24hr of
+            # events) and have their own 48hr TTL. Flushing events/features/findings is
+            # sufficient to force a clean redetection without losing the baseline.
+            for prefix in ["sasquatch:features:", "sasquatch:anomalies:", "sasquatch:findings:",
+                           "sasquatch:health:", "sasquatch:org_anomalies:", "sasquatch:org_findings:"]:
                 scan_cursor = 0
                 while True:
                     scan_cursor, found = await redis_client.scan(scan_cursor, match=f"{prefix}{sid}:*", count=100)
@@ -661,7 +697,7 @@ async def get_org_progress():
 
 
 @router.get("/org/findings")
-async def get_org_findings_endpoint(wlan: str = Query("__all__")):
+async def get_org_findings_endpoint(wlan: str = Query(..., description="WLAN (SSID) name to scope results to. Required.")):
     """
     Return org-wide anomaly findings produced by the cross-site detection job.
 
@@ -698,7 +734,7 @@ async def get_org_findings_endpoint(wlan: str = Query("__all__")):
 
 
 @router.get("/org/alerts")
-async def get_org_alerts(wlan: str = Query("__all__")):
+async def get_org_alerts(wlan: str = Query(..., description="WLAN (SSID) name to scope results to. Required.")):
     """
     Return org-wide alerts AND per-site alerts in a single response.
 
@@ -778,7 +814,7 @@ async def get_org_alerts(wlan: str = Query("__all__")):
 
 @router.get("/org/alert-history")
 async def get_org_alert_history(
-    wlan: str = Query("__all__"),
+    wlan: str = Query(..., description="WLAN (SSID) name to scope results to. Required."),
     days: int = Query(7, ge=1, le=30),
     tz_offset: int = Query(0, description="Browser timezone offset in minutes (JS getTimezoneOffset())"),
 ):
@@ -931,7 +967,7 @@ async def get_org_alert_history(
 
 
 @router.get("/org/family-insights")
-async def get_org_family_insights(wlan: str = Query("__all__")):
+async def get_org_family_insights(wlan: str = Query(..., description="WLAN (SSID) name to scope results to. Required.")):
     """
     Aggregate event category counts and anomaly findings per device family across all org sites.
     Optionally scoped to a specific WLAN via ?wlan=.
@@ -951,7 +987,7 @@ async def get_org_family_insights(wlan: str = Query("__all__")):
         events_by_site: dict[str, list[dict]] = defaultdict(list)
         for evt in all_events:
             sid = evt.get("site_id")
-            if sid and (wlan == "__all__" or evt.get("wlan") == wlan):
+            if sid and evt.get("wlan") == wlan:
                 events_by_site[sid].append(evt)
 
         # Fetch per-site findings, anomalies, and health scores in one pipeline round trip.
@@ -983,8 +1019,11 @@ async def get_org_family_insights(wlan: str = Query("__all__")):
         family_event_counts: dict[str, Counter] = defaultdict(Counter)
         family_total_events: Counter = Counter()
         family_worst_severity: dict[str, str] = {}
+        family_worst_dbscan_severity: dict[str, str] = {}
         family_outlier_sites: dict[str, list[str]] = defaultdict(list)
         family_is_family_outlier: dict[str, bool] = defaultdict(bool)
+        family_is_markov_outlier: dict[str, bool] = defaultdict(bool)
+        family_worst_markov_ratio: dict[str, float] = {}
         family_site_count: Counter = Counter()
         family_macs: dict[str, set] = defaultdict(set)
         # Track worst (most anomalous = most negative) centroid IF score and its top_features
@@ -1025,6 +1064,14 @@ async def get_org_family_insights(wlan: str = Query("__all__")):
                     family_worst_severity[fam] = sev
                 if finding.get("is_family_outlier"):
                     family_is_family_outlier[fam] = True
+                if finding.get("is_family_markov_outlier"):
+                    family_is_markov_outlier[fam] = True
+                markov_ratio = finding.get("markov_family_anomaly_ratio")
+                if markov_ratio is not None and markov_ratio > family_worst_markov_ratio.get(fam, 0.0):
+                    family_worst_markov_ratio[fam] = markov_ratio
+                dbscan_sev = finding.get("dbscan_severity")
+                if dbscan_sev and SEVERITY_RANK.get(dbscan_sev, 0) > SEVERITY_RANK.get(family_worst_dbscan_severity.get(fam, ""), 0):
+                    family_worst_dbscan_severity[fam] = dbscan_sev
                 if sev in SEVERITY_RANK:
                     family_outlier_sites[fam].append(site_name)
 
@@ -1078,7 +1125,10 @@ async def get_org_family_insights(wlan: str = Query("__all__")):
             "client_count": len(family_macs.get(family, set())),
             "site_count": family_site_count[family],
             "worst_severity": family_worst_severity.get(family),
+            "worst_dbscan_severity": family_worst_dbscan_severity.get(family),
             "is_family_outlier_any_site": family_is_family_outlier.get(family, False),
+            "is_family_markov_outlier_any_site": family_is_markov_outlier.get(family, False),
+            "worst_markov_ratio": family_worst_markov_ratio.get(family),
             "outlier_sites": family_outlier_sites.get(family, []),
             "worst_centroid_if_score": family_worst_centroid_if_score.get(family),
             "worst_centroid_top_features": family_worst_centroid_top_features.get(family, []),
@@ -1102,7 +1152,7 @@ async def get_org_family_insights(wlan: str = Query("__all__")):
 
 
 @router.get("/org/families/{family}/drilldown")
-async def get_org_family_drilldown(family: str, wlan: str = Query("__all__")):
+async def get_org_family_drilldown(family: str, wlan: str = Query(..., description="WLAN (SSID) name to scope results to. Required.")):
     """
     Org-wide per-MAC drilldown for a single device family.
     Optionally scoped to a specific WLAN via ?wlan=.
@@ -1113,6 +1163,8 @@ async def get_org_family_drilldown(family: str, wlan: str = Query("__all__")):
     redis_client = _get_redis()
     rows: list[dict] = []
     total_if_outliers = 0
+    total_dbscan_outliers = 0
+    total_markov_outliers = 0
 
     try:
         try:
@@ -1125,7 +1177,7 @@ async def get_org_family_drilldown(family: str, wlan: str = Query("__all__")):
         events_by_site: dict[str, list[dict]] = defaultdict(list)
         for evt in all_events:
             sid = evt.get("site_id")
-            if sid and (wlan == "__all__" or evt.get("wlan") == wlan):
+            if sid and evt.get("wlan") == wlan:
                 events_by_site[sid].append(evt)
 
         # Fetch anomalies, client caches, and findings for all sites in one pipeline round trip
@@ -1197,15 +1249,25 @@ async def get_org_family_drilldown(family: str, wlan: str = Query("__all__")):
                 if mac not in family_macs:
                     continue
                 is_if_outlier = data.get("is_if_outlier", False)
+                is_dbscan_outlier = data.get("is_dbscan_outlier", False)
+                is_markov_outlier = data.get("is_markov_outlier", False)
                 if is_if_outlier:
                     total_if_outliers += 1
+                if is_dbscan_outlier:
+                    total_dbscan_outliers += 1
+                if is_markov_outlier:
+                    total_markov_outliers += 1
                 rows.append({
                     "mac": mac,
                     "site_id": site_id,
                     "site_name": site_name,
                     "if_score": data.get("if_score"),
                     "is_if_outlier": is_if_outlier,
-                    "is_dbscan_outlier": data.get("is_dbscan_outlier", False),
+                    "is_dbscan_outlier": is_dbscan_outlier,
+                    "is_markov_outlier": is_markov_outlier,
+                    "markov_episode_anomaly_ratio": data.get("markov_episode_anomaly_ratio", 0.0),
+                    "markov_scoreable_episodes": data.get("markov_scoreable_episodes", 0),
+                    "markov_anomalous_episodes": data.get("markov_anomalous_episodes", 0),
                     "event_count": data.get("event_count", 0),
                     "random_mac": data.get("random_mac", False),
                     "client_metadata": client_cache.get(mac, {}),
@@ -1224,6 +1286,8 @@ async def get_org_family_drilldown(family: str, wlan: str = Query("__all__")):
         "family": family,
         "total_count": len(rows),
         "if_outlier_count": total_if_outliers,
+        "dbscan_outlier_count": total_dbscan_outliers,
+        "markov_outlier_count": total_markov_outliers,
         "rows": rows,
         "category_keys": list(EVENT_CATEGORIES.keys()),
         "worst_centroid_if_score": worst_centroid_if_score,
@@ -1255,7 +1319,7 @@ async def list_org_sites():
 
 
 @router.get("/org/cluster-viz")
-async def get_org_cluster_viz(wlan: str = Query("__all__")):
+async def get_org_cluster_viz(wlan: str = Query(..., description="WLAN (SSID) name to scope results to. Required.")):
     """
     PCA 2D projection of all MAC feature vectors across every org site.
     Optionally scoped to a specific WLAN via ?wlan=.
@@ -1329,14 +1393,14 @@ async def get_org_cluster_viz(wlan: str = Query("__all__")):
 
 
 @router.get("/sites/{site_id}/findings")
-async def get_site_findings(site_id: str, wlan: str = Query("__all__")):
+async def get_site_findings(site_id: str, wlan: str = Query(..., description="WLAN (SSID) name to scope results to. Required.")):
     """Current anomaly findings from Redis for a site, optionally scoped to a WLAN."""
     findings = await get_findings(site_id, wlan)
     return {"site_id": site_id, "wlan": wlan, "findings": findings, "count": len(findings)}
 
 
 @router.get("/sites/{site_id}/health")
-async def get_site_health(site_id: str, wlan: str = Query("__all__")):
+async def get_site_health(site_id: str, wlan: str = Query(..., description="WLAN (SSID) name to scope results to. Required.")):
     """
     Per-family health scores for a site, optionally scoped to a WLAN.
     Returns {family: {health_score, components, total_events, mac_count}}.
@@ -1366,14 +1430,14 @@ async def get_site_clients(site_id: str):
 
 
 @router.get("/sites/{site_id}/events/summary")
-async def get_events_summary(site_id: str, wlan: str = Query("__all__")):
+async def get_events_summary(site_id: str, wlan: str = Query(..., description="WLAN (SSID) name to scope results to. Required.")):
     """
     Event category counts per device family — used for heatmap in SiteOverview.
     Optionally scoped to a specific WLAN via ?wlan=.
     """
     events = await get_events(
         site_id=site_id,
-        wlan=wlan if wlan != "__all__" else None,
+        wlan=wlan,
     )
     if not events:
         raise HTTPException(status_code=404, detail="No events found for site.")
@@ -1402,18 +1466,49 @@ async def get_events_summary(site_id: str, wlan: str = Query("__all__")):
             for cat, count in cat_counts.items()
         }
 
+    # Aggregate per-family Markov stats from anomaly records so SiteOverview can
+    # display Markov results for families that have no finding.
+    family_markov: dict[str, dict] = {}
+    try:
+        anomalies_raw = await get_anomalies(site_id, wlan)
+        if anomalies_raw:
+            fam_evaluatable: dict[str, int] = defaultdict(int)
+            fam_anomalous: dict[str, int] = defaultdict(int)
+            fam_markov_outlier: dict[str, bool] = {}
+            for mac_data in anomalies_raw.values():
+                fam = mac_data.get("device_family", "Unknown")
+                scoreable = mac_data.get("markov_scoreable_episodes", 0)
+                if scoreable > 0:
+                    fam_evaluatable[fam] += 1
+                    if mac_data.get("is_markov_outlier", False):
+                        fam_anomalous[fam] += 1
+                if mac_data.get("is_markov_outlier", False):
+                    fam_markov_outlier[fam] = True
+            for fam in set(list(fam_evaluatable.keys()) + list(fam_markov_outlier.keys())):
+                evaluatable = fam_evaluatable.get(fam, 0)
+                anomalous = fam_anomalous.get(fam, 0)
+                family_markov[fam] = {
+                    "markov_evaluatable_count": evaluatable,
+                    "markov_family_anomalous_count": anomalous,
+                    "markov_family_anomaly_ratio": round(anomalous / evaluatable, 4) if evaluatable > 0 else 0.0,
+                    "is_family_markov_outlier": fam_markov_outlier.get(fam, False),
+                }
+    except Exception:
+        log.debug("Markov aggregation skipped for events/summary — anomaly data not yet available")
+
     return {
         "site_id": site_id,
         "wlan": wlan,
         "total_events": len(events),
         "families": result,
         "family_client_counts": {fam: len(macs) for fam, macs in family_macs.items()},
+        "family_markov": family_markov,
         "categories": list(EVENT_CATEGORIES.keys()),
     }
 
 
 @router.get("/sites/{site_id}/families/{family}/if-outliers")
-async def get_family_if_outliers(site_id: str, family: str, wlan: str = Query("__all__")):
+async def get_family_if_outliers(site_id: str, family: str, wlan: str = Query(..., description="WLAN (SSID) name to scope results to. Required.")):
     """
     MACs within a device family that triggered an Isolation Forest deviation.
     Used by the Family Drilldown view. Optionally scoped to a WLAN.
@@ -1422,7 +1517,7 @@ async def get_family_if_outliers(site_id: str, family: str, wlan: str = Query("_
     if not anomalies:
         raise HTTPException(status_code=404, detail="No anomaly data found. Run detection first.")
 
-    client_cache = await get_client_cache(site_id)
+    client_cache = await get_client_cache(site_id) or {}
 
     family_macs = [
         mac for mac, data in anomalies.items()
@@ -1437,6 +1532,8 @@ async def get_family_if_outliers(site_id: str, family: str, wlan: str = Query("_
             "if_score": anomalies[mac].get("if_score"),
             "is_if_outlier": anomalies[mac].get("is_if_outlier", False),
             "is_dbscan_outlier": anomalies[mac].get("is_dbscan_outlier", False),
+            "is_markov_outlier": anomalies[mac].get("is_markov_outlier", False),
+            "markov_episode_anomaly_ratio": anomalies[mac].get("markov_episode_anomaly_ratio"),
             "event_count": anomalies[mac].get("event_count", 0),
             "random_mac": anomalies[mac].get("random_mac", False),
             "client_metadata": client_cache.get(mac, {}),
@@ -1473,19 +1570,19 @@ async def get_family_if_outliers(site_id: str, family: str, wlan: str = Query("_
 
 
 @router.get("/sites/{site_id}/families/{family}/event-counts")
-async def get_family_event_counts(site_id: str, family: str, wlan: str = Query("__all__")):
+async def get_family_event_counts(site_id: str, family: str, wlan: str = Query(..., description="WLAN (SSID) name to scope results to. Required.")):
     """
     Per-MAC event category counts for all clients in a device family.
     Used by the Family Drilldown Event Counts view. Optionally scoped to a WLAN.
     """
     events = await get_events(
         site_id=site_id,
-        wlan=wlan if wlan != "__all__" else None,
+        wlan=wlan,
     )
     if not events:
         raise HTTPException(status_code=404, detail="No events found for site.")
 
-    client_cache = await get_client_cache(site_id)
+    client_cache = await get_client_cache(site_id) or {}
 
     mac_counts: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
     mac_total: dict[str, int] = defaultdict(int)
@@ -1526,7 +1623,7 @@ async def get_family_event_counts(site_id: str, family: str, wlan: str = Query("
 
 
 @router.get("/sites/{site_id}/anomalies/{mac}")
-async def get_mac_anomaly(site_id: str, mac: str, wlan: str = Query("__all__")):
+async def get_mac_anomaly(site_id: str, mac: str, wlan: str = Query(..., description="WLAN (SSID) name to scope results to. Required.")):
     """
     Full event timeline + anomaly scores for one MAC.
     Used by MAC Drill-down view. Optionally scoped to a WLAN.
@@ -1551,7 +1648,7 @@ async def get_mac_anomaly(site_id: str, mac: str, wlan: str = Query("__all__")):
     ]
     mac_events.sort(key=lambda e: e.get("timestamp", 0))
 
-    client_cache = await get_client_cache(site_id)
+    client_cache = await get_client_cache(site_id) or {}
     client_meta = client_cache.get(mac_normalized, {})
 
     # Compute per-MAC Shapley features: top feature deviations vs family mean
@@ -1609,6 +1706,35 @@ async def trigger_client_refresh(site_id: str):
         raise HTTPException(status_code=500, detail=str(exc))
 
 
+@router.post("/sites/{site_id}/markov-baseline")
+async def trigger_markov_baseline(site_id: str):
+    """
+    Manually trigger a Markov Chain baseline rebuild for all WLANs at a site.
+    Reads the last 24hr of events from Redis and rebuilds the transition matrices.
+    If no events are present in Redis, returns with zero counts and no baseline is written —
+    run a Full Discovery first to populate events, then call this endpoint.
+    """
+    try:
+        event_type_index = await get_event_type_index(site_id)
+        wlans = await get_wlans(site_id=site_id)
+        if not wlans:
+            return {"site_id": site_id, "status": "no_wlans", "results": [],
+                    "timestamp": datetime.now(timezone.utc).isoformat()}
+        results = []
+        for wlan in wlans:
+            result = await build_markov_baseline(site_id, wlan, event_type_index)
+            results.append({"wlan": wlan, **result})
+        return {
+            "site_id": site_id,
+            "status": "ok",
+            "results": results,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+    except Exception as exc:
+        log.exception(f"Markov baseline rebuild failed for site {site_id}")
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
 @router.post("/sites/{site_id}/flush")
 async def flush_site_redis(site_id: str):
     """
@@ -1629,9 +1755,13 @@ async def flush_site_redis(site_id: str):
         ]
         deleted += await client.delete(*static_keys)
 
-        # Scan for per-WLAN feature/anomaly/finding keys
+        # Scan for per-WLAN feature/anomaly/finding keys.
+        # markov_baseline keys are intentionally excluded — they are expensive to rebuild
+        # and have their own 48hr TTL. Preserving them avoids silent Markov scoring gaps
+        # after a flush-and-rerun cycle.
         pattern_keys: list[str] = []
-        for prefix in ["sasquatch:features:", "sasquatch:anomalies:", "sasquatch:findings:"]:
+        for prefix in ["sasquatch:features:", "sasquatch:anomalies:", "sasquatch:findings:",
+                       "sasquatch:health:", "sasquatch:org_anomalies:"]:
             scan_cursor = 0
             while True:
                 scan_cursor, found = await client.scan(scan_cursor, match=f"{prefix}{site_id}:*", count=100)
@@ -1714,10 +1844,21 @@ async def trigger_event_collection(site_id: str):
 async def trigger_anomaly_detection(site_id: str):
     """
     Run feature engineering + anomaly scoring on events already in Redis.
-    Runs for __all__ WLANs + each unique WLAN in the event data.
+    Rebuilds the Markov Chain baseline before scoring so Markov scores reflect
+    the current event window. Runs for each unique WLAN in the event data.
     Does not pull new events from Mist — use /collect first.
     Returns 409 if a cycle is already in progress, 404 if no events in Redis.
     """
+    # Rebuild Markov baseline before scoring so the detection cycle always has
+    # an up-to-date baseline. Failures are logged but do not block detection.
+    try:
+        event_type_index = await get_event_type_index(site_id)
+        wlans = await get_wlans(site_id=site_id)
+        for wlan in wlans:
+            await build_markov_baseline(site_id, wlan, event_type_index)
+    except Exception:
+        log.exception(f"Markov baseline rebuild failed for site {site_id} — continuing with detection")
+
     try:
         summary = await run_detect_only(site_id)
     except RuntimeError as exc:
@@ -1728,20 +1869,23 @@ async def trigger_anomaly_detection(site_id: str):
         log.exception(f"Anomaly detection failed for site {site_id}")
         raise HTTPException(status_code=500, detail=str(exc))
 
-    findings = await get_findings(site_id)
+    wlans = await get_wlans(site_id=site_id)
+    all_findings = []
+    for wlan in wlans:
+        all_findings.extend(await get_findings(site_id, wlan))
     return {
         "site_id": site_id,
         "status": "ok",
         "macs_with_features": summary["macs_with_features"],
         "macs_scored": summary["macs_scored"],
         "wlan_scopes": summary.get("wlan_scopes", 1),
-        "findings_generated": len(findings),
+        "findings_generated": len(all_findings),
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
 
 @router.get("/sites/{site_id}/cluster-viz")
-async def get_cluster_viz(site_id: str, wlan: str = Query("__all__")):
+async def get_cluster_viz(site_id: str, wlan: str = Query(..., description="WLAN (SSID) name to scope results to. Required.")):
     """
     PCA 2D projection of all MAC feature vectors for the cluster scatter plot.
     Optionally scoped to a specific WLAN via ?wlan=.
@@ -1773,6 +1917,7 @@ async def get_cluster_viz(site_id: str, wlan: str = Query("__all__")):
             "y": float(coords[i, 1]),
             "device_family": features[mac].get("device_family", "Unknown"),
             "is_outlier": anom.get("is_outlier", False),
+            "is_if_outlier": anom.get("is_if_outlier", False),
             "is_dbscan_outlier": anom.get("is_dbscan_outlier", False),
             "dbscan_label": anom.get("dbscan_label"),
         })
@@ -1787,7 +1932,7 @@ async def get_cluster_viz(site_id: str, wlan: str = Query("__all__")):
 
 
 @router.get("/sites/{site_id}/status")
-async def get_site_status(site_id: str, wlan: str = Query("__all__")):
+async def get_site_status(site_id: str, wlan: str = Query(..., description="WLAN (SSID) name to scope results to. Required.")):
     """Last run metadata: event count, finding count, Redis key TTLs."""
     client = _get_redis()
     try:
@@ -1804,7 +1949,7 @@ async def get_site_status(site_id: str, wlan: str = Query("__all__")):
         await client.aclose()
 
     # Event count from global sorted set
-    site_events = await get_events(site_id=site_id, wlan=wlan if wlan != "__all__" else None)
+    site_events = await get_events(site_id=site_id, wlan=wlan)
 
     return {
         "site_id": site_id,

@@ -193,7 +193,7 @@ function DomainHealthBar({ label, healthyRatio, unhealthyRatio }) {
 }
 
 
-export default function MacDrilldown({ siteId, mac, apiBase, onBack, wlan = "__all__" }) {
+export default function MacDrilldown({ siteId, mac, apiBase, onBack, wlan }) {
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
@@ -284,10 +284,13 @@ export default function MacDrilldown({ siteId, mac, apiBase, onBack, wlan = "__a
             ["IF outlier",     scores.is_if_outlier ? "Yes" : "No"],
             ["DBSCAN label",   scores.dbscan_label],
             ["DBSCAN outlier", scores.is_dbscan_outlier ? "Yes" : "No"],
+            ["Family outlier", scores.is_family_outlier ? "Yes" : "No"],
+            ["Markov outlier", scores.is_markov_outlier ? "Yes" : "No"],
+            ["Markov ep. ratio", scores.markov_episode_anomaly_ratio != null ? `${(scores.markov_episode_anomaly_ratio * 100).toFixed(1)}%` : "—"],
+            ["Markov anomalous ep.", scores.markov_anomalous_episodes != null ? `${scores.markov_anomalous_episodes} / ${scores.markov_scoreable_episodes}` : "—"],
+            ["Markov truncated ep.", scores.markov_short_episodes != null ? `${scores.markov_short_episodes} / ${scores.markov_total_episodes}` : "—"],
             ["is_outlier",     isOutlier ? "Yes" : "No"],
             ["Total events",   data.event_count],
-            ["Median gap",     vector.median_inter_event_seconds != null ? `${vector.median_inter_event_seconds.toFixed(1)}s` : "—"],
-            ["Gap CV",         vector.inter_event_cv != null ? vector.inter_event_cv.toFixed(3) : "—"],
           ].map(([label, value]) => (
             <div key={label} style={kvRow}>
               <span style={{ color: "#666" }}>{label}</span>

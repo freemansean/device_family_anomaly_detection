@@ -75,7 +75,6 @@ def _snapshot(finding: dict) -> dict:
         "health_components": finding.get("health_components") or {},
         "probable_pattern":  finding.get("probable_pattern"),
         "top_features":      (finding.get("top_features") or [])[:3],
-        "predominant_wlan":  finding.get("predominant_wlan"),
     }
 
 
@@ -197,7 +196,7 @@ async def record_cycle(
         await pipe.execute()
         log.debug(
             "alert_tracker: site=%s wlan=%s active=%d previously_active=%d",
-            site_id, wlan, len(active_families), len(current_active),
+            site_id, wlan, len(active_findings), len(current_active),
         )
 
     except Exception:
@@ -216,13 +215,13 @@ async def record_cycle(
 
 async def get_recent_sessions(
     days: int = 7,
-    wlan: str = "__all__",
+    wlan: str = "",
     redis_client=None,
 ) -> list[dict]:
     """
     Return all alert sessions (active and resolved) from the past `days` days.
 
-    If wlan != "__all__", only sessions for that exact wlan are returned.
+    If wlan is provided, only sessions for that exact WLAN are returned.
     Results are sorted oldest-first (ascending first_seen).
     """
     from .event_collector import sanitize_wlan_key
@@ -239,8 +238,8 @@ async def get_recent_sessions(
         if not session_keys:
             return []
 
-        # Filter by wlan scope when not __all__
-        if wlan != "__all__":
+        # Filter by wlan scope when a specific WLAN is requested
+        if wlan_key:
             session_keys = [k for k in session_keys if k.startswith(f"{k.split('||')[0]}||{wlan_key}||")]
 
         pipe = redis_client.pipeline()
