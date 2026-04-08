@@ -134,7 +134,7 @@ function healthColor(score) {
   return "#e05555";
 }
 
-export default function OrgFamilyDrilldown({ family, apiBase, onMacSiteSelect, onBack, wlan = "__all__" }) {
+export default function OrgFamilyDrilldown({ family, apiBase, onMacSiteSelect, onBack, wlan }) {
   const [data, setData]       = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError]     = useState(null);
@@ -175,6 +175,15 @@ export default function OrgFamilyDrilldown({ family, apiBase, onMacSiteSelect, o
       const av = computeMacHealth(a.categories) ?? 2;
       const bv = computeMacHealth(b.categories) ?? 2;
       return sortDir === "asc" ? av - bv : bv - av;
+    }
+    if (sortCol === "markov_ratio") {
+      // Flagged MACs sort above non-flagged; within each group sort by ratio descending
+      const aFlagged = a.is_markov_outlier ? 1 : 0;
+      const bFlagged = b.is_markov_outlier ? 1 : 0;
+      if (aFlagged !== bFlagged) return sortDir === "asc" ? bFlagged - aFlagged : aFlagged - bFlagged;
+      const av = a.markov_episode_anomaly_ratio ?? 0;
+      const bv = b.markov_episode_anomaly_ratio ?? 0;
+      return sortDir === "asc" ? bv - av : av - bv;
     }
     if (sortCol === "total_events") {
       return sortDir === "asc" ? a.total_events - b.total_events : b.total_events - a.total_events;
@@ -236,8 +245,10 @@ export default function OrgFamilyDrilldown({ family, apiBase, onMacSiteSelect, o
           />
           <div style={{ fontSize: "12px", color: "#666", marginBottom: "12px" }}>
             {data.total_count} clients across all sites.{" "}
-            <span style={{ color: "#e05555" }}>{data.if_outlier_count} flagged</span> by Isolation Forest.
-            Click column headers to sort. Click a row to open MAC drill-down.
+            <span style={{ color: "#e05555" }}>{data.if_outlier_count} flagged</span> by Isolation Forest.{" "}
+            <span style={{ color: "#e05555" }}>{data.dbscan_outlier_count} flagged</span> by DBSCAN.{" "}
+            <span style={{ color: "#e05555" }}>{data.markov_outlier_count} flagged</span> by Markov.
+            {" "}Click column headers to sort. Click a row to open MAC drill-down.
           </div>
 
           {sortedRows.length === 0 ? (
@@ -253,6 +264,7 @@ export default function OrgFamilyDrilldown({ family, apiBase, onMacSiteSelect, o
                     <SortTh col="if_score" style={{ minWidth: "120px" }}>IF Score</SortTh>
                     <th style={thStyle}>▲IF</th>
                     <th style={thStyle}>DBSCAN</th>
+                    <SortTh col="markov_ratio" style={{ minWidth: "80px" }}>Markov</SortTh>
                     {EVENT_CATEGORIES.map(cat => (
                       <SortTh key={cat} col={cat}>{CATEGORY_LABELS[cat]}</SortTh>
                     ))}
@@ -330,6 +342,30 @@ export default function OrgFamilyDrilldown({ family, apiBase, onMacSiteSelect, o
                             <span style={{ color: "#444", fontSize: "10px" }}>—</span>
                           )}
                         </td>
+                        <td style={{ ...tdStyle, textAlign: "center", minWidth: "80px" }}>
+                          {row.is_markov_outlier ? (
+                            <span
+                              title={`${row.markov_anomalous_episodes}/${row.markov_scoreable_episodes} episodes anomalous`}
+                              style={{
+                                color: "#4ab0e8", fontSize: "10px",
+                                background: "#0d2535", padding: "1px 5px",
+                                borderRadius: "3px", border: "1px solid #2a6a8a",
+                                whiteSpace: "nowrap",
+                              }}
+                            >
+                              {row.markov_scoreable_episodes > 0
+                                ? `${Math.round(row.markov_episode_anomaly_ratio * 100)}%`
+                                : "▲"}
+                            </span>
+                          ) : row.markov_scoreable_episodes > 0 ? (
+                            <span
+                              title={`${row.markov_anomalous_episodes}/${row.markov_scoreable_episodes} episodes anomalous`}
+                              style={{ color: "#2d7a4f", fontSize: "10px" }}
+                            >OK</span>
+                          ) : (
+                            <span style={{ color: "#333", fontSize: "10px" }}>—</span>
+                          )}
+                        </td>
                         {EVENT_CATEGORIES.map(cat => (
                           <td key={cat} style={{ ...tdStyle, color: (row.categories[cat] || 0) > 0 ? "#aaa" : "#333", textAlign: "right" }}>
                             {(row.categories[cat] || 0) > 0 ? row.categories[cat] : "—"}
@@ -347,7 +383,7 @@ export default function OrgFamilyDrilldown({ family, apiBase, onMacSiteSelect, o
           )}
 
           <div style={{ marginTop: "8px", fontSize: "11px", color: "#444" }}>
-            ▲ = Isolation Forest outlier within site peer group. DBSCAN = flagged site-wide. Click a row to open MAC timeline.
+            ▲IF = Isolation Forest outlier within site peer group. DBSCAN = flagged site-wide. Markov = % of connection episodes with anomalous event sequences (hover for episode counts). Click a row to open MAC timeline.
           </div>
         </>
       )}

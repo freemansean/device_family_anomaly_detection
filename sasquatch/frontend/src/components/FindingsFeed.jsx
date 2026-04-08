@@ -180,14 +180,29 @@ function AnomalyFindingCard({ finding, healthData, isAlert, expanded, onToggle, 
           <span style={{ color: "#666", fontSize: "12px" }}>
             {PATTERN_LABELS[finding.probable_pattern] || finding.probable_pattern}
           </span>
-          {(finding.wlan && finding.wlan !== "__all__" ? finding.wlan : finding.predominant_wlan) && (
+          {finding.wlan && (
             <span style={{ background: "#1a2a1a", color: "#7aaa7a", border: "1px solid #3a6a3a", borderRadius: "3px", padding: "2px 7px", fontSize: "10px" }}>
-              {finding.wlan !== "__all__" ? finding.wlan : finding.predominant_wlan}
+              {finding.wlan}
             </span>
           )}
           {finding.is_family_outlier && (
-            <span style={{ background: "#2a1a3a", color: "#b06ad4", border: "1px solid #6a3a8a", borderRadius: "3px", padding: "2px 7px", fontSize: "10px" }}>
-              family-wide
+            <span style={{ background: "#2a1a3a", color: "#b06ad4", border: "1px solid #6a3a8a", borderRadius: "3px", padding: "2px 7px", fontSize: "10px" }}
+              title="Centroid IF/distance: whole family's collective behavior differs from other families at this site">
+              IF family
+            </span>
+          )}
+          {finding.is_family_dbscan_outlier && (
+            <span style={{ background: "#1a2a1a", color: "#5ab86c", border: "1px solid #2a6a3a", borderRadius: "3px", padding: "2px 7px", fontSize: "10px" }}
+              title={`DBSCAN: ${(finding.dbscan_family_noise_ratio * 100).toFixed(0)}% of family MACs are site-wide behavioral outliers`}>
+              DBSCAN family
+            </span>
+          )}
+          {finding.is_family_markov_outlier && (
+            <span
+              style={{ background: "#1a2a3a", color: "#4ab0e8", border: "1px solid #2a6a8a", borderRadius: "3px", padding: "2px 7px", fontSize: "10px" }}
+              title={`Markov: ${finding.markov_family_anomalous_count}/${finding.markov_evaluatable_count} clients have anomalous event chain patterns (${finding.markov_family_anomaly_ratio != null ? (finding.markov_family_anomaly_ratio * 100).toFixed(0) + "%" : ""})`}
+            >
+              Markov {finding.markov_family_anomaly_ratio != null ? `${(finding.markov_family_anomaly_ratio * 100).toFixed(0)}%` : ""}
             </span>
           )}
           {isUnhealthy && (
@@ -332,7 +347,7 @@ function HealthOnlyCard({ family, data }) {
   );
 }
 
-export default function FindingsFeed({ siteId, apiBase, onMacSelect, refreshToken, wlan = "__all__" }) {
+export default function FindingsFeed({ siteId, apiBase, onMacSelect, refreshToken, wlan }) {
   const [findings, setFindings] = useState([]);
   const [health, setHealth]     = useState({});
   const [loading, setLoading]   = useState(true);
@@ -367,17 +382,24 @@ export default function FindingsFeed({ siteId, apiBase, onMacSelect, refreshToke
   const familyHealth      = (family) => health[family] ?? null;
   const familyHealthScore = (family) => health[family]?.health_score ?? 1.0;
 
-  // Partition findings: ALERT (anomalous + unhealthy) vs ANOMALOUS (anomalous, healthy)
-  const alertFindings     = findings.filter(f => familyHealthScore(f.device_family) < HEALTH_THRESHOLD);
-  const anomalousFindings = findings.filter(f => familyHealthScore(f.device_family) >= HEALTH_THRESHOLD);
+  // Partition findings into 4 detector classes (priority order to avoid duplication)
+  // IF Centroid: whole-family centroid flagged by IF/cosine-distance
+  const ifCentroidFindings = findings.filter(f => f.is_family_outlier);
+  // DBSCAN: family noise ratio above threshold, not already in IF Centroid
+  const dbscanFindings     = findings.filter(f => f.is_family_dbscan_outlier && !f.is_family_outlier);
+  // Markov: family event-chain anomaly ratio above threshold, not already in IF or DBSCAN
+  const markovFindings     = findings.filter(f => f.is_family_markov_outlier && !f.is_family_outlier && !f.is_family_dbscan_outlier);
+  // Catch-all for findings driven by per-MAC IF without a family-level flag (fold into IF section)
+  const ifDeviceFindings   = findings.filter(f => !f.is_family_outlier && !f.is_family_dbscan_outlier && !f.is_family_markov_outlier);
+  const ifSectionFindings  = [...ifCentroidFindings, ...ifDeviceFindings];
 
-  // HEALTH section: unhealthy families NOT in any anomaly finding
+  // GENERAL HEALTH: unhealthy families NOT triggering any anomaly finding
   const findingFamilies = new Set(findings.map(f => f.device_family));
   const healthOnlyFamilies = Object.entries(health)
     .filter(([fam, data]) => data.health_score < HEALTH_THRESHOLD && !findingFamilies.has(fam))
     .sort(([, a], [, b]) => a.health_score - b.health_score);
 
-  const hasAnything = alertFindings.length > 0 || healthOnlyFamilies.length > 0 || anomalousFindings.length > 0;
+  const hasAnything = ifSectionFindings.length > 0 || dbscanFindings.length > 0 || markovFindings.length > 0 || healthOnlyFamilies.length > 0;
 
   if (!hasAnything) {
     return <div style={{ color: "#2d7a4f", padding: "20px" }}>No anomalies detected. All device families behaving normally.</div>;
@@ -387,59 +409,67 @@ export default function FindingsFeed({ siteId, apiBase, onMacSelect, refreshToke
     setExpanded(prev => ({ ...prev, [idx]: !prev[idx] }));
   }
 
+  const IF_COLOR     = "#b06ad4";
+  const DBSCAN_COLOR = "#5ab86c";
+  const MARKOV_COLOR = "#4ab0e8";
+
+  function renderFindingCards(list, prefix) {
+    return list.map((finding, idx) => (
+      <AnomalyFindingCard
+        key={`${prefix}-${idx}`}
+        finding={finding}
+        healthData={familyHealth(finding.device_family)}
+        isAlert={familyHealthScore(finding.device_family) < HEALTH_THRESHOLD}
+        expanded={expanded[`${prefix}-${idx}`]}
+        onToggle={() => toggleExpand(`${prefix}-${idx}`)}
+        onMacSelect={onMacSelect}
+      />
+    ));
+  }
+
   return (
     <div>
       <h2 style={{ fontSize: "15px", color: "#aaa", marginBottom: "4px" }}>
         Anomaly Findings — {findings.length} active
       </h2>
 
-      {/* ALERT section */}
-      {alertFindings.length > 0 && (
+      {/* IF CENTROID — whole-family centroid outlier (+ per-device IF catch-all) */}
+      {ifSectionFindings.length > 0 && (
         <div>
-          <SectionHeader label="ALERT" color={ALERT_COLOR} count={alertFindings.length} />
+          <SectionHeader label="IF CENTROID" color={IF_COLOR} count={ifSectionFindings.length} />
           <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
-            {alertFindings.map((finding, idx) => (
-              <AnomalyFindingCard
-                key={`alert-${idx}`}
-                finding={finding}
-                healthData={familyHealth(finding.device_family)}
-                isAlert={true}
-                expanded={expanded[`alert-${idx}`]}
-                onToggle={() => toggleExpand(`alert-${idx}`)}
-                onMacSelect={onMacSelect}
-              />
-            ))}
+            {renderFindingCards(ifSectionFindings, "if")}
           </div>
         </div>
       )}
 
-      {/* HEALTH section — unhealthy families with no anomaly finding */}
+      {/* DBSCAN — % of device family are site-wide behavioral outliers */}
+      {dbscanFindings.length > 0 && (
+        <div>
+          <SectionHeader label="DBSCAN % OF FAMILY" color={DBSCAN_COLOR} count={dbscanFindings.length} />
+          <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
+            {renderFindingCards(dbscanFindings, "dbscan")}
+          </div>
+        </div>
+      )}
+
+      {/* MARKOV — % of device family have anomalous event-chain patterns */}
+      {markovFindings.length > 0 && (
+        <div>
+          <SectionHeader label="MARKOV % OF FAMILY" color={MARKOV_COLOR} count={markovFindings.length} />
+          <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
+            {renderFindingCards(markovFindings, "markov")}
+          </div>
+        </div>
+      )}
+
+      {/* GENERAL HEALTH — unhealthy families not triggering a behavioral anomaly */}
       {healthOnlyFamilies.length > 0 && (
         <div>
-          <SectionHeader label="HEALTH" color={HEALTH_COLOR} count={healthOnlyFamilies.length} />
+          <SectionHeader label="GENERAL HEALTH" color={HEALTH_COLOR} count={healthOnlyFamilies.length} />
           <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
             {healthOnlyFamilies.map(([fam, data]) => (
               <HealthOnlyCard key={fam} family={fam} data={data} />
-            ))}
-          </div>
-        </div>
-      )}
-
-      {/* ANOMALOUS section — anomalous but no health issue */}
-      {anomalousFindings.length > 0 && (
-        <div>
-          <SectionHeader label="ANOMALOUS" color={ANOMALY_COLOR.significant} count={anomalousFindings.length} />
-          <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
-            {anomalousFindings.map((finding, idx) => (
-              <AnomalyFindingCard
-                key={`anom-${idx}`}
-                finding={finding}
-                healthData={familyHealth(finding.device_family)}
-                isAlert={false}
-                expanded={expanded[`anom-${idx}`]}
-                onToggle={() => toggleExpand(`anom-${idx}`)}
-                onMacSelect={onMacSelect}
-              />
             ))}
           </div>
         </div>

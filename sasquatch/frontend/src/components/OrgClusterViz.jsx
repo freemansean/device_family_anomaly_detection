@@ -48,7 +48,7 @@ function subsample(points, max) {
   return [...outliers, ...sampled];
 }
 
-export default function OrgClusterViz({ apiBase, onMacSiteSelect, refreshToken, wlan = "__all__" }) {
+export default function OrgClusterViz({ apiBase, onMacSiteSelect, refreshToken, wlan }) {
   const [data, setData]             = useState(null);
   const [loading, setLoading]       = useState(true);
   const [error, setError]           = useState(null);

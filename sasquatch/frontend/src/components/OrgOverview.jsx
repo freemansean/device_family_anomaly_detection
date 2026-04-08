@@ -104,7 +104,7 @@ function SiteCard({ site, onClick }) {
   );
 }
 
-export default function OrgOverview({ apiBase, onSiteSelect, onMacSiteSelect, refreshToken, wlan = "__all__", onLoaded }) {
+export default function OrgOverview({ apiBase, onSiteSelect, onMacSiteSelect, refreshToken, wlan, onLoaded }) {
   const [summary, setSummary]       = useState(null);
   const [loading, setLoading]       = useState(true);
   const [error, setError]           = useState(null);

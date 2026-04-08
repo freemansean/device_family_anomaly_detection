@@ -14,7 +14,7 @@ multiplied back by event_count to recover volume-weighted totals per category.
 
 Redis key scheme:
   sasquatch:health:{site_id}:{wlan_key}
-  where wlan_key = "__all__" or a sanitized SSID name.
+  where wlan_key is a sanitized SSID name.
 """
 
 import json
@@ -36,7 +36,7 @@ _SUCCESS_CATS = ("AUTH_SUCCESS", "ROAM_SUCCESS", "DHCP_SUCCESS", "DNS_SUCCESS", 
 _FAILURE_CATS = ("AUTH_FAILURE", "ROAM_FAILURE", "DHCP_FAILURE", "DNS_FAILURE", "ARP_FAILURE")
 
 
-def _health_redis_key(site_id: str, wlan: str = "__all__") -> str:
+def _health_redis_key(site_id: str, wlan: str) -> str:
     return f"sasquatch:health:{site_id}:{sanitize_wlan_key(wlan)}"
 
 
@@ -138,7 +138,7 @@ def compute_family_health(features: dict[str, dict]) -> dict[str, dict]:
     return results
 
 
-async def score_health(site_id: str, wlan: str = "__all__") -> dict[str, dict]:
+async def score_health(site_id: str, wlan: str) -> dict[str, dict]:
     """
     Compute and store family health scores for the given site and WLAN scope.
     Reads feature vectors from Redis — feature_engineer.build_features() must
@@ -167,7 +167,7 @@ async def score_health(site_id: str, wlan: str = "__all__") -> dict[str, dict]:
     return health
 
 
-async def get_health(site_id: str, wlan: str = "__all__") -> dict[str, dict]:
+async def get_health(site_id: str, wlan: str) -> dict[str, dict]:
     """Read family health scores from Redis. Returns {} if not yet computed."""
     redis_client = aioredis.from_url(REDIS_URL, decode_responses=True)
     try:

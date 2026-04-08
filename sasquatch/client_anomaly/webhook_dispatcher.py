@@ -2,10 +2,13 @@
 webhook_dispatcher.py — Evaluate findings against dual alert gate and POST to webhook.
 
 A finding triggers the webhook only when BOTH conditions are true:
-  1. The device family is flagged as a family-level outlier by the centroid
-     Isolation Forest (is_family_outlier = True). This means the entire device
-     type is behaving differently from all other families at the site — not just
-     one misconfigured device.
+  1. The device family carries at least one anomaly label:
+       - is_family_outlier (centroid IF/distance) — whole family collectively differs
+         from all other families
+       - is_family_dbscan_outlier — fraction of DBSCAN noise MACs in the family
+         exceeds DBSCAN_FAMILY_NOISE_THRESHOLD (a site-wide clustering anomaly)
+       - is_family_markov_outlier — Markov Chain analysis found an anomalous event
+         chain pattern in >= MARKOV_FAMILY_OUTLIER_RATIO of the family's clients
   2. The family's health score is below ANOMALY_HEALTH_SCORE_THRESHOLD. This
      confirms that the behavioral anomaly is accompanied by measurable failure
      degradation, not just an unusual-but-healthy traffic pattern.
@@ -96,7 +99,7 @@ async def _post_with_retry(url: str, payload: dict) -> bool:
 
 async def evaluate_and_dispatch(
     site_id: str,
-    wlan: str = "__all__",
+    wlan: str,
     org_scope: bool = False,
 ) -> bool:
     """
@@ -107,8 +110,7 @@ async def evaluate_and_dispatch(
       - finding["is_family_outlier"] is True  (centroid IF flagged the whole family)
       - family health_score < HEALTH_SCORE_THRESHOLD (family is also measurably failing)
 
-    wlan: WLAN scope to evaluate. Defaults to "__all__" (cross-WLAN findings).
-      Pass a specific SSID to evaluate that WLAN's scoped findings independently.
+    wlan: WLAN scope to evaluate (specific SSID name, required).
     org_scope=True: read from org-wide findings/health keys instead of per-site keys.
 
     Returns True if webhook was sent (or no qualifying findings), False on delivery failure.
@@ -125,8 +127,14 @@ async def evaluate_and_dispatch(
         family = f.get("device_family", "")
         severity = f.get("severity", "")
 
-        # Gate 1: must be a family-level behavioral anomaly
-        if not f.get("is_family_outlier", False):
+        # Gate 1: must carry at least one family-level anomaly label
+        # (centroid IF/distance, DBSCAN family noise, or Markov Chain)
+        is_any_family_anomaly = (
+            f.get("is_family_outlier", False)
+            or f.get("is_family_dbscan_outlier", False)
+            or f.get("is_family_markov_outlier", False)
+        )
+        if not is_any_family_anomaly:
             continue
 
         # Gate 2: family health score must be below threshold
@@ -134,8 +142,11 @@ async def evaluate_and_dispatch(
         health_score = family_health.get("health_score", 1.0)
         if health_score >= HEALTH_SCORE_THRESHOLD:
             log.debug(
-                f"[{wlan}] Skipping webhook for [{family}]: is_family_outlier=True but "
-                f"health_score={health_score:.3f} >= threshold {HEALTH_SCORE_THRESHOLD}"
+                "[%s] Skipping webhook for [%s]: family anomaly label present but "
+                "health_score=%.3f >= threshold %.3f (if=%s dbscan=%s markov=%s)",
+                wlan, family, health_score, HEALTH_SCORE_THRESHOLD,
+                f.get("is_family_outlier"), f.get("is_family_dbscan_outlier"),
+                f.get("is_family_markov_outlier"),
             )
             continue
 

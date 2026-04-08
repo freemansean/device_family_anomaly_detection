@@ -120,7 +120,7 @@ function healthColor(score) {
   return "#e05555";
 }
 
-export default function FamilyDrilldown({ siteId, family, apiBase, onMacSelect, onBack, refreshToken, wlan = "__all__" }) {
+export default function FamilyDrilldown({ siteId, family, apiBase, onMacSelect, onBack, refreshToken, wlan }) {
   const [ifData, setIfData] = useState(null);
   const [ifLoading, setIfLoading] = useState(true);
   const [ifError, setIfError] = useState(null);
@@ -180,6 +180,8 @@ export default function FamilyDrilldown({ siteId, family, apiBase, onMacSelect, 
         if_score: client.if_score,
         is_if_outlier: client.is_if_outlier,
         is_dbscan_outlier: client.is_dbscan_outlier,
+        is_markov_outlier: client.is_markov_outlier,
+        markov_episode_anomaly_ratio: client.markov_episode_anomaly_ratio,
         event_count: client.event_count,
         categories: ev.categories || {},
         total_events: ev.total_events ?? client.event_count,
@@ -285,6 +287,7 @@ export default function FamilyDrilldown({ siteId, family, apiBase, onMacSelect, 
                     <SortTh col="if_score" style={{ minWidth: "120px" }}>IF Score</SortTh>
                     <th style={thStyle}>▲IF</th>
                     <th style={thStyle}>DBSCAN</th>
+                    <th style={thStyle}>Markov</th>
                     {/* Event category columns */}
                     {EVENT_CATEGORIES.map((cat) => (
                       <SortTh key={cat} col={cat}>{CATEGORY_LABELS[cat]}</SortTh>
@@ -364,6 +367,21 @@ export default function FamilyDrilldown({ siteId, family, apiBase, onMacSelect, 
                             <span style={{ color: "#444", fontSize: "10px" }}>—</span>
                           )}
                         </td>
+                        <td style={{ ...tdStyle, textAlign: "center" }}>
+                          {row.is_markov_outlier ? (
+                            <span style={{
+                              color: "#4ab0e8", fontSize: "10px",
+                              background: "#1a2a3a", padding: "1px 5px",
+                              borderRadius: "3px", border: "1px solid #2a6a8a",
+                            }}
+                              title={row.markov_episode_anomaly_ratio != null ? `${(row.markov_episode_anomaly_ratio * 100).toFixed(0)}% of episodes anomalous` : "Markov chain outlier"}
+                            >
+                              {row.markov_episode_anomaly_ratio != null ? `${(row.markov_episode_anomaly_ratio * 100).toFixed(0)}%` : "chain"}
+                            </span>
+                          ) : (
+                            <span style={{ color: "#333", fontSize: "10px" }}>—</span>
+                          )}
+                        </td>
                         {EVENT_CATEGORIES.map((cat) => (
                           <td key={cat} style={{ ...tdStyle, color: (row.categories[cat] || 0) > 0 ? "#aaa" : "#333", textAlign: "right" }}>
                             {(row.categories[cat] || 0) > 0 ? row.categories[cat] : "—"}
@@ -384,7 +402,7 @@ export default function FamilyDrilldown({ siteId, family, apiBase, onMacSelect, 
           )}
 
           <div style={{ marginTop: "8px", fontSize: "11px", color: "#444" }}>
-            Click a row to open the MAC drill-down timeline. ▲ = Isolation Forest outlier. DBSCAN = flagged site-wide.
+            Click a row to open the MAC drill-down timeline. ▲ = Isolation Forest outlier. DBSCAN = flagged site-wide. Markov = anomalous event chain pattern.
           </div>
         </>
       )}

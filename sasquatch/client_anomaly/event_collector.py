@@ -219,9 +219,7 @@ def sanitize_wlan_key(wlan: str) -> str:
     Sanitize a WLAN (SSID) name for safe use as a Redis key segment.
     Replaces colons, slashes, and whitespace with hyphens.
     """
-    if not wlan or wlan == "__all__":
-        return "__all__"
-    return re.sub(r"[:/\s]", "-", wlan) or "__all__"
+    return re.sub(r"[:/\s]", "-", wlan) if wlan else ""
 
 
 async def fetch_event_type_index() -> list[str]:
@@ -526,7 +524,7 @@ async def _load_events_from_site_sets(
 
     events = [json.loads(m) for batch in results for m in batch]
 
-    if wlan and wlan != "__all__":
+    if wlan:
         events = [e for e in events if e.get("wlan") == wlan]
 
     return events
@@ -605,10 +603,16 @@ async def collect(site_id: str, duration: str = "1h") -> int:
     redis_client = aioredis.from_url(REDIS_URL, decode_responses=True)
     try:
         client_cache = await get_client_cache(site_id)
-        if not client_cache:
+        if client_cache is None:
             raise RuntimeError(
                 f"Client cache missing for site {site_id}. "
                 "Run client_cache.refresh_client_cache() first."
+            )
+        if not client_cache:
+            log.warning(
+                f"Client cache is empty for site {site_id} — "
+                "proceeding with OUI-only enrichment. "
+                "Run client_cache.refresh_client_cache() to populate."
             )
 
         new_raw = await fetch_all_events(site_id, duration=duration)
@@ -656,10 +660,15 @@ async def collect_full(site_id: str, on_page: Optional[callable] = None) -> int:
     redis_client = aioredis.from_url(REDIS_URL, decode_responses=True)
     try:
         client_cache = await get_client_cache(site_id)
-        if not client_cache:
+        if client_cache is None:
             raise RuntimeError(
                 f"Client cache missing for site {site_id}. "
                 "Run client_cache.refresh_client_cache() first."
+            )
+        if not client_cache:
+            log.warning(
+                f"Client cache is empty for site {site_id} — "
+                "proceeding with OUI-only enrichment."
             )
 
         events = await fetch_all_events(site_id, duration="1d", on_page=on_page)
@@ -687,14 +696,14 @@ async def get_events(
 ) -> list[dict]:
     """
     Load events from per-site sorted sets, optionally filtered by site and/or WLAN.
-    wlan=None or wlan="__all__" returns all WLANs.
+    wlan=None returns all events regardless of WLAN.
     """
     redis_client = aioredis.from_url(REDIS_URL, decode_responses=True)
     try:
         return await _load_events_from_site_sets(
             redis_client,
             site_id=site_id,
-            wlan=wlan if (wlan and wlan != "__all__") else None,
+            wlan=wlan,
         )
     finally:
         await redis_client.aclose()

@@ -122,9 +122,9 @@ function AlertCard({ finding, onFamilyClick }) {
           <span style={{ color: "#666", fontSize: "12px" }}>
             {PATTERN_LABELS[finding.probable_pattern] || finding.probable_pattern}
           </span>
-          {(finding.wlan && finding.wlan !== "__all__" ? finding.wlan : finding.predominant_wlan) && (
+          {finding.wlan && (
             <span style={{ background: "#1a2a1a", color: "#7aaa7a", border: "1px solid #3a6a3a", borderRadius: "3px", padding: "2px 7px", fontSize: "10px" }}>
-              {finding.wlan !== "__all__" ? finding.wlan : finding.predominant_wlan}
+              {finding.wlan}
             </span>
           )}
           {finding.is_family_outlier && (
@@ -243,7 +243,7 @@ function SiteAlertGroup({ siteAlert, onFamilyClick }) {
   );
 }
 
-export default function OrgAlerts({ apiBase, onMacSiteSelect, refreshToken, wlan = "__all__" }) {
+export default function OrgAlerts({ apiBase, onMacSiteSelect, refreshToken, wlan }) {
   const [data, setData]               = useState(null);
   const [loading, setLoading]         = useState(true);
   const [error, setError]             = useState(null);
@@ -504,7 +504,7 @@ function HistoryRow({ alarm }) {
   const failureComponents = alarm.health_components
     ? Object.entries(alarm.health_components).filter(([, rate]) => rate > 0)
     : [];
-  const wlanDisplay = alarm.wlan !== "__all__" ? alarm.wlan : alarm.predominant_wlan;
+  const wlanDisplay = alarm.wlan;
 
   return (
     <div style={{

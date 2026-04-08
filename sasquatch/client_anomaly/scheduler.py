@@ -5,13 +5,14 @@ Jobs:
 - client_refresh_job: Daily at 00:00 — refresh client device cache.
 - event_and_detect_job: Every SITE_FOCUS_DETECTION_INTERVAL minutes — collect events for the focus site and run detection.
 
-Detection now runs for each unique WLAN present in the site's event data, plus a
-combined "__all__" pass that uses events across all WLANs. This allows the frontend
-to display WLAN-scoped anomaly findings.
+Detection runs independently for each unique WLAN present in the site's event data.
+Every event must have a WLAN (SSID) associated with it; there is no cross-WLAN
+combined scope. This allows the frontend to display per-WLAN anomaly findings.
 """
 
 import logging
 import os
+from datetime import datetime, timezone
 
 import httpx
 import redis.asyncio as aioredis
@@ -19,9 +20,11 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from .anomaly_detector import score, score_org_wide
 from .client_cache import get_client_cache, refresh_client_cache
-from .event_collector import collect, collect_full, get_wlans, reenrich_stale_events
+from .event_collector import collect, collect_full, ensure_event_type_index, get_wlans, reenrich_stale_events
 from .feature_engineer import build_features, get_features
 from .health_scorer import score_health
+from .markov_analyzer import baseline_exists as markov_baseline_exists
+from .markov_analyzer import build_and_store_baseline as build_markov_baseline
 from .webhook_dispatcher import evaluate_and_dispatch
 
 log = logging.getLogger(__name__)
@@ -92,10 +95,10 @@ async def _run_wlan_detection(
     org_pools: "dict[str, dict[str, list[dict]]] | None" = None,
 ) -> dict:
     """
-    Build features and run anomaly scoring for __all__ WLANs plus each unique WLAN
-    found in the site's event data. Webhook dispatch runs per WLAN scope so that
-    WLAN-scoped anomalies (e.g. Windows anomalous on COWS but not All WLANs) are
-    independently evaluated and can trigger alerts.
+    Build features and run anomaly scoring for each unique WLAN found in the site's
+    event data. Webhook dispatch runs per WLAN scope so that WLAN-scoped anomalies
+    (e.g. Windows anomalous on one WLAN but not another) are independently evaluated
+    and can trigger alerts.
 
     org_pools: optional {wlan: {family: [feature_records from OTHER sites]}} used to
       supplement small device families that would otherwise be skipped by IF.
@@ -103,24 +106,53 @@ async def _run_wlan_detection(
     Returns summary dict with total MACs scored and WLAN count.
     """
     wlans = await get_wlans(site_id=site_id)
-    scopes = ["__all__"] + wlans
-    log.info(f"[wlan detection] Site {site_id}: running {len(scopes)} scope(s): {scopes}")
+    if not wlans:
+        log.info(f"[wlan detection] Site {site_id}: no WLANs detected — skipping detection")
+        return {"macs_scored": 0, "wlan_scopes": 0}
+
+    log.info(f"[wlan detection] Site {site_id}: running {len(wlans)} WLAN scope(s): {wlans}")
 
     total_macs = 0
-    for wlan in scopes:
+    _redis_for_baseline = aioredis.from_url(REDIS_URL, decode_responses=True)
+    try:
+        event_type_index = await ensure_event_type_index(_redis_for_baseline)
+        for wlan in wlans:
+            if not await markov_baseline_exists(site_id, wlan, _redis_for_baseline):
+                log.info(
+                    "[wlan detection] No Markov baseline for site=%s wlan=%s — building now",
+                    site_id, wlan,
+                )
+                try:
+                    result = await build_markov_baseline(site_id, wlan, event_type_index)
+                    log.info(
+                        "[wlan detection] Markov baseline built: site=%s wlan=%s "
+                        "macs=%d events=%d episodes=%d",
+                        site_id, wlan,
+                        result.get("macs", 0),
+                        result.get("events", 0),
+                        result.get("normal_episodes", 0),
+                    )
+                except Exception:
+                    log.exception(
+                        "[wlan detection] Failed to build Markov baseline for site=%s wlan=%s",
+                        site_id, wlan,
+                    )
+    finally:
+        await _redis_for_baseline.aclose()
+
+    for wlan in wlans:
         try:
             mac_count = await build_features(site_id, wlan)
             await score_health(site_id, wlan)
             org_ctx = org_pools.get(wlan) if org_pools else None
             scored = await score(site_id, wlan, org_family_contexts=org_ctx)
             log.info(f"[wlan detection] site={site_id} wlan={wlan}: {scored} MACs scored")
-            if wlan == "__all__":
-                total_macs = scored
+            total_macs = max(total_macs, scored)
             await evaluate_and_dispatch(site_id, wlan=wlan)
         except Exception:
             log.exception(f"[wlan detection] Failed for site={site_id} wlan={wlan}")
 
-    return {"macs_scored": total_macs, "wlan_scopes": len(scopes)}
+    return {"macs_scored": total_macs, "wlan_scopes": len(wlans)}
 
 
 async def build_org_pools(
@@ -140,7 +172,7 @@ async def build_org_pools(
     for sid in site_ids:
         if sid == exclude_site:
             continue
-        for wlan in ["__all__"] + wlans_by_site.get(sid, []):
+        for wlan in wlans_by_site.get(sid, []):
             features = await get_features(sid, wlan)
             if not features:
                 continue
@@ -291,7 +323,7 @@ async def event_and_detect_job():
         for sid in site_ids:
             try:
                 cache = await get_client_cache(sid)
-                if not cache:
+                if cache is None:
                     log.info(f"[org] Client cache missing for site {sid} — refreshing")
                     await refresh_client_cache(sid)
                 await run_detection_cycle(sid)
@@ -367,14 +399,28 @@ async def org_cross_site_detect_job() -> None:
         # Step 1: Ensure client caches are warm, then collect events for all sites.
         # Use the org job's interval as the collection window so non-focused sites
         # receive complete event coverage between org cycles (not just the last hour).
+        # Acquire the per-site lock before collecting to avoid a duplicate Mist API
+        # call when event_and_detect_job is already running collect() for the same site.
+        # If the lock is held, skip collection and use whatever events are already in Redis.
         org_duration = f"{ORG_DETECTION_INTERVAL_HOURS}h"
         for sid in site_ids:
             try:
                 cache = await get_client_cache(sid)
-                if not cache:
+                if cache is None:
                     log.info(f"[org-detect] Client cache missing for site {sid} — refreshing")
                     await refresh_client_cache(sid)
-                await collect(sid, duration=org_duration)
+                lock_client, lock_acquired = await _acquire_lock(sid)
+                if not lock_acquired:
+                    await lock_client.aclose()
+                    log.info(
+                        f"[org-detect] Site {sid}: per-site cycle in progress — "
+                        "skipping duplicate collect, using existing Redis events"
+                    )
+                else:
+                    try:
+                        await collect(sid, duration=org_duration)
+                    finally:
+                        await _release_lock(lock_client, sid)
             except Exception:
                 log.exception(f"[org-detect] Event collection failed for site {sid}")
 
@@ -384,19 +430,19 @@ async def org_cross_site_detect_job() -> None:
             try:
                 wlans = await get_wlans(site_id=sid)
                 wlans_by_site[sid] = wlans
-                for wlan in ["__all__"] + wlans:
+                for wlan in wlans:
                     await build_features(sid, wlan)
                     await score_health(sid, wlan)
                 log.info(
                     f"[org-detect] Features built for site {sid}: "
-                    f"{len(wlans) + 1} WLAN scope(s)"
+                    f"{len(wlans)} WLAN scope(s)"
                 )
             except Exception:
                 log.exception(f"[org-detect] Feature build failed for site {sid}")
                 wlans_by_site.setdefault(sid, [])
 
         # Step 3: Determine the union of all WLAN scopes across the org.
-        all_wlans: set[str] = {"__all__"}
+        all_wlans: set[str] = set()
         for wlans in wlans_by_site.values():
             all_wlans.update(wlans)
 
@@ -439,6 +485,72 @@ async def org_cross_site_detect_job() -> None:
         await lock_release_client.aclose()
 
 
+async def markov_baseline_job() -> None:
+    """
+    Daily job: build Markov Chain transition matrix baselines for all site/wlan combinations.
+
+    Runs at 00:30 (30 minutes after the client cache refresh at 00:00) so that any
+    newly-refreshed client enrichment is reflected in the baseline events before the
+    matrix is built.
+
+    For each site and each WLAN scope, loads the last 24hr of events from Redis and
+    computes:
+      - Event-level NxN transition count matrix (Laplace-smoothed, row-normalized)
+      - Episode-type 2x2 transition count matrix (short/normal episode states)
+
+    Stored at sasquatch:markov_baseline:{site_id}:{wlan_key} with 48hr TTL.
+    On first deploy (no events yet) the key is simply not written — the detection cycle
+    will skip Markov scoring until the next daily run after events are collected.
+    """
+    site_id = await _get_focus_site()
+    if not site_id:
+        log.error("[markov baseline] No focus site configured — skipping")
+        return
+
+    redis_client = aioredis.from_url(REDIS_URL, decode_responses=True)
+    try:
+        event_type_index = await ensure_event_type_index(redis_client)
+    finally:
+        await redis_client.aclose()
+
+    if site_id == ORG_FOCUS_VALUE:
+        site_ids = await _get_org_sites()
+        if not site_ids:
+            log.error("[markov baseline] Org focus set but no sites returned — skipping")
+            return
+        for sid in site_ids:
+            try:
+                wlans = await get_wlans(site_id=sid)
+                for wlan in wlans:
+                    result = await build_markov_baseline(sid, wlan, event_type_index)
+                    log.info(
+                        "[markov baseline] site=%s wlan=%s: %d MACs, %d events, "
+                        "%d normal episodes",
+                        sid, wlan,
+                        result.get("macs", 0),
+                        result.get("events", 0),
+                        result.get("normal_episodes", 0),
+                    )
+            except Exception:
+                log.exception("[markov baseline] Failed for site=%s", sid)
+        return
+
+    try:
+        wlans = await get_wlans(site_id=site_id)
+        for wlan in wlans:
+            result = await build_markov_baseline(site_id, wlan, event_type_index)
+            log.info(
+                "[markov baseline] site=%s wlan=%s: %d MACs, %d events, "
+                "%d normal episodes",
+                site_id, wlan,
+                result.get("macs", 0),
+                result.get("events", 0),
+                result.get("normal_episodes", 0),
+            )
+    except Exception:
+        log.exception("[markov baseline] Failed for site=%s", site_id)
+
+
 def create_scheduler() -> AsyncIOScheduler:
     scheduler = AsyncIOScheduler()
 
@@ -450,6 +562,21 @@ def create_scheduler() -> AsyncIOScheduler:
         minute=0,
         id="client_refresh",
         name="Client Cache Refresh",
+    )
+
+    # Daily at 00:30 — Markov baseline rebuild (after client cache refresh).
+    # Also runs immediately at startup so the baseline is available without
+    # waiting up to 24 hours after a fresh deployment or service restart.
+    # If no events are in Redis yet, the job exits early without writing anything
+    # and the nightly run will populate the baseline once events accumulate.
+    scheduler.add_job(
+        markov_baseline_job,
+        "cron",
+        hour=0,
+        minute=30,
+        id="markov_baseline",
+        name="Markov Chain Baseline Rebuild",
+        next_run_time=datetime.now(timezone.utc),
     )
 
     # Periodic per-site detection cycle
