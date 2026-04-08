@@ -231,8 +231,33 @@ no PCA applied there. `pca.n_components_` is logged at INFO each cycle.
 
 ---
 
-### 14. Feature vectors collapse time — episode-based roam/auth storm detection missing
-**Files:** `sasquatch/client_anomaly/feature_engineer.py`, `sasquatch/client_anomaly/health_scorer.py`
+### ~~14. Feature vectors collapse time — episode-based roam/auth storm detection missing~~ RESOLVED
+**Files:** `sasquatch/client_anomaly/markov_analyzer.py` (new), `sasquatch/client_anomaly/anomaly_detector.py`, `sasquatch/client_anomaly/scheduler.py`
+
+Two-layer Markov Chain episode analysis implemented as Stage 4 in `anomaly_detector.py`:
+- **Layer 1 — Event-level transition matrix:** A site/wlan-scoped NxN matrix is built from all
+  consecutive event-type pairs in normal-length episodes over the last 24hr. Each episode is
+  scored by mean log-probability of its transitions against this baseline. Episodes below
+  `MARKOV_EPISODE_LOG_PROB_THRESHOLD` (-4.0) are flagged anomalous.
+- **Layer 2 — Episode-type state machine:** Tracks a "short" (failed, < `MARKOV_MIN_EPISODE_LENGTH`
+  events) vs "normal" episode-type sequence per MAC. A MAC stuck repeatedly cycling through
+  short episodes (e.g., connect → DHCP_NAK → disconnect, repeated) is flagged as having
+  `has_repeated_short_episodes = True`.
+
+The baseline is built from Redis events once per day by `markov_baseline_job` (00:30 daily) and
+stored in `sasquatch:markov_baseline:{site_id}:{wlan_key}` with a 48hr TTL. Detection builds the
+baseline on first run if it is absent. New family-level flag `is_family_markov_outlier` bypasses
+`FINDING_THRESHOLD` — a family where enough clients have anomalous episode patterns generates a
+finding regardless of the combined IF/DBSCAN MAC-level outlier ratio.
+
+**Previously proposed episode-detection approach (feature vector extensions):**
+The proposed additions (`max_episode_ap_count`, `max_episode_failure_rate`, etc.) were not
+implemented — the Markov approach provides episode-level anomaly detection without requiring
+changes to the feature vector schema or the IF/DBSCAN pipeline. Cross-AP blast-radius detection
+(PMKID storm hitting 20 APs simultaneously) remains unimplemented in the Markov layer; the
+transition matrix captures event-type sequences but not the spatial dimension (AP count).
+
+**Remaining gap:** Original issue — filed under `sasquatch/client_anomaly/feature_engineer.py`, `sasquatch/client_anomaly/health_scorer.py`
 
 The current feature vector is a 24hr ratio snapshot. A client that was perfectly healthy
 for 3 hours, endured 5 minutes of complete roaming chaos across 20 APs, and then recovered
@@ -300,6 +325,38 @@ those get diluted in the 24hr ratio alongside the quiet periods.
   full re-auth. Surface this as a distinct `probable_pattern` value.
 
 ---
+
+### 21. Markov baseline warm-up delay on first deployment / flush
+**Files:** `sasquatch/client_anomaly/markov_analyzer.py`, `sasquatch/client_anomaly/scheduler.py`
+
+The Markov baseline requires 24hr of events to build a meaningful transition matrix.
+On first deployment (or after `POST /api/v1/org/flush`), the baseline key is absent and
+the first detection cycle builds it on-demand from whatever events are already in Redis
+— which may be hours short of 24hr. Stage 4 is silently skipped until the baseline is
+available, which is the correct behavior, but there is no operator-visible signal that
+Markov scoring is inactive.
+
+**Fix:** Surface `markov_baseline_age_hours` (or `markov_baseline_built_at`) in the
+`GET /api/v1/sites/{site_id}/status` response and display it in the dashboard status bar
+alongside the last detection timestamp.
+
+---
+
+### 22. Markov transition matrix does not capture cross-AP blast radius
+**Files:** `sasquatch/client_anomaly/markov_analyzer.py`
+
+The Markov event-level analysis captures *what types of events* happen in sequence, but
+not *how many distinct APs* are involved in a failure episode. The PMKID storm described
+in item 14 (20 APs rejecting the same client's PMKID within 3 minutes) would show an
+anomalous `FBT_FAILURE → FBT_FAILURE` transition sequence, but the transition score
+cannot distinguish "2 failures at the same AP" from "20 failures across 20 APs."
+
+**Proposed addition:**
+- Add `max_episode_ap_count` feature to the Markov episode record: count of distinct APs
+  in the episode. If > `MARKOV_BLAST_RADIUS_AP_THRESHOLD` (env, default 5), add to the
+  episode's anomaly score regardless of transition probability.
+- This would make `pmkid_storm_episode` (≥5 distinct APs returning FBT status:53 in 90s)
+  detectable as a distinct high-confidence pattern.
 
 ---
 

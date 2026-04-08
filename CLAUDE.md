@@ -12,16 +12,16 @@ Detects anomalous client behavior at a Juniper Mist site by:
 1. Building a 24-hour client device database (MAC → device metadata)
 2. Pulling all client events for the site over the last 24 hours
 3. Engineering per-MAC behavioral feature vectors
-4. Running a two-stage ML detection pipeline (see `anomaly_detector.py`):
+4. Running a four-stage ML detection pipeline (see `anomaly_detector.py`):
    - **Stage 1 — DBSCAN** (site-wide): flags MACs that don't cluster with any site peer group
    - **Stage 1b — Family Centroid IF**: flags entire device families behaving differently from all other families
    - **Stage 2 — Isolation Forest** (per device family): flags individual MACs anomalous within their family
+   - **Stage 4 — Markov Chain** (see `markov_analyzer.py`): scores event-transition sequences within episodes against a 24hr site baseline; flags families where ≥ `MARKOV_FAMILY_OUTLIER_RATIO` of clients have anomalous connection patterns or repeated short (failed) episodes
 5. Computing a separate per-family **Health Score** (see `health_scorer.py`): mean of per-MAC
    failure rates across AUTH, ROAM, DHCP, DNS, and ARP — independent of the anomaly pipeline
 6. Rolling up MAC-level anomalies to device type findings
 7. Exposing findings via a React + FastAPI dashboard
-8. Firing a webhook only when a device family is **both** a behavioral outlier (centroid IF) **and**
-   unhealthy (health score below threshold) — dual-gate to prevent single-device noise
+8. Firing a webhook when a device family carries **any** family-level anomaly label (is_family_outlier, is_family_dbscan_outlier, or is_family_markov_outlier) **and** is unhealthy (health score below threshold) — dual-gate to prevent single-device noise
 
 **This module has NO LLM in the detection path.** Pure ML + rule-based only.
 Client event data must not egress to third-party providers. Do not add any LLM calls to detection or scoring code.
@@ -82,7 +82,8 @@ sasquatch/
 │   ├── client_cache.py          # Daily client list refresh → Redis
 │   ├── event_collector.py       # 24hr event pull + MAC enrichment → Redis
 │   ├── feature_engineer.py      # Per-MAC feature vector construction
-│   ├── anomaly_detector.py      # Isolation Forest + DBSCAN scoring
+│   ├── anomaly_detector.py      # Four-stage ML pipeline (DBSCAN/IF/Markov) + finding rollup
+│   ├── markov_analyzer.py       # Markov Chain episode analysis (Stage 4)
 │   ├── health_scorer.py         # Per-family health score (separate from anomaly pipeline)
 │   ├── webhook_dispatcher.py    # Dual-gate alert dispatch (anomaly + health)
 │   ├── alert_tracker.py         # Persistent alert session history (7-day, per-site)
@@ -97,8 +98,8 @@ sasquatch/
 │       │   ├── OrgOverview.jsx          # Org four-tab shell: Org Alerts (default), Org Overview, Org Family Insights, Findings
 │       │   ├── OrgAlerts.jsx            # Default org view: org-wide + per-site dual-gate alerts with family drilldown
 │       │   ├── OrgFamilyInsights.jsx    # Org-wide family heatmap + health column
-│       │   ├── FindingsFeed.jsx         # Site findings: ALERT → HEALTH → ANOMALOUS sections
-│       │   ├── OrgFindingsFeed.jsx      # Org findings: same three-section layout, family name drills down to OrgFamilyDrilldown
+│       │   ├── FindingsFeed.jsx         # Site findings: IF CENTROID → DBSCAN % → MARKOV % → HEALTH sections
+│       │   ├── OrgFindingsFeed.jsx      # Org findings: same detector-section layout, family name drills down to OrgFamilyDrilldown
 │       │   └── MacDrilldown.jsx         # Per-MAC 24hr timeline + feature breakdown
 │       └── App.jsx
 ├── .env                         # See env vars section below
@@ -116,7 +117,8 @@ sasquatch/
 | `sasquatch:wlans:{site_id}` | 7 days | Set: unique SSID names seen for this site |
 | `sasquatch:event_type_index` | 7 days | JSON array: ordered list of known Mist client event type strings |
 | `sasquatch:features:{site_id}:{wlan_key}` | 24hr | JSON dict: MAC → feature vector dict |
-| `sasquatch:anomalies:{site_id}:{wlan_key}` | 24hr | JSON dict: MAC → {if_score, dbscan_label, is_outlier, is_family_outlier, …} |
+| `sasquatch:anomalies:{site_id}:{wlan_key}` | 24hr | JSON dict: MAC → {if_score, dbscan_label, is_outlier, is_family_outlier, is_markov_outlier, markov_episode_anomaly_ratio, …} |
+| `sasquatch:markov_baseline:{site_id}:{wlan_key}` | 48hr | JSON dict: {transition_counts, episode_transition_counts, event_type_index, computed_at} |
 | `sasquatch:health:{site_id}:{wlan_key}` | 24hr | JSON dict: family → {health_score, components, total_events, mac_count} |
 | `sasquatch:findings:{site_id}:{wlan_key}` | 24hr | JSON array: rolled-up findings for GUI + webhook |
 | `sasquatch:org_anomalies:{site_id}:{wlan_key}` | 24hr | JSON dict: per-MAC org-wide scores (written by `score_org_wide`) |
@@ -538,7 +540,7 @@ feature vectors concatenated with the component-wise maximum. This is then fed i
 two methods depending on how many qualifying families are present:
 
 - **N < `ANOMALY_CENTROID_IF_MIN_FAMILIES` (default 3):** Step skipped entirely. `is_family_outlier` remains False.
-- **`ANOMALY_CENTROID_IF_MIN_FAMILIES` ≤ N ≤ `ANOMALY_CENTROID_DIST_MAX_FAMILIES` (default 8):** Cosine-distance fallback. The element-wise median of all scaled family centroid rows is used as the population reference point (median rather than mean to resist the masking effect — an anomalous family shifts the mean toward itself). Each family's cosine distance from that reference is computed. Families exceeding `ANOMALY_CENTROID_DIST_THRESHOLD` (default 0.35) are flagged.
+- **`ANOMALY_CENTROID_IF_MIN_FAMILIES` ≤ N ≤ `ANOMALY_CENTROID_DIST_MAX_FAMILIES` (default 8):** Cosine-distance fallback. Each family row is L2-normalized to a unit vector before computing distances (cosine distance is scale-invariant but requires non-zero-magnitude vectors — do NOT use StandardScaler here as it makes rows zero-mean and causes the median reference to approach the zero vector, producing spuriously high distances everywhere). The element-wise median of all L2-normalized rows is re-normalized to a unit vector and used as the population reference. Each family's cosine distance from that reference is computed. Families exceeding `ANOMALY_CENTROID_DIST_THRESHOLD` (default 0.55) are flagged.
 - **N > `ANOMALY_CENTROID_DIST_MAX_FAMILIES`:** Full `IsolationForest` run across all family centroid rows. Families with `decision_function < 0` are flagged.
 
 The cosine-distance path exists because IF is statistically unreliable at small N (5–8 rows): contamination-derived thresholds carry little statistical meaning and scores can be noisy between cycles. The distance approach is simpler, more stable, and produces interpretable scores that can be logged and monitored.
@@ -701,8 +703,7 @@ is omitted from the payload.
     {
       "device_family": "iPhone",
       "severity": "significant",
-      "wlan": "__all__",
-      "predominant_wlan": "Corp-WiFi",
+      "wlan": "Corp-WiFi",
       "outlier_ratio": 0.72,
       "affected_mac_count": 18,
       "is_family_outlier": true,
@@ -771,9 +772,9 @@ lookup — NO LLM (rule-based only, no network calls). Evaluated in priority ord
 Do not raise exceptions that would kill the scheduler job on webhook failure.
 
 **Alert history tracking:** After computing `qualifying`, `evaluate_and_dispatch` calls
-`alert_tracker.record_cycle(site_id, "__all__", active_families)` regardless of whether
-`ANOMALY_WEBHOOK_URL` is configured, so history is always recorded. An empty `active_families`
-set resolves any previously-active sessions for that site. Skipped for `org_scope=True`
+`alert_tracker.record_cycle(site_id, wlan, active_findings)` regardless of whether
+`ANOMALY_WEBHOOK_URL` is configured, so history is always recorded. An empty `active_findings`
+set resolves any previously-active sessions for that WLAN. Skipped for `org_scope=True`
 since org findings are composite cross-site records, not single-site events.
 
 ---
@@ -1004,7 +1005,7 @@ ANOMALY_MIN_PEERS=5
 ANOMALY_MIN_MAC_EVENTS=20
 ANOMALY_CENTROID_IF_MIN_FAMILIES=3
 ANOMALY_CENTROID_DIST_MAX_FAMILIES=8   # sites with ≤ this many families use cosine-distance; above uses IF
-ANOMALY_CENTROID_DIST_THRESHOLD=0.35   # cosine distance above which a family centroid is flagged
+ANOMALY_CENTROID_DIST_THRESHOLD=0.55   # cosine distance (L2-normalized unit vectors) above which a family centroid is flagged
 
 # Health Score (health_scorer.py)
 # Families with health_score below this value are considered degraded for webhook gating.
@@ -1035,18 +1036,6 @@ Org-wide cross-site detection is fully implemented. When `MIST_ORG_ID` is config
 
 The org-level pipeline uses the same `score_org_wide()` function in `anomaly_detector.py`
 and the same dual alert gate in `webhook_dispatcher.py`.
-
----
-
-## Known Mist API Notes
-
-- Site ID in use: `04edb3ac-542a-4d1d-ad90-b1e2fd682a67` (REMOTE_SITE)
-- Org ID: `3549f835-42c3-40d1-90cc-5e70ccc537ee`
-- The Live-Demo Cupertino env (org `9777c1a0-6ef6-11e6-8bbf-02e208b2d34f`) has known
-  chronic issues (vSRX disconnects, STP loop, DHCP VLAN 2 failures) — useful for
-  testing anomaly detection since real anomalies exist there
-- Client events endpoint returns up to 1000 per page — always paginate
-- `duration` parameter accepts strings like `"1d"`, `"24h"`, `"86400"` (seconds)
 
 ---
 
@@ -1166,4 +1155,3 @@ Build in this order to enable incremental testing:
 - No real-time Mist API calls in the FastAPI request path — reads from Redis only
 - No failure weighting in the anomaly ML feature vector — failure signals belong in the health score, not the anomaly vector
 - Do not gate webhooks on single-device IF or DBSCAN anomalies — only `is_family_outlier` (centroid IF) qualifies for webhook dispatch
-- Do not re-introduce Stage 3 rule-based threshold detection — that signal is now covered by the health score
