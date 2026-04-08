@@ -185,6 +185,31 @@ function AlertCard({ finding, onFamilyClick }) {
         </div>
       )}
 
+      {/* Worst-health MACs */}
+      {finding.worst_health_macs?.length > 0 && (
+        <div style={{ marginTop: "8px" }}>
+          <div style={{ color: "#555", fontSize: "10px", marginBottom: "4px" }}>Worst-health devices</div>
+          <div style={{ display: "flex", flexDirection: "column", gap: "3px" }}>
+            {finding.worst_health_macs.map(({ mac, health_score, health_components }) => {
+              const worstCat = Object.entries(health_components || {}).sort(([, a], [, b]) => b - a)[0];
+              return (
+                <div key={mac} style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                  <span style={{ fontFamily: "monospace", fontSize: "11px", color: "#7ec8e3" }}>{mac}</span>
+                  <span style={{ color: healthScoreColor(health_score), fontSize: "11px", fontWeight: "bold" }}>
+                    {(health_score * 100).toFixed(0)}%
+                  </span>
+                  {worstCat && (
+                    <span style={{ color: "#666", fontSize: "10px" }}>
+                      {worstCat[0]} {(worstCat[1] * 100).toFixed(0)}% fail
+                    </span>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
     </div>
   );
 }

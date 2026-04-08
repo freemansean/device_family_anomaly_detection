@@ -46,6 +46,7 @@ from .feature_engineer import (
     build_posthoc_features,
     get_features,
 )
+from .health_scorer import _mac_health_score
 
 log = logging.getLogger(__name__)
 
@@ -694,6 +695,27 @@ async def score(
                 if wlan_counts:
                     predominant_wlan = wlan_counts.most_common(1)[0][0]
 
+            # Worst-health MACs: top 3 across all family MACs by health score (ascending).
+            # Used by alert cards in the UI and webhook payload to surface the specific
+            # devices experiencing the most failures — independent of outlier scoring.
+            mac_health_scores = {
+                m: _mac_health_score(features[m]["vector"])
+                for m in family_macs
+            }
+            worst_health_macs = sorted(
+                [
+                    {
+                        "mac": m,
+                        "health_score": round(score, 4),
+                        "health_components": {
+                            k: round(v, 4) for k, v in comps.items() if v > 0
+                        },
+                    }
+                    for m, (score, comps) in mac_health_scores.items()
+                ],
+                key=lambda x: x["health_score"],
+            )[:3]
+
             finding = {
                 "device_family": family,
                 "wlan": wlan,
@@ -718,6 +740,7 @@ async def score(
                     key=lambda m: anomalies[m]["volume_concentration_weight"],
                     reverse=True,
                 )[:5],
+                "worst_health_macs": worst_health_macs,
                 "top_features": top_features,
                 "probable_pattern": probable_pattern,
             }
