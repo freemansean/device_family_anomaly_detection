@@ -200,7 +200,6 @@ Copy `.env.example` to `.env`. Variables are grouped below by concern.
 | Variable | Default | Description |
 |---|---|---|
 | `ANOMALY_WEBHOOK_URL` | _(empty)_ | Endpoint to POST alerts. Leave empty to disable dispatch — alert sessions are still recorded in Redis. |
-| `ANOMALY_WEBHOOK_SEVERITY_THRESHOLD` | `significant` | Minimum finding severity to dispatch a webhook. Valid values: `minimal`, `moderate`, `significant`. Severity is derived from `outlier_ratio`: minimal (0–0.3), moderate (0.3–0.6), significant (>0.6). |
 
 ### App Auth & Frontend
 

@@ -665,16 +665,15 @@ appear at a small number of sites.
 
 **Purpose:** Apply the dual alert gate and POST qualifying findings to the webhook URL.
 
-**Dual alert gate — all three conditions must be true to fire the webhook:**
+**Dual alert gate — both conditions must be true to fire the webhook:**
 1. `finding["is_family_outlier"] == True` — the centroid IF flagged the whole family as
    behaviorally different from all other device types. Single-device IF or DBSCAN outliers
    are visible in the UI but never trigger the webhook.
 2. `family health_score < ANOMALY_HEALTH_SCORE_THRESHOLD` — the family is also measurably
    failing, not just behaviorally unusual.
-3. `finding["severity"] >= ANOMALY_WEBHOOK_SEVERITY_THRESHOLD` — severity floor (default: `significant`).
 
-Valid severity values: `minimal`, `moderate`, `significant`. Do not use `CRITICAL` — it is
-not a valid severity string and will cause `_meets_severity()` to return False for everything.
+Finding severity (`minimal` / `moderate` / `significant`) is informational — it is stored
+on findings and displayed in the UI, but does not gate webhook dispatch.
 
 **Marvis TSHOOT enrichment:** After findings pass the dual gate but before the payload is
 POSTed, the dispatcher calls the Mist Marvis TSHOOT API for each of the top three worst-health
@@ -1012,10 +1011,9 @@ ANOMALY_CENTROID_DIST_THRESHOLD=0.55   # cosine distance (L2-normalized unit vec
 # Range: 0.0 (all failing) to 1.0 (no failures). Tune down if too noisy.
 ANOMALY_HEALTH_SCORE_THRESHOLD=0.75
 
-# Webhook — dual gate: is_family_outlier AND health_score < threshold AND severity >= threshold
-# Valid severity values: minimal, moderate, significant  (do NOT use CRITICAL — invalid)
+# Webhook — dual gate: is_family_outlier AND health_score < threshold.
+# Any severity triggers dispatch — severity is informational only.
 ANOMALY_WEBHOOK_URL=https://project-sasquatch-production.up.railway.app/webhook/anomaly
-ANOMALY_WEBHOOK_SEVERITY_THRESHOLD=significant
 
 # Frontend
 VITE_API_BASE_URL=http://localhost:8000

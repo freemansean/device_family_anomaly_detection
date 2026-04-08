@@ -51,7 +51,7 @@ from ..markov_analyzer import baseline_exists as markov_baseline_exists
 from ..markov_analyzer import build_and_store_baseline as build_markov_baseline
 from ..scheduler import build_org_pools, run_collect_only, run_detect_only, run_detection_cycle
 from .. import alert_tracker
-from ..webhook_dispatcher import evaluate_and_dispatch
+from ..webhook_dispatcher import evaluate_and_dispatch, run_family_tshoot
 from .auth import require_auth
 
 log = logging.getLogger(__name__)
@@ -1566,6 +1566,46 @@ async def get_family_if_outliers(site_id: str, family: str, wlan: str = Query(..
         "outliers": all_clients,
         "centroid_if_score": centroid_if_score,
         "top_features": family_top_features,
+    }
+
+
+@router.post("/sites/{site_id}/families/{family}/tshoot")
+async def trigger_family_tshoot(
+    site_id: str,
+    family: str,
+    wlan: str = Query(..., description="WLAN (SSID) name to scope results to. Required."),
+    _: None = Depends(require_auth),
+):
+    """
+    Manually trigger a Mist client TSHOOT for the worst-health MACs in a device family.
+
+    Reads worst_health_macs from the current finding for this family (if present)
+    and dispatches concurrent TSHOOT calls to the Mist site-level troubleshoot API.
+    The staleness check is skipped for manual triggers — operator intent is assumed.
+
+    Returns the TSHOOT results for each MAC immediately (synchronous response).
+    Requires MIST_API_TOKEN to be configured; returns 503 if not.
+    """
+    if not os.getenv("MIST_API_TOKEN", ""):
+        raise HTTPException(status_code=503, detail="MIST_API_TOKEN not configured.")
+
+    results = await run_family_tshoot(site_id=site_id, family=family, wlan=wlan)
+    if results is None or (
+        not results
+        and not await get_findings(site_id, wlan)
+    ):
+        raise HTTPException(
+            status_code=404,
+            detail=f"No finding found for family '{family}' at site '{site_id}' on WLAN '{wlan}'.",
+        )
+
+    return {
+        "site_id": site_id,
+        "family": family,
+        "wlan": wlan,
+        "mac_count": len(results),
+        "tshoot": results,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
 
