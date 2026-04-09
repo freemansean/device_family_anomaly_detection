@@ -364,6 +364,133 @@ async def set_webhook_config(body: dict):
     return config
 
 
+# ── General Config + Anomaly Config (file-persisted, survives reboots) ────────
+
+import pathlib as _pathlib
+
+_CONFIG_OVERRIDES_FILE = _pathlib.Path(__file__).parent.parent / "config_overrides.json"
+
+
+def _load_config_overrides() -> dict:
+    """Load persisted config overrides from disk. Returns empty dict on missing/corrupt file."""
+    try:
+        return json.loads(_CONFIG_OVERRIDES_FILE.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def _save_config_section(section: str, values: dict) -> None:
+    """Merge `values` into the named section of config_overrides.json and write to disk."""
+    overrides = _load_config_overrides()
+    overrides[section] = values
+    _CONFIG_OVERRIDES_FILE.write_text(json.dumps(overrides, indent=2))
+
+
+@router.get("/general-config")
+async def get_general_config():
+    """Return current general config (env defaults merged with persisted overrides)."""
+    overrides = _load_config_overrides().get("general", {})
+    config = {
+        "site_focus_detection_interval": int(os.getenv("SITE_FOCUS_DETECTION_INTERVAL", "60")),
+        "org_detection_interval_hours": int(os.getenv("ORG_DETECTION_INTERVAL_HOURS", "1")),
+        "cache_miss_refresh_threshold": int(os.getenv("CACHE_MISS_REFRESH_THRESHOLD", "10")),
+        "anomaly_min_mac_events": int(os.getenv("ANOMALY_MIN_MAC_EVENTS", "5")),
+    }
+    config.update(overrides)
+    return config
+
+
+@router.post("/general-config")
+async def set_general_config(body: dict):
+    """Persist general config overrides to disk so they survive service restarts."""
+    config: dict = {}
+
+    int_bounds = {
+        "site_focus_detection_interval": (1, 1440),
+        "org_detection_interval_hours": (1, 168),
+        "cache_miss_refresh_threshold": (1, 1000),
+        "anomaly_min_mac_events": (1, 10000),
+    }
+    for key, (lo, hi) in int_bounds.items():
+        if key in body:
+            try:
+                v = int(body[key])
+            except (ValueError, TypeError):
+                raise HTTPException(status_code=400, detail=f"{key} must be an integer")
+            if not (lo <= v <= hi):
+                raise HTTPException(status_code=400, detail=f"{key} must be between {lo} and {hi}")
+            config[key] = v
+
+    _save_config_section("general", config)
+    log.info("General configuration updated by administrator: %s", config)
+    return config
+
+
+@router.get("/anomaly-config")
+async def get_anomaly_config():
+    """Return current anomaly detection config (env defaults merged with persisted overrides)."""
+    overrides = _load_config_overrides().get("anomaly", {})
+    config = {
+        "anomaly_if_contamination": float(os.getenv("ANOMALY_IF_CONTAMINATION", "0.05")),
+        "anomaly_dbscan_eps": float(os.getenv("ANOMALY_DBSCAN_EPS", "2.5")),
+        "anomaly_dbscan_min_samples": int(os.getenv("ANOMALY_DBSCAN_MIN_SAMPLES", "5")),
+        "anomaly_dbscan_min_family_size": int(os.getenv("ANOMALY_DBSCAN_MIN_FAMILY_SIZE", "2")),
+        "anomaly_finding_threshold": float(os.getenv("ANOMALY_FINDING_THRESHOLD", "0.2")),
+        "anomaly_min_peers": int(os.getenv("ANOMALY_MIN_PEERS", "3")),
+        "anomaly_centroid_if_min_families": int(os.getenv("ANOMALY_CENTROID_IF_MIN_FAMILIES", "3")),
+        "anomaly_centroid_dist_max_families": int(os.getenv("ANOMALY_CENTROID_DIST_MAX_FAMILIES", "8")),
+        "anomaly_centroid_dist_threshold": float(os.getenv("ANOMALY_CENTROID_DIST_THRESHOLD", "0.35")),
+        "anomaly_health_score_threshold": float(os.getenv("ANOMALY_HEALTH_SCORE_THRESHOLD", "0.80")),
+        "markov_family_outlier_ratio": float(os.getenv("MARKOV_FAMILY_OUTLIER_RATIO", "0.5")),
+    }
+    config.update(overrides)
+    return config
+
+
+@router.post("/anomaly-config")
+async def set_anomaly_config(body: dict):
+    """Persist anomaly detection config overrides to disk so they survive service restarts."""
+    config: dict = {}
+
+    float_bounds = {
+        "anomaly_if_contamination": (0.01, 0.5),
+        "anomaly_dbscan_eps": (0.01, 100.0),
+        "anomaly_finding_threshold": (0.0, 1.0),
+        "anomaly_centroid_dist_threshold": (0.0, 2.0),
+        "anomaly_health_score_threshold": (0.0, 1.0),
+        "markov_family_outlier_ratio": (0.0, 1.0),
+    }
+    int_bounds = {
+        "anomaly_dbscan_min_samples": (1, 500),
+        "anomaly_dbscan_min_family_size": (1, 500),
+        "anomaly_min_peers": (1, 500),
+        "anomaly_centroid_if_min_families": (1, 100),
+        "anomaly_centroid_dist_max_families": (1, 200),
+    }
+    for key, (lo, hi) in float_bounds.items():
+        if key in body:
+            try:
+                v = float(body[key])
+            except (ValueError, TypeError):
+                raise HTTPException(status_code=400, detail=f"{key} must be a number")
+            if not (lo <= v <= hi):
+                raise HTTPException(status_code=400, detail=f"{key} must be between {lo} and {hi}")
+            config[key] = v
+    for key, (lo, hi) in int_bounds.items():
+        if key in body:
+            try:
+                v = int(body[key])
+            except (ValueError, TypeError):
+                raise HTTPException(status_code=400, detail=f"{key} must be an integer")
+            if not (lo <= v <= hi):
+                raise HTTPException(status_code=400, detail=f"{key} must be between {lo} and {hi}")
+            config[key] = v
+
+    _save_config_section("anomaly", config)
+    log.info("Anomaly configuration updated by administrator: %s", config)
+    return config
+
+
 @router.get("/sites/{site_id}/progress")
 async def get_site_progress(site_id: str):
     """Return the latest detection cycle progress for a site."""
