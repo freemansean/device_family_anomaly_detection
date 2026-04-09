@@ -19,12 +19,10 @@ findings visible in the UI but never trigger the webhook.
 Retry logic: 3 attempts with exponential backoff (1s, 2s, 4s).
 Never raises — webhook failure does not kill the scheduler job.
 
-Client TSHOOT enrichment (TODO #21):
-  When MIST_TSHOOT_ENABLED=true, each qualifying finding is enriched with results
-  from the Mist site-level client troubleshoot API, targeting the worst-health MACs
-  within the impacted family. The `tshoot` field on each finding is a list of per-MAC
-  results: {mac, ap, status, results}. TSHOOT failures never block webhook delivery.
-  Status values: "completed" | "error".
+Marvis TSHOOT enrichment: each qualifying finding is enriched with results from the
+  Mist org-level troubleshoot API, targeting the worst-health MACs in the family. The
+  `marvis_tshoot` field on each finding is a list of {mac, tshoot_results} dicts.
+  TSHOOT failures never block webhook delivery.
 """
 
 import asyncio
@@ -34,6 +32,7 @@ import os
 from datetime import datetime, timezone
 
 import httpx
+import redis.asyncio as aioredis
 
 from . import alert_tracker
 from .anomaly_detector import get_findings, get_org_findings
@@ -48,53 +47,65 @@ HEALTH_SCORE_THRESHOLD = float(os.getenv("ANOMALY_HEALTH_SCORE_THRESHOLD", "0.75
 MIST_CLOUD_HOST = os.getenv("MIST_CLOUD_HOST", "api.mist.com")
 MIST_API_TOKEN = os.getenv("MIST_API_TOKEN", "")
 MIST_ORG_ID = os.getenv("MIST_ORG_ID", "")
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 
-# Client TSHOOT enrichment — off by default until validated against live Mist API.
-MIST_TSHOOT_ENABLED: bool = os.getenv("MIST_TSHOOT_ENABLED", "false").lower() == "true"
 
-async def _fetch_marvis_tshoot(mac: str) -> list[dict]:
+async def _get_webhook_config() -> dict:
     """
-    Call the Marvis TSHOOT API for a single client MAC.
-    Returns the 'results' list from the response, or [] on any failure.
-    Never raises — a TSHOOT failure must not block webhook delivery.
+    Read runtime webhook configuration from Redis (sasquatch:webhook_config).
+    Falls back to .env defaults for any keys not present in Redis.
     """
-    if not MIST_ORG_ID or not MIST_API_TOKEN:
-        return []
-    url = f"https://{MIST_CLOUD_HOST}/api/v1/orgs/{MIST_ORG_ID}/troubleshoot?mac={mac}"
-    headers = {"Authorization": f"Token {MIST_API_TOKEN}"}
+    redis_client = aioredis.from_url(REDIS_URL, decode_responses=True)
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            resp = await client.get(url, headers=headers)
-            resp.raise_for_status()
-            return resp.json().get("results", [])
-    except Exception as exc:
-        log.warning("Marvis TSHOOT fetch failed for %s: %s", mac, exc)
-        return []
+        raw = await redis_client.get("sasquatch:webhook_config")
+    finally:
+        await redis_client.aclose()
 
+    config = {
+        "enabled": bool(WEBHOOK_URL),
+        "url": WEBHOOK_URL,
+        "scope": "org_and_site",
+        "marvis_tshoot_enabled": bool(MIST_ORG_ID and MIST_API_TOKEN),
+        "family_size_threshold": 1,
+    }
+    if raw:
+        config.update(json.loads(raw))
+    return config
 
 async def _run_client_tshoot(site_id: str, mac: str) -> dict:
     """
-    Call the Mist site-level client TSHOOT API for a single MAC.
+    Call the Mist org-level client TSHOOT API for a single MAC.
 
-    GET /api/v1/sites/{site_id}/clients/troubleshoot?mac={mac}
-
-    Mirrors the org-level Marvis endpoint pattern — synchronous GET, results
-    returned directly in the response.
+    GET /api/v1/orgs/{org_id}/troubleshoot?mac={mac}&site_id={site_id}
 
     Returns a dict with keys:
       status   — "completed" | "error"
       results  — raw Mist `results` list on success, [] otherwise
       error    — error message string (only on "error" status)
 
-    Never raises — TSHOOT failures must not block webhook delivery.
+    Handles 429 rate-limiting: reads Retry-After header (default 10s, capped at 60s)
+    and retries once. Never raises — TSHOOT failures must not block webhook delivery.
     """
+    if not MIST_ORG_ID or not MIST_API_TOKEN:
+        return {"status": "error", "error": "MIST_ORG_ID or MIST_API_TOKEN not configured", "results": []}
     headers = {"Authorization": f"Token {MIST_API_TOKEN}"}
-    url = f"https://{MIST_CLOUD_HOST}/api/v1/sites/{site_id}/clients/troubleshoot?mac={mac}"
+    url = f"https://{MIST_CLOUD_HOST}/api/v1/orgs/{MIST_ORG_ID}/troubleshoot?mac={mac}&site_id={site_id}"
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
-            resp = await client.get(url, headers=headers)
-            resp.raise_for_status()
-            return {"status": "completed", "results": resp.json().get("results", [])}
+            for attempt in range(2):
+                resp = await client.get(url, headers=headers)
+                if resp.status_code == 429:
+                    retry_after = int(resp.headers.get("Retry-After", 10))
+                    log.warning(
+                        "TSHOOT rate-limited for %s at site %s — backing off %ds",
+                        mac, site_id, retry_after,
+                    )
+                    await asyncio.sleep(retry_after)
+                    continue
+                resp.raise_for_status()
+                return {"status": "completed", "results": resp.json().get("results", [])}
+            # Exhausted retries after 429
+            return {"status": "error", "error": "rate limited (429)", "results": []}
     except httpx.HTTPStatusError as exc:
         log.warning(
             "Client TSHOOT HTTP error for %s at site %s: %s %s",
@@ -104,70 +115,6 @@ async def _run_client_tshoot(site_id: str, mac: str) -> dict:
     except Exception as exc:
         log.warning("Client TSHOOT failed for %s at site %s: %s", mac, site_id, exc)
         return {"status": "error", "error": str(exc), "results": []}
-
-
-async def _enrich_with_client_tshoot(
-    qualifying: list[dict], site_id: str, wlan: str
-) -> None:
-    """
-    Enrich each qualifying finding with site-level client TSHOOT results.
-
-    Targets the worst_health_macs list (MACs with lowest health scores) within
-    each impacted family. Dispatches all TSHOOT calls concurrently via
-    asyncio.gather and attaches results as `tshoot` — a list of per-MAC dicts:
-      {mac, ap, status, results, [error]}
-
-    Modifies `qualifying` in place. Never raises.
-    """
-    if not MIST_API_TOKEN:
-        log.debug("[%s] Client TSHOOT skipped — MIST_API_TOKEN not configured", wlan)
-        return
-
-    try:
-        # Load client cache once for ap lookup.
-        try:
-            cache = await get_client_cache(site_id)
-        except Exception:
-            cache = {}
-
-        # Build flat job list: (finding_idx, mac, ap)
-        jobs: list[tuple[int, str, str]] = []
-        for idx, finding in enumerate(qualifying):
-            for mac_entry in finding.get("worst_health_macs", []):
-                mac = mac_entry["mac"]
-                mac_norm = mac.replace(":", "").lower()
-                ap = (cache.get(mac_norm) or cache.get(mac) or {}).get("last_ap", "")
-                jobs.append((idx, mac, ap))
-
-        if not jobs:
-            for finding in qualifying:
-                finding["tshoot"] = []
-            return
-
-        async def _one(idx: int, mac: str, ap: str):
-            result = await _run_client_tshoot(site_id, mac)
-            return idx, mac, ap, result
-
-        raw_results = await asyncio.gather(*[_one(*j) for j in jobs])
-
-        # Group back onto findings.
-        by_finding: dict[int, list[dict]] = {i: [] for i in range(len(qualifying))}
-        for idx, mac, ap, result in raw_results:
-            by_finding[idx].append({"mac": mac, "ap": ap, **result})
-
-        for i, finding in enumerate(qualifying):
-            finding["tshoot"] = by_finding[i]
-
-        completed = sum(1 for _, _, _, r in raw_results if r.get("status") == "completed")
-        log.info(
-            "[%s] Client TSHOOT enrichment: %d MACs queried, %d completed",
-            wlan, len(jobs), completed,
-        )
-
-    except Exception as exc:
-        log.warning("[%s] Client TSHOOT enrichment error (non-blocking): %s", wlan, exc)
-        for finding in qualifying:
-            finding.setdefault("tshoot", [])
 
 
 async def run_family_tshoot(site_id: str, family: str, wlan: str) -> list[dict]:
@@ -250,14 +197,28 @@ async def evaluate_and_dispatch(
     wlan: WLAN scope to evaluate (specific SSID name, required).
     org_scope=True: read from org-wide findings/health keys instead of per-site keys.
 
+    Runtime config (stored in Redis key sasquatch:webhook_config) overrides .env:
+      - enabled: bool — master on/off switch
+      - url: str — POST destination
+      - scope: "org_only" | "org_and_site" — whether site-level alarms are dispatched
+      - marvis_tshoot_enabled: bool — whether TSHOOT enrichment runs before dispatch
+
     Returns True if webhook was sent (or no qualifying findings), False on delivery failure.
     """
-    if not WEBHOOK_URL:
-        log.debug("ANOMALY_WEBHOOK_URL not set — skipping webhook dispatch")
+    config = await _get_webhook_config()
+
+    effective_url = config["url"]
+    if not config["enabled"] or not effective_url:
+        log.debug(
+            "Webhook dispatch skipped (enabled=%s, url_set=%s)",
+            config["enabled"], bool(effective_url),
+        )
         return True
 
-    findings = await (get_org_findings() if org_scope else get_findings(site_id, wlan))
-    health = await get_health(site_id, wlan)
+    findings = await (get_org_findings(wlan) if org_scope else get_findings(site_id, wlan))
+    # For org_scope, health_score is embedded directly on each finding by score_org_wide().
+    # For site scope, look up health from the per-site Redis key.
+    health = {} if org_scope else await get_health(site_id, wlan)
 
     qualifying = []
     for f in findings:
@@ -273,9 +234,17 @@ async def evaluate_and_dispatch(
         if not is_any_family_anomaly:
             continue
 
-        # Gate 2: family health score must be below threshold
-        family_health = health.get(family, {})
-        health_score = family_health.get("health_score", 1.0)
+        # Gate 2: family health score must be below threshold.
+        # For org_scope, use health_score embedded on the finding by score_org_wide().
+        # For site scope, cross-reference against the per-site health dict.
+        if org_scope:
+            health_score = f.get("health_score", 1.0)
+            health_components = f.get("health_components", {})
+        else:
+            family_health = health.get(family, {})
+            health_score = family_health.get("health_score", 1.0)
+            health_components = family_health.get("components", {})
+
         if health_score >= HEALTH_SCORE_THRESHOLD:
             log.debug(
                 "[%s] Skipping webhook for [%s]: family anomaly label present but "
@@ -286,14 +255,25 @@ async def evaluate_and_dispatch(
             )
             continue
 
+        # Gate 3: family must have at least family_size_threshold affected devices.
+        # Families below the threshold are visible in the UI but suppressed from webhook dispatch.
+        family_size_threshold = config.get("family_size_threshold", 1)
+        affected_count = f.get("affected_mac_count", 0)
+        if affected_count < family_size_threshold:
+            log.debug(
+                "[%s] Skipping webhook for [%s]: affected_mac_count=%d < family_size_threshold=%d",
+                wlan, family, affected_count, family_size_threshold,
+            )
+            continue
+
         # Attach health data to the outbound finding payload
         qualifying.append({
             **f,
             "health_score": health_score,
-            "health_components": family_health.get("components", {}),
+            "health_components": health_components,
         })
 
-    # Track alert history regardless of webhook configuration or qualifying count.
+    # Track alert history regardless of qualifying count or scope setting.
     # Skip for org_scope — org findings are cross-site composites, not single-site events.
     if not org_scope:
         active_findings = {
@@ -310,9 +290,18 @@ async def evaluate_and_dispatch(
         )
         return True
 
-    # Enrich each qualifying finding with Marvis TSHOOT results for its worst MACs.
+    # Scope gate: "org_only" means site-level dispatches are suppressed.
+    # Alert history was already recorded above so sessions remain consistent.
+    if not org_scope and config["scope"] == "org_only":
+        log.debug(
+            "[%s] Webhook scope is org_only — %d qualifying finding(s) tracked but not dispatched",
+            wlan, len(qualifying),
+        )
+        return True
+
+    # Enrich each qualifying finding with TSHOOT results for its worst MACs.
     # All TSHOOT calls across all findings are dispatched concurrently.
-    if MIST_ORG_ID and MIST_API_TOKEN:
+    if config["marvis_tshoot_enabled"] and MIST_ORG_ID and MIST_API_TOKEN:
         # Build a flat list of (finding_index, mac_entry) pairs so we can scatter/gather.
         tshoot_tasks: list[tuple[int, dict]] = []
         for i, finding in enumerate(qualifying):
@@ -321,32 +310,26 @@ async def evaluate_and_dispatch(
 
         if tshoot_tasks:
             results = await asyncio.gather(
-                *[_fetch_marvis_tshoot(t[1]["mac"]) for t in tshoot_tasks]
+                *[_run_client_tshoot(site_id, t[1]["mac"]) for t in tshoot_tasks]
             )
             # Group results back onto each finding.
             finding_tshoot: dict[int, list[dict]] = {i: [] for i in range(len(qualifying))}
-            for (i, mac_entry), tshoot_results in zip(tshoot_tasks, results):
+            for (i, mac_entry), result in zip(tshoot_tasks, results):
                 finding_tshoot[i].append({
                     "mac": mac_entry["mac"],
-                    "tshoot_results": tshoot_results,
+                    "tshoot_results": result.get("results", []),
                 })
             for i, finding in enumerate(qualifying):
                 finding["marvis_tshoot"] = finding_tshoot[i]
             log.info(
-                "[%s] Marvis TSHOOT enrichment complete: %d MACs queried across %d finding(s)",
+                "[%s] TSHOOT enrichment complete: %d MACs queried across %d finding(s)",
                 wlan, len(tshoot_tasks), len(qualifying),
             )
     else:
-        log.debug("[%s] Marvis TSHOOT skipped — MIST_ORG_ID or MIST_API_TOKEN not configured", wlan)
-
-    # Site-level client TSHOOT enrichment (TODO #21).
-    # Targets worst_health_macs — the MACs with the lowest health scores in each
-    # impacted family. Only runs for per-site findings (not org-scope composites)
-    # and only when MIST_TSHOOT_ENABLED=true.
-    if MIST_TSHOOT_ENABLED and not org_scope:
-        await _enrich_with_client_tshoot(qualifying, site_id, wlan)
-    elif MIST_TSHOOT_ENABLED and org_scope:
-        log.debug("[%s] Client TSHOOT skipped for org-scope findings", wlan)
+        log.debug(
+            "[%s] TSHOOT skipped (marvis_tshoot_enabled=%s, org_id_set=%s, token_set=%s)",
+            wlan, config["marvis_tshoot_enabled"], bool(MIST_ORG_ID), bool(MIST_API_TOKEN),
+        )
 
     payload = {
         "source": "sasquatch_client_anomaly",
@@ -359,6 +342,7 @@ async def evaluate_and_dispatch(
 
     log.info(
         f"[{wlan}] Dispatching webhook: {len(qualifying)} finding(s) passed dual alert gate "
-        f"(is_family_outlier + health_score < {HEALTH_SCORE_THRESHOLD})"
+        f"(is_family_outlier + health_score < {HEALTH_SCORE_THRESHOLD})\n"
+        f"Payload: {json.dumps(payload, indent=2)}"
     )
-    return await _post_with_retry(WEBHOOK_URL, payload)
+    return await _post_with_retry(effective_url, payload)

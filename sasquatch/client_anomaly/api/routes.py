@@ -45,7 +45,7 @@ from ..event_collector import (
     get_wlans,
     sanitize_wlan_key,
 )
-from ..feature_engineer import _features_redis_key, build_features, get_features
+from ..feature_engineer import _family_event_counts_redis_key, _features_redis_key, build_features, get_features
 from ..health_scorer import get_health, score_health, _health_redis_key
 from ..markov_analyzer import baseline_exists as markov_baseline_exists
 from ..markov_analyzer import build_and_store_baseline as build_markov_baseline
@@ -301,6 +301,69 @@ async def set_org_detection_enabled(body: dict):
     return {"enabled": enabled}
 
 
+_WEBHOOK_CONFIG_KEY = "sasquatch:webhook_config"
+
+
+@router.get("/webhook-config")
+async def get_webhook_config():
+    """Return current webhook configuration (Redis override values merged with .env defaults)."""
+    client = _get_redis()
+    try:
+        raw = await client.get(_WEBHOOK_CONFIG_KEY)
+    finally:
+        await client.aclose()
+
+    env_url = os.getenv("ANOMALY_WEBHOOK_URL", "")
+    mist_org_id = os.getenv("MIST_ORG_ID", "")
+    mist_api_token = os.getenv("MIST_API_TOKEN", "")
+
+    # Start from .env defaults, then apply any Redis overrides
+    config = {
+        "enabled": bool(env_url),
+        "url": env_url,
+        "scope": "org_and_site",
+        "marvis_tshoot_enabled": bool(mist_org_id and mist_api_token),
+        "family_size_threshold": 1,
+    }
+    if raw:
+        config.update(json.loads(raw))
+    return config
+
+
+@router.post("/webhook-config")
+async def set_webhook_config(body: dict):
+    """Save webhook configuration to Redis, overriding .env defaults at runtime."""
+    config: dict = {}
+    if "enabled" in body:
+        config["enabled"] = bool(body["enabled"])
+    if "url" in body:
+        config["url"] = str(body["url"]).strip()
+    if "scope" in body:
+        scope = str(body["scope"])
+        if scope not in ("org_only", "org_and_site"):
+            raise HTTPException(status_code=400, detail="scope must be 'org_only' or 'org_and_site'")
+        config["scope"] = scope
+    if "marvis_tshoot_enabled" in body:
+        config["marvis_tshoot_enabled"] = bool(body["marvis_tshoot_enabled"])
+    if "family_size_threshold" in body:
+        try:
+            threshold = int(body["family_size_threshold"])
+            if threshold < 1:
+                raise ValueError
+        except (ValueError, TypeError):
+            raise HTTPException(status_code=400, detail="family_size_threshold must be an integer >= 1")
+        config["family_size_threshold"] = threshold
+
+    client = _get_redis()
+    try:
+        await client.set(_WEBHOOK_CONFIG_KEY, json.dumps(config))
+    finally:
+        await client.aclose()
+
+    log.info("Webhook configuration updated by administrator: %s", config)
+    return config
+
+
 @router.get("/sites/{site_id}/progress")
 async def get_site_progress(site_id: str):
     """Return the latest detection cycle progress for a site."""
@@ -503,7 +566,25 @@ async def trigger_org_detect_only():
         except Exception:
             log.exception(f"Org detect: score_org_wide failed for wlan={wlan}")
 
-    org_findings = await _get_org_findings_for_site()
+    org_findings = []
+    for wlan in all_wlans:
+        org_findings.extend(await _get_org_findings_for_site(wlan))
+
+    # Phase 3 — dispatch webhooks for each site/wlan using the freshly-scored findings.
+    for sid, wlans in wlans_by_site.items():
+        for wlan in wlans:
+            try:
+                await evaluate_and_dispatch(sid, wlan)
+            except Exception:
+                log.exception(f"Org detect: webhook dispatch failed for site {sid} wlan={wlan} (non-fatal)")
+
+    # Dispatch org-wide webhook for each WLAN scope (org findings carry embedded health_score).
+    for wlan in sorted(all_wlans):
+        try:
+            await evaluate_and_dispatch("__org__", wlan=wlan, org_scope=True)
+        except Exception:
+            log.exception(f"Org detect: org-wide webhook dispatch failed for wlan={wlan} (non-fatal)")
+
     results = [
         {
             "site_id": sid,
@@ -778,10 +859,16 @@ async def get_org_alerts(wlan: str = Query(..., description="WLAN (SSID) name to
     raw_org = pipeline_results[n * 2]
     org_findings = json.loads(raw_org) if raw_org else []
 
-    # Org-wide alerts: org findings that are also unhealthy
+    # Org-wide alerts: org findings where any family-level anomaly flag is set AND unhealthy.
+    # Any of centroid IF, DBSCAN past threshold, or Markov qualifies — not just centroid.
     org_alerts = [
         f for f in org_findings
         if f.get("health_score", 1.0) < _ALERT_HEALTH_THRESHOLD
+        and (
+            f.get("is_family_outlier")
+            or f.get("is_family_dbscan_outlier")
+            or f.get("is_family_markov_outlier")
+        )
     ]
     for f in org_alerts:
         for sa in f.get("sites_affected", []):
@@ -977,55 +1064,89 @@ async def get_org_family_insights(wlan: str = Query(..., description="WLAN (SSID
 
     redis_client = _get_redis()
     try:
+        # Check 60s response cache — data only changes on detection cycles.
+        wlan_key = sanitize_wlan_key(wlan)
+        cache_key = f"sasquatch:cache:org_family_insights:{wlan_key}"
+        cached = await redis_client.get(cache_key)
+        if cached:
+            return json.loads(cached)
+
         try:
             site_map = await _get_org_site_map(redis_client)
         except Exception:
             raise HTTPException(status_code=502, detail="Could not reach Mist API")
 
-        # Load all events once (per-site sorted sets fetched in one pipeline inside get_events()).
-        all_events = await get_events()
-        events_by_site: dict[str, list[dict]] = defaultdict(list)
-        for evt in all_events:
-            sid = evt.get("site_id")
-            if sid and evt.get("wlan") == wlan:
-                events_by_site[sid].append(evt)
-
-        # Fetch per-site findings, anomalies, and health scores in one pipeline round trip.
-        # Anomalies carry family_centroid_if_score on every MAC, so the centroid
-        # score is available even when a family's outlier_ratio is below the
-        # finding threshold (i.e. no finding was generated for that family).
+        # Fetch per-site findings, anomalies, health scores, pre-computed family event
+        # counts, and the org-wide findings in one pipeline round trip.
         site_ids_ordered = list(site_map.keys())
         pipe = redis_client.pipeline()
         for sid in site_ids_ordered:
             pipe.get(_findings_redis_key(sid, wlan))
             pipe.get(_anomalies_redis_key(sid, wlan))
             pipe.get(_health_redis_key(sid, wlan))
+            pipe.get(_family_event_counts_redis_key(sid, wlan))
+        pipe.get(_org_findings_redis_key(wlan))
         pipeline_results = await pipe.execute()
+        n = len(site_ids_ordered)
         findings_by_site = {
-            sid: (json.loads(pipeline_results[i * 3]) if pipeline_results[i * 3] else [])
+            sid: (json.loads(pipeline_results[i * 4]) if pipeline_results[i * 4] else [])
             for i, sid in enumerate(site_ids_ordered)
         }
         anomalies_by_site_insights = {
-            sid: (json.loads(pipeline_results[i * 3 + 1]) if pipeline_results[i * 3 + 1] else {})
+            sid: (json.loads(pipeline_results[i * 4 + 1]) if pipeline_results[i * 4 + 1] else {})
             for i, sid in enumerate(site_ids_ordered)
         }
         health_by_site = {
-            sid: (json.loads(pipeline_results[i * 3 + 2]) if pipeline_results[i * 3 + 2] else {})
+            sid: (json.loads(pipeline_results[i * 4 + 2]) if pipeline_results[i * 4 + 2] else {})
             for i, sid in enumerate(site_ids_ordered)
         }
-
+        event_counts_by_site = {
+            sid: (json.loads(pipeline_results[i * 4 + 3]) if pipeline_results[i * 4 + 3] else {})
+            for i, sid in enumerate(site_ids_ordered)
+        }
+        # family_is_family_outlier and family_worst_dbscan_severity come exclusively from
+        # org-wide detection, not per-site findings. IF and DBSCAN badges mean the family
+        # was flagged across the whole org population, not just at one site.
+        raw_org_findings = pipeline_results[n * 4]
+        org_findings_list: list[dict] = json.loads(raw_org_findings) if raw_org_findings else []
+        family_is_family_outlier: dict[str, bool] = {
+            f["device_family"]: True
+            for f in org_findings_list
+            if f.get("is_family_outlier") and f.get("device_family")
+        }
         SEVERITY_RANK = {"significant": 3, "moderate": 2, "minimal": 1}
+
+        # Org-wide DBSCAN severity, Markov ratio, and DBSCAN outlier site count — all read
+        # directly from org findings (not aggregated from per-site findings).
+        org_family_dbscan_severity: dict[str, str] = {}
+        org_family_markov_ratio: dict[str, float] = {}
+        org_family_markov_is_outlier: dict[str, bool] = {}
+        org_family_dbscan_site_count: dict[str, int] = {}
+        for f in org_findings_list:
+            fam = f.get("device_family")
+            if not fam:
+                continue
+            sev = f.get("dbscan_severity")
+            if sev and SEVERITY_RANK.get(sev, 0) > SEVERITY_RANK.get(org_family_dbscan_severity.get(fam, ""), 0):
+                org_family_dbscan_severity[fam] = sev
+            ratio = f.get("markov_family_anomaly_ratio")
+            if ratio is not None:
+                org_family_markov_ratio[fam] = ratio
+            if f.get("is_family_markov_outlier"):
+                org_family_markov_is_outlier[fam] = True
+            cnt = f.get("dbscan_outlier_site_count")
+            if cnt is not None:
+                org_family_dbscan_site_count[fam] = cnt
 
         family_event_counts: dict[str, Counter] = defaultdict(Counter)
         family_total_events: Counter = Counter()
         family_worst_severity: dict[str, str] = {}
-        family_worst_dbscan_severity: dict[str, str] = {}
         family_outlier_sites: dict[str, list[str]] = defaultdict(list)
-        family_is_family_outlier: dict[str, bool] = defaultdict(bool)
         family_is_markov_outlier: dict[str, bool] = defaultdict(bool)
         family_worst_markov_ratio: dict[str, float] = {}
         family_site_count: Counter = Counter()
-        family_macs: dict[str, set] = defaultdict(set)
+        # mac_count is summed across sites (same device at multiple sites counted once per site).
+        family_mac_count: Counter = Counter()
         # Track worst (most anomalous = most negative) centroid IF score and its top_features
         family_worst_centroid_if_score: dict[str, float] = {}
         family_worst_centroid_top_features: dict[str, list] = {}
@@ -1036,24 +1157,19 @@ async def get_org_family_insights(wlan: str = Query(..., description="WLAN (SSID
         sites_with_data = 0
 
         for site_id, site_name in site_map.items():
-            events = events_by_site.get(site_id, [])
-            if not events:
+            site_counts = event_counts_by_site.get(site_id, {})
+            if not site_counts:
                 continue
             sites_with_data += 1
             findings: list[dict] = findings_by_site[site_id]
 
-            seen_families: set[str] = set()
-            for event in events:
-                family = event.get("device_family", "Unknown")
-                category = event.get("event_category", "OTHER")
-                family_event_counts[family][category] += 1
-                family_total_events[family] += 1
-                seen_families.add(family)
-                mac = (event.get("mac") or "").replace(":", "").lower()
-                if mac:
-                    family_macs[family].add(mac)
-            for fam in seen_families:
-                family_site_count[fam] += 1
+            # Aggregate pre-computed family event category counts.
+            for family, fdata in site_counts.items():
+                for cat, cnt in fdata.get("categories", {}).items():
+                    family_event_counts[family][cat] += cnt
+                family_total_events[family] += fdata.get("total_events", 0)
+                family_mac_count[family] += fdata.get("mac_count", 0)
+                family_site_count[family] += 1
 
             for finding in findings:
                 fam = finding.get("device_family")
@@ -1062,23 +1178,21 @@ async def get_org_family_insights(wlan: str = Query(..., description="WLAN (SSID
                 sev = finding.get("severity")
                 if sev and SEVERITY_RANK.get(sev, 0) > SEVERITY_RANK.get(family_worst_severity.get(fam, ""), 0):
                     family_worst_severity[fam] = sev
-                if finding.get("is_family_outlier"):
-                    family_is_family_outlier[fam] = True
                 if finding.get("is_family_markov_outlier"):
                     family_is_markov_outlier[fam] = True
                 markov_ratio = finding.get("markov_family_anomaly_ratio")
                 if markov_ratio is not None and markov_ratio > family_worst_markov_ratio.get(fam, 0.0):
                     family_worst_markov_ratio[fam] = markov_ratio
-                dbscan_sev = finding.get("dbscan_severity")
-                if dbscan_sev and SEVERITY_RANK.get(dbscan_sev, 0) > SEVERITY_RANK.get(family_worst_dbscan_severity.get(fam, ""), 0):
-                    family_worst_dbscan_severity[fam] = dbscan_sev
+                # dbscan_severity is sourced from org-wide findings, not per-site findings.
                 if sev in SEVERITY_RANK:
                     family_outlier_sites[fam].append(site_name)
 
-            # Accumulate health scores — volume-weighted by total_events per family at this site
+            # Accumulate health scores — mac_count-weighted so every device gets equal vote,
+            # matching the per-device-average principle in health_scorer.py and the weighting
+            # used when attaching health to org findings in score_org_wide().
             site_health = health_by_site.get(site_id, {})
             for fam, hdata in site_health.items():
-                weight = hdata.get("total_events", 0)
+                weight = hdata.get("mac_count", 0)
                 if weight > 0:
                     family_health_weighted_sum[fam] += hdata.get("health_score", 1.0) * weight
                     family_health_weight_total[fam] += weight
@@ -1101,54 +1215,58 @@ async def get_org_family_insights(wlan: str = Query(..., description="WLAN (SSID
                         # Use top_features from the finding if one exists for this family/site
                         fam_finding = next((f for f in findings if f.get("device_family") == fam), None)
                         family_worst_centroid_top_features[fam] = fam_finding.get("top_features", []) if fam_finding else []
+
+        all_categories = list(EVENT_CATEGORIES.keys()) + ["OTHER"]
+        families_out: dict[str, dict] = {}
+        for family, cat_counts in family_event_counts.items():
+            total = family_total_events[family]
+            health_weight = family_health_weight_total.get(family, 0.0)
+            health_score = (
+                round(family_health_weighted_sum[family] / health_weight, 4)
+                if health_weight > 0 else None
+            )
+            health_components = (
+                {
+                    comp: round(family_health_components_sum[family][comp] / health_weight, 4)
+                    for comp in family_health_components_sum.get(family, {})
+                }
+                if health_weight > 0 else None
+            )
+            families_out[family] = {
+                "total_events": total,
+                "client_count": family_mac_count[family],
+                "site_count": family_site_count[family],
+                "worst_severity": family_worst_severity.get(family),
+                "worst_dbscan_severity": org_family_dbscan_severity.get(family),
+                "dbscan_outlier_site_count": org_family_dbscan_site_count.get(family, 0),
+                "is_family_outlier_any_site": family_is_family_outlier.get(family, False),
+                "is_family_markov_outlier_any_site": org_family_markov_is_outlier.get(family, False),
+                "worst_markov_ratio": org_family_markov_ratio.get(family),
+                "outlier_sites": family_outlier_sites.get(family, []),
+                "worst_centroid_if_score": family_worst_centroid_if_score.get(family),
+                "worst_centroid_top_features": family_worst_centroid_top_features.get(family, []),
+                "health_score": health_score,
+                "health_components": health_components,
+                "categories": {
+                    cat: {
+                        "count": cat_counts.get(cat, 0),
+                        "ratio": round(cat_counts.get(cat, 0) / total, 4) if total > 0 else 0.0,
+                    }
+                    for cat in all_categories
+                },
+            }
+
+        response = {
+            "families": families_out,
+            "categories": list(EVENT_CATEGORIES.keys()),
+            "total_sites": len(site_map),
+            "sites_with_data": sites_with_data,
+        }
+        if families_out:
+            await redis_client.set(cache_key, json.dumps(response), ex=60)
+        return response
     finally:
         await redis_client.aclose()
-
-    all_categories = list(EVENT_CATEGORIES.keys()) + ["OTHER"]
-    families_out: dict[str, dict] = {}
-    for family, cat_counts in family_event_counts.items():
-        total = family_total_events[family]
-        health_weight = family_health_weight_total.get(family, 0.0)
-        health_score = (
-            round(family_health_weighted_sum[family] / health_weight, 4)
-            if health_weight > 0 else None
-        )
-        health_components = (
-            {
-                comp: round(family_health_components_sum[family][comp] / health_weight, 4)
-                for comp in family_health_components_sum.get(family, {})
-            }
-            if health_weight > 0 else None
-        )
-        families_out[family] = {
-            "total_events": total,
-            "client_count": len(family_macs.get(family, set())),
-            "site_count": family_site_count[family],
-            "worst_severity": family_worst_severity.get(family),
-            "worst_dbscan_severity": family_worst_dbscan_severity.get(family),
-            "is_family_outlier_any_site": family_is_family_outlier.get(family, False),
-            "is_family_markov_outlier_any_site": family_is_markov_outlier.get(family, False),
-            "worst_markov_ratio": family_worst_markov_ratio.get(family),
-            "outlier_sites": family_outlier_sites.get(family, []),
-            "worst_centroid_if_score": family_worst_centroid_if_score.get(family),
-            "worst_centroid_top_features": family_worst_centroid_top_features.get(family, []),
-            "health_score": health_score,
-            "health_components": health_components,
-            "categories": {
-                cat: {
-                    "count": cat_counts.get(cat, 0),
-                    "ratio": round(cat_counts.get(cat, 0) / total, 4) if total > 0 else 0.0,
-                }
-                for cat in all_categories
-            },
-        }
-
-    return {
-        "families": families_out,
-        "categories": list(EVENT_CATEGORIES.keys()),
-        "total_sites": len(site_map),
-        "sites_with_data": sites_with_data,
-    }
 
 
 @router.get("/org/families/{family}/drilldown")

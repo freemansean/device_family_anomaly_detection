@@ -490,6 +490,28 @@ genuine problems. The `GET /sites/{site_id}/status` response should convey
 
 ---
 
+## Backend — Event Filtering
+
+### 22. Drop weak-signal events below configurable RSSI threshold
+**File:** `sasquatch/client_anomaly/event_collector.py`
+
+Events from clients at very low RSSI (≤ -85 dBm by default) are likely transient
+associations at the edge of coverage — they skew feature vectors (high disassoc rates,
+failed auths) and add noise to the ML pipeline without representing real client behavior
+patterns. These should be filtered out during enrichment before storage in Redis.
+
+**Fix:** In `event_collector.py`, after enrichment and before the Redis write, drop any
+event where `rssi` is present and `rssi <= ANOMALY_MIN_RSSI`. Add env var:
+
+```
+ANOMALY_MIN_RSSI=-85   # drop events with RSSI at or below this value; set to -200 to disable
+```
+
+Events with no `rssi` field (e.g. DHCP-only events) should be kept. Log a per-batch
+count of dropped events at DEBUG level.
+
+---
+
 ## Configuration
 
 ### 15. Webhook URL in .env is stale — needs reconfiguration
@@ -636,6 +658,54 @@ TSHOOT_STALENESS_SECONDS=300       # Skip TSHOOT if client last_seen older than 
   `POST /api/v1/sites/{site_id}/families/{family}/tshoot` in `routes.py`.
 - Three new env vars added to `.env`: `MIST_TSHOOT_ENABLED=false`,
   `TSHOOT_TIMEOUT_SECONDS=30`, `TSHOOT_STALENESS_SECONDS=300`.
+
+---
+
+### 23. No accommodation for service accounts
+
+Client devices that are service accounts (e.g., shared login terminals, IoT management agents, always-on monitoring probes) exhibit persistent, high-volume, highly regular event patterns that are structurally anomalous compared to normal user devices — low `inter_event_cv`, dominant single event type, near-zero roam activity. These will reliably score as outliers in both IF and DBSCAN even though their behavior is expected and intentional.
+
+**Impact:** False positives in families that include a mix of user devices and service account devices (common in "Windows" and "IoT" families). The service account MACs will drag up the outlier ratio and may push the family over `ANOMALY_FINDING_THRESHOLD`.
+
+**Options to explore:**
+- Config-driven MAC exclusion list (`SERVICE_ACCOUNT_MACS` in `.env`) — excluded from all ML input and finding rollup, still stored in Redis for audit
+- Automatic detection: MACs with `inter_event_cv < threshold` AND `top_event_fraction > threshold` AND event count above a volume floor could be auto-tagged as `device_family = "ServiceAccount"` and excluded from family IF pooling
+- Separate peer group: service accounts form their own DBSCAN cluster rather than being excluded — anomalous service accounts (e.g., a probe that suddenly starts failing auth) would still be detectable
+
+**File scope:** `feature_engineer.py` (exclusion/tagging logic), `anomaly_detector.py` (peer group handling), `.env` (config), `client_cache.py` (optional tag on enrichment)
+
+---
+
+---
+
+### 24. GUI-based configuration — move env vars out of .env
+
+Currently all tuning parameters live in `.env`, which requires server access to change and makes the system hard to hand off to others. The goal is a settings UI that lets operators configure the system without touching the filesystem.
+
+**Proposed layout:** Two new panels in the header toolbar, positioned just before the existing "Webhook Config" button:
+
+- **General Config** — operational settings:
+  - `SITE_FOCUS_DETECTION_INTERVAL` (minutes between detection runs)
+  - `ORG_DETECTION_INTERVAL_HOURS`
+  - `CACHE_MISS_REFRESH_THRESHOLD`
+  - `MIST_TSHOOT_ENABLED` / `TSHOOT_TIMEOUT_SECONDS` / `TSHOOT_STALENESS_SECONDS`
+  - `ANOMALY_MIN_MAC_EVENTS`
+
+- **Anomaly Config** — ML tuning:
+  - `ANOMALY_IF_CONTAMINATION`
+  - `ANOMALY_DBSCAN_EPS` / `ANOMALY_DBSCAN_MIN_SAMPLES` / `ANOMALY_DBSCAN_MIN_FAMILY_SIZE`
+  - `ANOMALY_FINDING_THRESHOLD`
+  - `ANOMALY_MIN_PEERS`
+  - `ANOMALY_CENTROID_IF_MIN_FAMILIES` / `ANOMALY_CENTROID_DIST_MAX_FAMILIES` / `ANOMALY_CENTROID_DIST_THRESHOLD`
+  - `ANOMALY_HEALTH_SCORE_THRESHOLD`
+  - `MARKOV_FAMILY_OUTLIER_RATIO`
+
+**Implementation approach:**
+- Backend: new `GET /api/v1/config` and `POST /api/v1/config` routes; persist overrides to a `config_overrides.json` file (or a Redis key) so the `.env` remains the baseline default and GUI values take precedence at runtime
+- Frontend: modal panels matching the existing Webhook Config modal style
+- Sensitive values (`MIST_API_TOKEN`, `MIST_ORG_ID`, `MIST_SITE_ID`, `MIST_CLOUD_HOST`, `REDIS_URL`) stay in `.env` only — do not expose in the GUI
+
+**File scope:** `api/routes.py` (new config endpoints), `scheduler.py` (read config at job dispatch time, not module load), frontend config modal components, `.env` (remains authoritative for secrets)
 
 ---
 

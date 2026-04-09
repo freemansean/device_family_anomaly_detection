@@ -226,16 +226,15 @@ PMKID failure ratio, DHCP XID counts, roam failure types — used to generate hu
 
 ## Alert Logic
 
-Webhooks fire only when **all three** conditions are met for a device family:
+Webhooks fire only when **both** conditions are met for a device family:
 
 1. Any family-level anomaly label is set — at least one of:
    - `is_family_outlier` — centroid IF/distance flagged the whole family as behaviorally different from all other device types
    - `is_family_dbscan_outlier` — fraction of DBSCAN-noise MACs in the family exceeds the noise threshold
    - `is_family_markov_outlier` — Markov Chain analysis found anomalous event-chain patterns in ≥ `MARKOV_FAMILY_OUTLIER_RATIO` of the family's clients
 2. `health_score < 0.75` — family is also measurably failing
-3. `severity >= significant` (configurable)
 
-Single-device IF outliers without a family-level flag appear in the UI but never trigger webhooks.
+Finding severity (`minimal` / `moderate` / `significant`) is informational only — it is displayed in the UI but does not gate webhook dispatch. Single-device IF outliers without a family-level flag appear in the UI but never trigger webhooks.
 
 ### Marvis TSHOOT Enrichment
 
@@ -276,6 +275,7 @@ TSHOOT failures for individual MACs return an empty `tshoot_results` list withou
 | **Findings Feed** | Four detector sections: IF CENTROID (centroid/distance outliers), DBSCAN % OF FAMILY, MARKOV % OF FAMILY, and HEALTH (unhealthy families with no anomaly finding). |
 | **Org Overview** | Four-tab shell: Org Alerts, Org Overview, Org Family Insights, Org Findings. |
 | **Org Alerts** | Org-wide alerts grouped by family; site alerts grouped by site. Default org view. |
+| **Org Family Insights** | Heatmap aggregated across all org sites. IF / DB / Markov columns reflect org-wide analysis — Markov % is the org-wide ratio of clients with anomalous chain patterns (not per-site worst); DB severity and site badge count come from the org-wide DBSCAN run. Health is mac_count-weighted across sites so every device gets equal vote. |
 | **MAC Drilldown** | 24hr event timeline + feature vector vs family baseline + IF score + DBSCAN label + Markov episode stats. |
 | **Family Drilldown** | Per-MAC breakdown for a device family at a site or across the org. |
 

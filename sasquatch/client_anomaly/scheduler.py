@@ -470,11 +470,12 @@ async def org_cross_site_detect_job() -> None:
             except Exception:
                 log.exception(f"[org-detect] Org-wide scoring failed for wlan={wlan}")
 
-        # Step 5: Dispatch a single org-wide webhook from the combined findings list.
-        try:
-            await evaluate_and_dispatch("__org__", org_scope=True)
-        except Exception:
-            log.exception("[org-detect] Webhook dispatch failed (non-fatal)")
+        # Step 5: Dispatch org-wide webhook per WLAN scope from the combined findings.
+        for wlan in sorted(all_wlans):
+            try:
+                await evaluate_and_dispatch("__org__", wlan=wlan, org_scope=True)
+            except Exception:
+                log.exception(f"[org-detect] Org-wide webhook dispatch failed for wlan={wlan} (non-fatal)")
 
         log.info(
             f"[org-detect] Cross-site detection cycle complete for {len(site_ids)} sites"

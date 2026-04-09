@@ -113,6 +113,12 @@ export default function App() {
   const selectedWlanRef = useRef(selectedWlan);
   useEffect(() => { selectedWlanRef.current = selectedWlan; }, [selectedWlan]);
 
+  // Webhook configuration modal
+  const [webhookModalOpen, setWebhookModalOpen] = useState(false);
+  const [webhookConfig, setWebhookConfig] = useState(null); // null = not yet loaded
+  const [webhookDraft, setWebhookDraft] = useState(null);   // in-modal editable copy
+  const [webhookSaveState, setWebhookSaveState] = useState("idle"); // idle | saving | ok | error
+
   // Action bar state
   const [focusSite, setFocusSite] = useState(null); // {site_id, source}
   const [orgDetectionEnabled, setOrgDetectionEnabled] = useState(true);
@@ -156,6 +162,10 @@ export default function App() {
     apiFetch(`${API_BASE}/api/v1/org/detection-enabled`)
       .then((r) => r.json())
       .then((data) => setOrgDetectionEnabled(data.enabled !== false))
+      .catch(console.error);
+    apiFetch(`${API_BASE}/api/v1/webhook-config`)
+      .then((r) => r.json())
+      .then((data) => setWebhookConfig(data))
       .catch(console.error);
   }, [token]);
 
@@ -313,6 +323,36 @@ export default function App() {
     } catch {
       setAS("orgDetection", "error");
       setTimeout(() => setAS("orgDetection", "idle"), 3000);
+    }
+  }
+
+  function handleOpenWebhookConfig() {
+    setWebhookDraft(webhookConfig ? { ...webhookConfig } : {
+      enabled: false, url: "", scope: "org_and_site", marvis_tshoot_enabled: false, family_size_threshold: 1,
+    });
+    setWebhookSaveState("idle");
+    setWebhookModalOpen(true);
+  }
+
+  async function handleSaveWebhookConfig() {
+    if (!webhookDraft) return;
+    setWebhookSaveState("saving");
+    try {
+      const r = await apiFetch(`${API_BASE}/api/v1/webhook-config`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(webhookDraft),
+      });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const saved = await r.json();
+      setWebhookConfig(saved);
+      setWebhookSaveState("ok");
+      setTimeout(() => {
+        setWebhookModalOpen(false);
+        setWebhookSaveState("idle");
+      }, 800);
+    } catch {
+      setWebhookSaveState("error");
     }
   }
 
@@ -595,6 +635,27 @@ export default function App() {
             );
           })()}
 
+          <div style={{ width: "1px", height: "24px", background: "#2a2a2a" }} />
+
+          {/* Webhook Configuration */}
+          {(() => {
+            const active = webhookConfig?.enabled;
+            return (
+              <button
+                onClick={handleOpenWebhookConfig}
+                title="Configure webhook dispatch settings"
+                style={{
+                  ...actionBtnStyle("idle"),
+                  borderColor: active ? "#2d5a8a" : "#333",
+                  color: active ? "#7ec8e3" : "#888",
+                  background: active ? "#0d1f2e" : "#1a1a1a",
+                }}
+              >
+                Webhook Config{active ? " ●" : ""}
+              </button>
+            );
+          })()}
+
         </div>
 
         {/* Progress bar for Full Discovery */}
@@ -658,6 +719,163 @@ export default function App() {
           onBack={() => selectedFamily ? setView("family") : setView("findings")}
           wlan={selectedWlan}
         />
+      )}
+
+      {/* Webhook Configuration Modal */}
+      {webhookModalOpen && webhookDraft && (
+        <div
+          style={{
+            position: "fixed", inset: 0, zIndex: 200,
+            background: "rgba(0,0,0,0.65)",
+            display: "flex", alignItems: "center", justifyContent: "center",
+          }}
+          onClick={(e) => { if (e.target === e.currentTarget) setWebhookModalOpen(false); }}
+        >
+          <div style={{
+            background: "#161616",
+            border: "1px solid #2a2a3a",
+            borderRadius: "6px",
+            padding: "24px 28px",
+            width: "460px",
+            maxWidth: "95vw",
+            boxShadow: "0 8px 32px rgba(0,0,0,0.7)",
+            fontFamily: "monospace",
+          }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "20px" }}>
+              <h2 style={{ margin: 0, fontSize: "15px", color: "#7ec8e3" }}>Webhook Configuration</h2>
+              <button
+                onClick={() => setWebhookModalOpen(false)}
+                style={{ background: "none", border: "none", color: "#555", cursor: "pointer", fontSize: "18px", lineHeight: 1, padding: "0 2px" }}
+              >×</button>
+            </div>
+
+            {/* Webhooks Enabled */}
+            <div style={{ marginBottom: "18px" }}>
+              <label style={{ display: "flex", alignItems: "center", gap: "10px", cursor: "pointer" }}>
+                <input
+                  type="checkbox"
+                  checked={!!webhookDraft.enabled}
+                  onChange={(e) => setWebhookDraft(d => ({ ...d, enabled: e.target.checked }))}
+                  style={{ width: "15px", height: "15px", accentColor: "#7ec8e3", cursor: "pointer" }}
+                />
+                <span style={{ color: "#e0e0e0", fontSize: "13px" }}>Webhooks enabled</span>
+              </label>
+            </div>
+
+            {/* Webhook URL */}
+            <div style={{ marginBottom: "18px" }}>
+              <div style={{ color: "#888", fontSize: "11px", marginBottom: "5px" }}>WEBHOOK HTTP TARGET</div>
+              <input
+                type="text"
+                value={webhookDraft.url ?? ""}
+                onChange={(e) => setWebhookDraft(d => ({ ...d, url: e.target.value }))}
+                placeholder="https://your-server/webhook"
+                disabled={!webhookDraft.enabled}
+                style={{
+                  width: "100%",
+                  boxSizing: "border-box",
+                  background: webhookDraft.enabled ? "#1e1e2e" : "#141414",
+                  color: webhookDraft.enabled ? "#e0e0e0" : "#444",
+                  border: "1px solid #2a2a3a",
+                  borderRadius: "4px",
+                  padding: "6px 10px",
+                  fontSize: "12px",
+                  fontFamily: "monospace",
+                }}
+              />
+            </div>
+
+            {/* Webhook Scope */}
+            <div style={{ marginBottom: "18px" }}>
+              <div style={{ color: "#888", fontSize: "11px", marginBottom: "8px" }}>WEBHOOK SCOPE</div>
+              {[
+                { value: "org_and_site", label: "Org alarms and site alarms", desc: "Dispatch for both org-wide and per-site dual-gate alerts" },
+                { value: "org_only",     label: "Org alarms only",            desc: "Suppress site-level dispatches; only fire on org-wide findings" },
+              ].map(opt => (
+                <label key={opt.value} style={{ display: "flex", alignItems: "flex-start", gap: "10px", marginBottom: "10px", cursor: webhookDraft.enabled ? "pointer" : "default" }}>
+                  <input
+                    type="radio"
+                    name="webhook-scope"
+                    value={opt.value}
+                    checked={webhookDraft.scope === opt.value}
+                    onChange={() => setWebhookDraft(d => ({ ...d, scope: opt.value }))}
+                    disabled={!webhookDraft.enabled}
+                    style={{ marginTop: "2px", accentColor: "#7ec8e3", cursor: "pointer" }}
+                  />
+                  <div>
+                    <div style={{ color: webhookDraft.enabled ? "#e0e0e0" : "#444", fontSize: "13px" }}>{opt.label}</div>
+                    <div style={{ color: webhookDraft.enabled ? "#555" : "#333", fontSize: "11px" }}>{opt.desc}</div>
+                  </div>
+                </label>
+              ))}
+            </div>
+
+            {/* Family Size Threshold */}
+            <div style={{ marginBottom: "18px" }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: "5px" }}>
+                <div style={{ color: "#888", fontSize: "11px" }}>MINIMUM FAMILY SIZE FOR WEBHOOK</div>
+                <div style={{ color: webhookDraft.enabled ? "#7ec8e3" : "#444", fontSize: "13px", fontWeight: "bold" }}>
+                  {webhookDraft.family_size_threshold ?? 1} {(webhookDraft.family_size_threshold ?? 1) === 1 ? "device" : "devices"}
+                </div>
+              </div>
+              <input
+                type="range"
+                min={1}
+                max={50}
+                value={webhookDraft.family_size_threshold ?? 1}
+                onChange={(e) => setWebhookDraft(d => ({ ...d, family_size_threshold: Number(e.target.value) }))}
+                disabled={!webhookDraft.enabled}
+                style={{ width: "100%", accentColor: "#7ec8e3", cursor: webhookDraft.enabled ? "pointer" : "default" }}
+              />
+              <div style={{ color: "#555", fontSize: "11px", marginTop: "4px" }}>
+                Families with fewer affected devices than this threshold appear in the UI as alarms but do not trigger a webhook.
+              </div>
+            </div>
+
+            {/* Marvis TSHOOT */}
+            <div style={{ marginBottom: "24px", paddingBottom: "20px", borderBottom: "1px solid #222" }}>
+              <label style={{ display: "flex", alignItems: "flex-start", gap: "10px", cursor: webhookDraft.enabled ? "pointer" : "default" }}>
+                <input
+                  type="checkbox"
+                  checked={!!webhookDraft.marvis_tshoot_enabled}
+                  onChange={(e) => setWebhookDraft(d => ({ ...d, marvis_tshoot_enabled: e.target.checked }))}
+                  disabled={!webhookDraft.enabled}
+                  style={{ marginTop: "2px", width: "15px", height: "15px", accentColor: "#7ec8e3", cursor: "pointer" }}
+                />
+                <div>
+                  <div style={{ color: webhookDraft.enabled ? "#e0e0e0" : "#444", fontSize: "13px" }}>Marvis TSHOOT augmentation</div>
+                  <div style={{ color: webhookDraft.enabled ? "#555" : "#333", fontSize: "11px" }}>Enrich webhook payloads with Marvis client troubleshoot results for worst-health MACs</div>
+                </div>
+              </label>
+            </div>
+
+            {/* Save / Cancel */}
+            <div style={{ display: "flex", gap: "10px", justifyContent: "flex-end" }}>
+              <button
+                onClick={() => setWebhookModalOpen(false)}
+                style={{
+                  background: "transparent", color: "#666", border: "1px solid #2a2a2a",
+                  borderRadius: "4px", padding: "6px 16px", cursor: "pointer", fontSize: "12px", fontFamily: "monospace",
+                }}
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleSaveWebhookConfig}
+                disabled={webhookSaveState === "saving"}
+                style={{
+                  background: webhookSaveState === "ok" ? "#1a3a1a" : webhookSaveState === "error" ? "#2a1515" : "#0d2a38",
+                  color: webhookSaveState === "ok" ? "#2d7a4f" : webhookSaveState === "error" ? "#e05555" : "#7ec8e3",
+                  border: `1px solid ${webhookSaveState === "ok" ? "#2d7a4f55" : webhookSaveState === "error" ? "#e0555555" : "#2d5a8a"}`,
+                  borderRadius: "4px", padding: "6px 18px", cursor: webhookSaveState === "saving" ? "default" : "pointer",
+                  fontSize: "12px", fontFamily: "monospace",
+                }}
+              >
+                {webhookSaveState === "saving" ? "Saving…" : webhookSaveState === "ok" ? "Saved ✓" : webhookSaveState === "error" ? "Error ✗" : "Save"}
+              </button>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );
