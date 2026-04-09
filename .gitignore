@@ -24,6 +24,7 @@ data/
 # Runtime artifacts
 logs/
 dump.rdb
+sasquatch/client_anomaly/config_overrides.json
 
 # OS
 .DS_Store
