@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback } from "react";
 import { apiFetch } from "../api";
 import { familyColor } from "./familyColors";
 import OrgFamilyDrilldown from "./OrgFamilyDrilldown";
+import OrgClusterViz from "./OrgClusterViz";
 
 const CATEGORIES = [
   "DHCP_SUCCESS", "DHCP_FAILURE", "DNS_SUCCESS", "DNS_FAILURE",
@@ -185,7 +186,8 @@ export default function OrgFamilyInsights({ apiBase, refreshToken, onMacSiteSele
         </span>
       </div>
 
-      <div style={{ overflowX: "auto" }}>
+      <div style={{ display: "flex", gap: "28px", alignItems: "flex-start" }}>
+      <div style={{ overflowX: "auto", flex: "1 1 auto", minWidth: 0 }}>
         <table style={{ borderCollapse: "collapse", fontSize: "12px" }}>
           <thead>
             <tr>
@@ -324,9 +326,9 @@ export default function OrgFamilyInsights({ apiBase, refreshToken, onMacSiteSele
                             }}
                           >
                             {dbSev}
-                            {outlierSites.length > 0 && (
+                            {fdata.dbscan_outlier_site_count > 0 && (
                               <span style={{ opacity: 0.7, marginLeft: "4px" }}>
-                                ({[...new Set(outlierSites)].length})
+                                ({fdata.dbscan_outlier_site_count})
                               </span>
                             )}
                           </span>
@@ -419,7 +421,7 @@ export default function OrgFamilyInsights({ apiBase, refreshToken, onMacSiteSele
                       >
                         {count > 0 && (
                           <span style={{ fontSize: "10px", color: textCol }}>
-                            {count > 9999 ? `${(count / 1000).toFixed(0)}k` : count > 999 ? `${(count / 1000).toFixed(1)}k` : count}
+                            {count > 999 ? `${(count / 1000).toFixed(1)}k` : count}
                           </span>
                         )}
                       </td>
@@ -472,7 +474,7 @@ export default function OrgFamilyInsights({ apiBase, refreshToken, onMacSiteSele
                     >
                       {count > 0 && (
                         <span style={{ fontSize: "10px", color: textCol }}>
-                          {count > 9999 ? `${(count / 1000).toFixed(0)}k` : count > 999 ? `${(count / 1000).toFixed(1)}k` : count}
+                          {count > 999 ? `${(count / 1000).toFixed(1)}k` : count}
                         </span>
                       )}
                     </td>
@@ -484,11 +486,16 @@ export default function OrgFamilyInsights({ apiBase, refreshToken, onMacSiteSele
         </table>
       </div>
 
+      <div style={{ flex: "0 0 600px", width: "600px" }}>
+        <OrgClusterViz apiBase={apiBase} onMacSiteSelect={onMacSiteSelect} refreshToken={refreshToken} wlan={wlan} />
+      </div>
+      </div>
+
       <div style={{ marginTop: "8px", fontSize: "11px", color: "#444" }}>
         Cell ratios are % of that family's org-wide event pool.
-        {" "}<span style={{ color: "#b06ad4" }}>IF: family</span> = device class flagged as a centroid outlier at one or more sites.
-        {" "}<span style={{ fontWeight: "bold", color: "#666" }}>DB:</span> <span style={{ color: "#e0a835" }}>moderate</span> / <span style={{ color: "#e05555" }}>significant</span> = worst DBSCAN finding across all sites (badge = distinct site count).
-        {" "}<span style={{ color: "#4ab0e8" }}>Markov %</span> = highest anomalous-chain ratio seen across sites.
+        {" "}<span style={{ color: "#b06ad4" }}>IF: family</span> = device class flagged as a centroid outlier org-wide (cross-site population).
+        {" "}<span style={{ fontWeight: "bold", color: "#666" }}>DB:</span> <span style={{ color: "#e0a835" }}>moderate</span> / <span style={{ color: "#e05555" }}>significant</span> = org-wide DBSCAN severity (badge = sites with outlier MACs).
+        {" "}<span style={{ color: "#4ab0e8" }}>Markov %</span> = org-wide ratio of clients with anomalous chain patterns.
         {" "}Health = volume-weighted failure rate org-wide (hover for per-category breakdown).
         {" "}Hover cells for exact counts.
       </div>

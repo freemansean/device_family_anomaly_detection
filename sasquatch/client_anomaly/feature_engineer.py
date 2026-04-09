@@ -73,6 +73,10 @@ def _features_redis_key(site_id: str, wlan: str) -> str:
     return f"sasquatch:features:{site_id}:{sanitize_wlan_key(wlan)}"
 
 
+def _family_event_counts_redis_key(site_id: str, wlan: str) -> str:
+    return f"sasquatch:family_event_counts:{site_id}:{sanitize_wlan_key(wlan)}"
+
+
 def build_mac_feature_vector(mac_events: list[dict]) -> dict[str, float]:
     """
     Build the ML input feature vector for a single MAC.
@@ -244,6 +248,31 @@ async def build_features(site_id: str, wlan: str) -> int:
                 "Run event_collector.collect() first."
             )
 
+        # Pre-compute per-family event category counts for the org/family-insights
+        # endpoint so it can aggregate across sites without loading raw events per request.
+        _fam_cat: dict[str, Counter] = defaultdict(Counter)
+        _fam_macs: dict[str, set] = defaultdict(set)
+        for _evt in events:
+            _fam = _evt.get("device_family", "Unknown")
+            _cat = _evt.get("event_category", "OTHER")
+            _fam_cat[_fam][_cat] += 1
+            _mac = (_evt.get("mac") or "").replace(":", "").lower()
+            if _mac:
+                _fam_macs[_fam].add(_mac)
+        family_counts = {
+            fam: {
+                "total_events": sum(cats.values()),
+                "mac_count": len(_fam_macs[fam]),
+                "categories": dict(cats),
+            }
+            for fam, cats in _fam_cat.items()
+        }
+        await redis_client.set(
+            _family_event_counts_redis_key(site_id, wlan),
+            json.dumps(family_counts),
+            ex=FEATURES_TTL,
+        )
+
         # Group events by MAC
         mac_events: dict[str, list[dict]] = defaultdict(list)
         for event in events:
@@ -281,12 +310,17 @@ async def build_features(site_id: str, wlan: str) -> int:
         await redis_client.aclose()
 
 
-async def get_features(site_id: str, wlan: str) -> dict[str, dict]:
+async def get_features(site_id: str, wlan: str) -> dict[str, dict] | None:
+    """Return the features dict for the given site/wlan, or None if the key doesn't exist.
+
+    Returns {} (empty dict) when build_features ran but no MACs met the event threshold.
+    Returns None when build_features has never been run (key missing from Redis).
+    """
     redis_client = aioredis.from_url(REDIS_URL, decode_responses=True)
     try:
         raw = await redis_client.get(_features_redis_key(site_id, wlan))
     finally:
         await redis_client.aclose()
-    if not raw:
-        return {}
+    if raw is None:
+        return None
     return json.loads(raw)

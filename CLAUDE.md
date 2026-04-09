@@ -894,7 +894,7 @@ request path. The API is read-only except for the manual refresh POST.
 
 The `/health` endpoint returns `{family: {health_score, components, total_events, mac_count}}`.
 The `/org/family-insights` endpoint includes `health_score` and `health_components` per family,
-computed as a volume-weighted average of per-site health scores across all sites.
+computed as a mac_count-weighted average of per-site health scores across all sites (each device gets equal vote, matching health_scorer.py's per-device-average principle).
 
 ---
 
@@ -911,7 +911,7 @@ computed as a volume-weighted average of per-site health scores across all sites
 **2. Org Family Insights (`OrgFamilyInsights.jsx`)**
 - Same heatmap layout but aggregated across all org sites
 - Anomaly badge reflects worst finding across all sites for that family
-- **Health column**: volume-weighted average health score from all sites. Hover tooltip shows per-category failure rates.
+- **Health column**: mac_count-weighted average health score from all sites (each device equal vote). Hover tooltip shows per-category failure rates.
 - No "Device Family Behavior Explanation" / Shapley column — that detail belongs in drilldowns
 - Data source: `/api/v1/org/family-insights`
 

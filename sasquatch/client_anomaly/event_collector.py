@@ -60,6 +60,12 @@ IGNORED_EVENT_TYPES: frozenset[str] = frozenset({
 # failure ratios and depresses health scores for devices in marginal coverage areas.
 _AUTH_FAILURE_IGNORED_STATUS_CODES: frozenset[int] = frozenset({-79})
 
+# Events with RSSI weaker than this threshold are discarded. Clients at the fringe of
+# RF coverage generate high false-positive rates — their event patterns reflect poor
+# signal, not authentic device behavior. Events with no rssi field are accepted as-is
+# (some event types such as DHCP and DNS do not carry a signal measurement).
+_RSSI_MIN_THRESHOLD = -87
+
 # Known Mist client event types — used to define the ML feature vector dimensions.
 # Fetched live from /api/v1/const/client_events at startup and cached in Redis,
 # but this list serves as a safe fallback.
@@ -413,6 +419,7 @@ def _enrich_batch(
     cache_miss_macs: set[str] = set()
     enriched = []
     transmission_failure_skipped = 0
+    weak_signal_skipped = 0
     for event in events:
         event_type = event.get("type", "")
         if event_type in IGNORED_EVENT_TYPES:
@@ -422,6 +429,10 @@ def _enrich_batch(
             and event.get("status_code") in _AUTH_FAILURE_IGNORED_STATUS_CODES
         ):
             transmission_failure_skipped += 1
+            continue
+        rssi = event.get("rssi")
+        if rssi is not None and rssi < _RSSI_MIN_THRESHOLD:
+            weak_signal_skipped += 1
             continue
         if event_type and event_type not in known_types:
             unknown_types.add(event_type)
@@ -433,6 +444,10 @@ def _enrich_batch(
         log.debug(
             f"Skipped {transmission_failure_skipped} AUTH_FAILURE events with "
             f"status_code in {set(_AUTH_FAILURE_IGNORED_STATUS_CODES)} (transmission failures)"
+        )
+    if weak_signal_skipped:
+        log.debug(
+            f"Skipped {weak_signal_skipped} events with rssi < {_RSSI_MIN_THRESHOLD} dBm (weak signal)"
         )
     return enriched, unknown_types, cache_miss_macs
 

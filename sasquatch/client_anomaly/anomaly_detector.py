@@ -508,11 +508,17 @@ async def score(
     redis_client = aioredis.from_url(REDIS_URL, decode_responses=True)
     try:
         features = await get_features(site_id, wlan)
-        if not features:
+        if features is None:
             raise RuntimeError(
                 f"No features found for site {site_id} / wlan={wlan}. "
                 "Run feature_engineer.build_features() first."
             )
+        if not features:
+            log.info(
+                f"No qualifying MACs for site {site_id} / wlan={wlan} "
+                f"(all below MIN_MAC_EVENTS threshold) — skipping score"
+            )
+            return 0
 
         # Load raw events for post-hoc explainer (only used for outliers)
         events = await get_events(
@@ -1007,6 +1013,7 @@ async def score_org_wide(
 
     # Org-wide family Markov rollup — derived from merged MAC-level is_markov_outlier
     org_family_markov_flags: dict[str, bool] = {}
+    org_family_markov_ratio: dict[str, float] = {}
     for family, family_cks in org_family_groups.items():
         # Only count MACs that had any Markov data (is_markov_outlier is explicitly set)
         # As a proxy for "evaluatable", we count all composite keys — if the per-site
@@ -1015,10 +1022,12 @@ async def score_org_wide(
         total_cks = len(family_cks)
         if total_cks == 0:
             org_family_markov_flags[family] = False
+            org_family_markov_ratio[family] = 0.0
             continue
         markov_outlier_cks = [k for k in family_cks if org_anomalies_flat[k].get("is_markov_outlier")]
         ratio = len(markov_outlier_cks) / total_cks
         org_family_markov_flags[family] = ratio >= MARKOV_FAMILY_OUTLIER_RATIO
+        org_family_markov_ratio[family] = ratio
 
     # Raw events cache for post-hoc explainer — loaded once per site on demand
     raw_events_cache: dict[str, dict[str, list[dict]]] = {}
@@ -1072,7 +1081,14 @@ async def score_org_wide(
             outlier_count = len(outlier_cks)
             outlier_ratio = outlier_count / total if total > 0 else 0.0
 
-            if outlier_ratio < FINDING_THRESHOLD:
+            # Evaluate family-level DBSCAN and Markov flags before the threshold gate so
+            # they can bypass it — mirrors site-level rollup logic (line ~712).
+            is_family_dbscan_outlier = (
+                family_dbscan_noise_ratio.get(family, 0.0) >= DBSCAN_FAMILY_NOISE_THRESHOLD
+            )
+            is_family_markov_outlier = org_family_markov_flags.get(family, False)
+
+            if outlier_ratio < FINDING_THRESHOLD and not is_family_dbscan_outlier and not is_family_markov_outlier:
                 continue
 
             # Per-site breakdown for the sites_affected field
@@ -1145,11 +1161,6 @@ async def score_org_wide(
                     posthoc["event_count"] = len(combined_events)
                     probable_pattern = _classify_probable_pattern(posthoc)
 
-            is_family_dbscan_outlier = (
-                family_dbscan_noise_ratio.get(family, 0.0) >= DBSCAN_FAMILY_NOISE_THRESHOLD
-            )
-            is_family_markov_outlier = org_family_markov_flags.get(family, False)
-
             finding = {
                 "device_family": family,
                 "wlan": wlan,
@@ -1164,6 +1175,7 @@ async def score_org_wide(
                 "is_family_outlier": is_family_level_outlier,
                 "is_family_dbscan_outlier": is_family_dbscan_outlier,
                 "is_family_markov_outlier": is_family_markov_outlier,
+                "markov_family_anomaly_ratio": round(org_family_markov_ratio.get(family, 0.0), 4),
                 "centroid_if_score": centroid_if_scores.get(family),
                 "centroid_dist_score": centroid_dist_scores.get(family),
                 "centroid_detection_method": centroid_method,
@@ -1173,6 +1185,7 @@ async def score_org_wide(
                 ),
                 "dbscan_outlier_ratio": round(dbscan_outlier_ratio, 4),
                 "dbscan_outlier_count": dbscan_outlier_count,
+                "dbscan_outlier_site_count": len({composite_to_site[k] for k in dbscan_outlier_cks}),
                 "if_outlier_count": len(if_outlier_cks),
                 "top_features": top_features,
                 "probable_pattern": probable_pattern,
@@ -1184,6 +1197,48 @@ async def score_org_wide(
                 f"({outlier_ratio:.1%}) across {len(sites_affected)} sites "
                 f"→ {finding['severity']} / {probable_pattern}"
             )
+
+        # Attach volume-weighted org health_score to each finding before storing.
+        # Read per-site health from Redis and compute a mac_count-weighted average
+        # so that larger sites contribute proportionally to the org health signal.
+        org_site_ids = list(all_features_by_site.keys())
+        if org_site_ids and org_findings:
+            pipe = redis_client.pipeline()
+            for _sid in org_site_ids:
+                pipe.get(f"sasquatch:health:{_sid}:{sanitize_wlan_key(wlan)}")
+            health_raws = await pipe.execute()
+            site_health_map: dict[str, dict] = {}
+            for _sid, _raw in zip(org_site_ids, health_raws):
+                if _raw:
+                    try:
+                        site_health_map[_sid] = json.loads(_raw)
+                    except Exception:
+                        pass
+            for _f in org_findings:
+                _family = _f["device_family"]
+                _wsum = 0.0
+                _wcount = 0
+                _comp_wsum: dict[str, float] = {}
+                _comp_wcount: dict[str, float] = {}
+                for _sh in site_health_map.values():
+                    _fh = _sh.get(_family)
+                    if not _fh:
+                        continue
+                    _n = _fh.get("mac_count", 1)
+                    _wsum += _fh.get("health_score", 1.0) * _n
+                    _wcount += _n
+                    for _cat, _val in _fh.get("components", {}).items():
+                        _comp_wsum[_cat] = _comp_wsum.get(_cat, 0.0) + _val * _n
+                        _comp_wcount[_cat] = _comp_wcount.get(_cat, 0.0) + _n
+                if _wcount > 0:
+                    _f["health_score"] = round(_wsum / _wcount, 4)
+                    _f["health_components"] = {
+                        _cat: round(_comp_wsum[_cat] / _comp_wcount[_cat], 4)
+                        for _cat in _comp_wsum
+                    }
+                else:
+                    _f["health_score"] = 1.0
+                    _f["health_components"] = {}
 
         severity_order = {"significant": 0, "moderate": 1, "minimal": 2}
         org_findings.sort(
