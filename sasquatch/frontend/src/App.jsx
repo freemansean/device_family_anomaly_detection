@@ -113,23 +113,25 @@ export default function App() {
   const selectedWlanRef = useRef(selectedWlan);
   useEffect(() => { selectedWlanRef.current = selectedWlan; }, [selectedWlan]);
 
-  // Webhook configuration modal
-  const [webhookModalOpen, setWebhookModalOpen] = useState(false);
-  const [webhookConfig, setWebhookConfig] = useState(null); // null = not yet loaded
-  const [webhookDraft, setWebhookDraft] = useState(null);   // in-modal editable copy
-  const [webhookSaveState, setWebhookSaveState] = useState("idle"); // idle | saving | ok | error
+  // Config state (shared across unified config modal tabs)
+  const [webhookConfig, setWebhookConfig] = useState(null);
+  const [webhookDraft, setWebhookDraft] = useState(null);
+  const [webhookSaveState, setWebhookSaveState] = useState("idle");
 
-  // General Config modal
-  const [generalConfigModalOpen, setGeneralConfigModalOpen] = useState(false);
   const [generalConfig, setGeneralConfig] = useState(null);
   const [generalConfigDraft, setGeneralConfigDraft] = useState(null);
   const [generalConfigSaveState, setGeneralConfigSaveState] = useState("idle");
 
-  // Anomaly Config modal
-  const [anomalyConfigModalOpen, setAnomalyConfigModalOpen] = useState(false);
   const [anomalyConfig, setAnomalyConfig] = useState(null);
   const [anomalyConfigDraft, setAnomalyConfigDraft] = useState(null);
   const [anomalyConfigSaveState, setAnomalyConfigSaveState] = useState("idle");
+
+  // Utilities dropdown
+  const [utilDropdownOpen, setUtilDropdownOpen] = useState(false);
+
+  // Unified config modal
+  const [configModalOpen, setConfigModalOpen] = useState(false);
+  const [configTab, setConfigTab] = useState("general"); // "general" | "anomaly" | "webhook"
 
   // Action bar state
   const [focusSite, setFocusSite] = useState(null); // {site_id, source}
@@ -141,6 +143,7 @@ export default function App() {
     flush: "idle",         // idle | confirm | loading | ok | error
     detect: "idle",
     discover: "idle",      // idle | running | ok | error
+    collect: "idle",       // idle | loading | ok | error
     swapFocus: "idle",
     orgDetection: "idle",  // idle | loading | ok | error
   });
@@ -309,6 +312,23 @@ export default function App() {
     }
   }
 
+  async function handleCollectEvents() {
+    if (!selectedSite) return;
+    setAS("collect", "loading");
+    try {
+      const endpoint = selectedSite === ORG_FOCUS_VALUE
+        ? `${API_BASE}/api/v1/org/collect`
+        : `${API_BASE}/api/v1/sites/${selectedSite}/collect`;
+      const r = await apiFetch(endpoint, { method: "POST" });
+      if (!r.ok && r.status !== 409) throw new Error(`HTTP ${r.status}`);
+      setAS("collect", "ok");
+      setTimeout(() => setAS("collect", "idle"), 2000);
+    } catch {
+      setAS("collect", "error");
+      setTimeout(() => setAS("collect", "idle"), 3000);
+    }
+  }
+
   async function handleSwapFocus() {
     if (!selectedSite) return;
     setAS("swapFocus", "loading");
@@ -351,7 +371,6 @@ export default function App() {
       enabled: false, url: "", scope: "org_and_site", marvis_tshoot_enabled: false, family_size_threshold: 1,
     });
     setWebhookSaveState("idle");
-    setWebhookModalOpen(true);
   }
 
   async function handleSaveWebhookConfig() {
@@ -368,7 +387,7 @@ export default function App() {
       setWebhookConfig(saved);
       setWebhookSaveState("ok");
       setTimeout(() => {
-        setWebhookModalOpen(false);
+        setConfigModalOpen(false);
         setWebhookSaveState("idle");
       }, 800);
     } catch {
@@ -384,7 +403,6 @@ export default function App() {
       anomaly_min_mac_events: 5,
     });
     setGeneralConfigSaveState("idle");
-    setGeneralConfigModalOpen(true);
   }
 
   async function handleSaveGeneralConfig() {
@@ -400,7 +418,7 @@ export default function App() {
       const saved = await r.json();
       setGeneralConfig(saved);
       setGeneralConfigSaveState("ok");
-      setTimeout(() => { setGeneralConfigModalOpen(false); setGeneralConfigSaveState("idle"); }, 800);
+      setTimeout(() => { setConfigModalOpen(false); setGeneralConfigSaveState("idle"); }, 800);
     } catch {
       setGeneralConfigSaveState("error");
     }
@@ -415,13 +433,18 @@ export default function App() {
       anomaly_finding_threshold: 0.2,
       anomaly_min_peers: 3,
       anomaly_centroid_if_min_families: 3,
-      anomaly_centroid_dist_max_families: 8,
+      anomaly_centroid_dist_max_families: 10,
       anomaly_centroid_dist_threshold: 0.35,
       anomaly_health_score_threshold: 0.80,
       markov_family_outlier_ratio: 0.5,
+      markov_stuck_loop_threshold: 0.4,
+      markov_stuck_loop_min_events: 20,
+      markov_min_episode_length: 3,
+      markov_outlier_episode_ratio: 0.5,
+      markov_short_episode_min_count: 3,
+      markov_min_scoreable_episodes: 2,
     });
     setAnomalyConfigSaveState("idle");
-    setAnomalyConfigModalOpen(true);
   }
 
   async function handleSaveAnomalyConfig() {
@@ -437,7 +460,7 @@ export default function App() {
       const saved = await r.json();
       setAnomalyConfig(saved);
       setAnomalyConfigSaveState("ok");
-      setTimeout(() => { setAnomalyConfigModalOpen(false); setAnomalyConfigSaveState("idle"); }, 800);
+      setTimeout(() => { setConfigModalOpen(false); setAnomalyConfigSaveState("idle"); }, 800);
     } catch {
       setAnomalyConfigSaveState("error");
     }
@@ -585,21 +608,75 @@ export default function App() {
             </div>
           )}
 
-          <button
-            onClick={() => { clearToken(); setTokenState(null); }}
-            style={{
-              marginLeft: "auto",
-              background: "transparent",
-              color: "#555",
-              border: "1px solid #2a2a2a",
-              padding: "4px 10px",
-              borderRadius: "4px",
-              cursor: "pointer",
-              fontSize: "12px",
-            }}
-          >
-            Sign out
-          </button>
+          {/* Utilities Dropdown */}
+          {selectedSite && (
+            <div style={{ position: "relative" }}>
+              <button
+                onClick={() => setUtilDropdownOpen(o => !o)}
+                onBlur={() => setTimeout(() => setUtilDropdownOpen(false), 150)}
+                style={{ background: "#222", color: "#888", border: "1px solid #444", padding: "4px 8px", borderRadius: "4px", cursor: "pointer", fontSize: "13px", fontFamily: "monospace" }}
+              >
+                Utilities ▾
+              </button>
+              {utilDropdownOpen && (
+                <div style={{ position: "absolute", top: "100%", left: 0, zIndex: 100, background: "#1a1a1a", border: "1px solid #444", borderRadius: "4px", marginTop: "2px", minWidth: "180px", boxShadow: "0 4px 12px rgba(0,0,0,0.5)" }}>
+                  {[
+                    { key: "clientRefresh", label: "Client Refresh", handler: handleClientRefresh, loadLabel: "Refreshing…", okLabel: "Refreshed ✓" },
+                    { key: "discover", label: "Full Discovery", handler: handleFullDiscovery, loadLabel: "Discovering…", okLabel: "Done ✓", loadKey: "running" },
+                    { key: "collect", label: "Full Events", handler: handleCollectEvents, loadLabel: "Collecting…", okLabel: "Collected ✓" },
+                    { key: "detect", label: "Re-detect Anomalies", handler: handleDetect, loadLabel: "Detecting…", okLabel: "Done ✓" },
+                  ].map(item => {
+                    const s = actionState[item.key];
+                    const busy = s === "loading" || s === "running";
+                    const label = busy ? item.loadLabel : s === "ok" ? item.okLabel : s === "error" ? "Error ✗" : item.label;
+                    return (
+                      <div
+                        key={item.key}
+                        onMouseDown={() => { if (!busy) { item.handler(); setUtilDropdownOpen(false); } }}
+                        onMouseEnter={e => { if (!busy) e.currentTarget.style.background = "#252525"; }}
+                        onMouseLeave={e => e.currentTarget.style.background = "transparent"}
+                        style={{ padding: "7px 12px", cursor: busy ? "default" : "pointer", fontSize: "12px", fontFamily: "monospace", color: s === "ok" ? "#2d7a4f" : s === "error" ? "#e05555" : busy ? "#555" : "#ccc", borderBottom: "1px solid #2a2a2a" }}
+                      >
+                        {label}
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          )}
+
+          <div style={{ marginLeft: "auto", display: "flex", gap: "8px", alignItems: "center" }}>
+            <button
+              onClick={() => { setConfigTab("general"); setConfigModalOpen(true); handleOpenGeneralConfig(); }}
+              style={{
+                background: "transparent",
+                color: "#7ec8e3",
+                border: "1px solid #2d5a8a",
+                padding: "4px 10px",
+                borderRadius: "4px",
+                cursor: "pointer",
+                fontSize: "12px",
+                fontFamily: "monospace",
+              }}
+            >
+              Config
+            </button>
+            <button
+              onClick={() => { clearToken(); setTokenState(null); }}
+              style={{
+                background: "transparent",
+                color: "#555",
+                border: "1px solid #2a2a2a",
+                padding: "4px 10px",
+                borderRadius: "4px",
+                cursor: "pointer",
+                fontSize: "12px",
+              }}
+            >
+              Sign out
+            </button>
+          </div>
         </div>
 
         {/* Action bar */}
@@ -664,36 +741,6 @@ export default function App() {
 
           <div style={{ width: "1px", height: "24px", background: "#2a2a2a" }} />
 
-          {/* Client Refresh */}
-          {(() => {
-            const s = actionState.clientRefresh;
-            const isOrg = selectedSite === ORG_FOCUS_VALUE;
-            const label = isOrg ? "Org Client Refresh" : "Client Refresh";
-            return (
-              <button
-                onClick={handleClientRefresh}
-                disabled={!selectedSite || s === "loading"}
-                style={actionBtnStyle(s)}
-              >
-                {s === "loading" ? "Refreshing…" : s === "ok" ? "Refreshed ✓" : s === "error" ? "Error ✗" : label}
-              </button>
-            );
-          })()}
-
-          {/* Full Discovery */}
-          {(() => {
-            const s = actionState.discover;
-            return (
-              <button
-                onClick={handleFullDiscovery}
-                disabled={!selectedSite || s === "running" || actionState.clientRefresh === "loading"}
-                style={actionBtnStyle(s === "running" ? "loading" : s)}
-              >
-                {s === "running" ? "Discovering…" : s === "ok" ? "Discovery Done ✓" : s === "error" ? "Error ✗" : "Full Discovery"}
-              </button>
-            );
-          })()}
-
           {/* Flush Events */}
           {(() => {
             const s = actionState.flush;
@@ -704,59 +751,6 @@ export default function App() {
                 style={actionBtnStyle(s === "confirm" ? "warn" : s)}
               >
                 {s === "loading" ? "Flushing…" : s === "confirm" ? "Confirm Flush?" : s === "ok" ? "Flushed ✓" : s === "error" ? "Error ✗" : "Flush Events"}
-              </button>
-            );
-          })()}
-
-          {/* Re-trigger Detection */}
-          {(() => {
-            const s = actionState.detect;
-            return (
-              <button
-                onClick={handleDetect}
-                disabled={!selectedSite || s === "loading"}
-                style={actionBtnStyle(s)}
-              >
-                {s === "loading" ? "Detecting…" : s === "ok" ? "Detection Done ✓" : s === "error" ? "Error ✗" : "Re-detect Anomalies"}
-              </button>
-            );
-          })()}
-
-          <div style={{ width: "1px", height: "24px", background: "#2a2a2a" }} />
-
-          {/* General Config */}
-          <button
-            onClick={handleOpenGeneralConfig}
-            title="Configure operational settings (intervals, thresholds)"
-            style={{ ...actionBtnStyle("idle"), color: "#aaa", borderColor: "#333" }}
-          >
-            General Config
-          </button>
-
-          {/* Anomaly Config */}
-          <button
-            onClick={handleOpenAnomalyConfig}
-            title="Configure ML anomaly detection parameters"
-            style={{ ...actionBtnStyle("idle"), color: "#aaa", borderColor: "#333" }}
-          >
-            Anomaly Config
-          </button>
-
-          {/* Webhook Configuration */}
-          {(() => {
-            const active = webhookConfig?.enabled;
-            return (
-              <button
-                onClick={handleOpenWebhookConfig}
-                title="Configure webhook dispatch settings"
-                style={{
-                  ...actionBtnStyle("idle"),
-                  borderColor: active ? "#2d5a8a" : "#333",
-                  color: active ? "#7ec8e3" : "#888",
-                  background: active ? "#0d1f2e" : "#1a1a1a",
-                }}
-              >
-                Webhook Config{active ? " ●" : ""}
               </button>
             );
           })()}
@@ -826,373 +820,415 @@ export default function App() {
         />
       )}
 
-      {/* General Config Modal */}
-      {generalConfigModalOpen && generalConfigDraft && (
+      {/* Unified Config Modal */}
+      {configModalOpen && (
         <div
           style={{ position: "fixed", inset: 0, zIndex: 200, background: "rgba(0,0,0,0.65)", display: "flex", alignItems: "center", justifyContent: "center" }}
-          onClick={(e) => { if (e.target === e.currentTarget) setGeneralConfigModalOpen(false); }}
+          onClick={(e) => { if (e.target === e.currentTarget) setConfigModalOpen(false); }}
         >
-          <div style={{ background: "#161616", border: "1px solid #2a2a3a", borderRadius: "6px", padding: "24px 28px", width: "480px", maxWidth: "95vw", boxShadow: "0 8px 32px rgba(0,0,0,0.7)", fontFamily: "monospace" }}>
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "20px" }}>
-              <h2 style={{ margin: 0, fontSize: "15px", color: "#7ec8e3" }}>General Config</h2>
-              <button onClick={() => setGeneralConfigModalOpen(false)} style={{ background: "none", border: "none", color: "#555", cursor: "pointer", fontSize: "18px", lineHeight: 1, padding: "0 2px" }}>×</button>
+          <div style={{ background: "#161616", border: "1px solid #2a2a3a", borderRadius: "6px", padding: "24px 28px", width: "540px", maxWidth: "95vw", maxHeight: "90vh", overflowY: "auto", boxShadow: "0 8px 32px rgba(0,0,0,0.7)", fontFamily: "monospace" }}>
+            {/* Header with close */}
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "16px" }}>
+              <h2 style={{ margin: 0, fontSize: "15px", color: "#7ec8e3" }}>Configuration</h2>
+              <button onClick={() => setConfigModalOpen(false)} style={{ background: "none", border: "none", color: "#555", cursor: "pointer", fontSize: "18px", lineHeight: 1, padding: "0 2px" }}>×</button>
             </div>
 
-            {/* Detection Interval */}
-            <div style={{ marginBottom: "18px" }}>
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: "5px" }}>
-                <div style={{ color: "#888", fontSize: "11px" }}>SITE DETECTION INTERVAL (MINUTES)</div>
-                <div style={{ color: "#7ec8e3", fontSize: "13px", fontWeight: "bold" }}>{generalConfigDraft.site_focus_detection_interval} min</div>
-              </div>
-              <input type="range" min={1} max={120} value={generalConfigDraft.site_focus_detection_interval} onChange={(e) => setGeneralConfigDraft(d => ({ ...d, site_focus_detection_interval: Number(e.target.value) }))} style={{ width: "100%", accentColor: "#7ec8e3", cursor: "pointer" }} />
-              <div style={{ color: "#555", fontSize: "11px", marginTop: "4px" }}>How often the detection pipeline runs for the focused site. Lower values = more frequent detection but more Mist API calls.</div>
-            </div>
-
-            {/* Org Detection Interval */}
-            <div style={{ marginBottom: "18px" }}>
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: "5px" }}>
-                <div style={{ color: "#888", fontSize: "11px" }}>ORG DETECTION INTERVAL (HOURS)</div>
-                <div style={{ color: "#7ec8e3", fontSize: "13px", fontWeight: "bold" }}>{generalConfigDraft.org_detection_interval_hours} hr</div>
-              </div>
-              <input type="range" min={1} max={24} value={generalConfigDraft.org_detection_interval_hours} onChange={(e) => setGeneralConfigDraft(d => ({ ...d, org_detection_interval_hours: Number(e.target.value) }))} style={{ width: "100%", accentColor: "#7ec8e3", cursor: "pointer" }} />
-              <div style={{ color: "#555", fontSize: "11px", marginTop: "4px" }}>How often the org-wide cross-site detection job runs. Each run collects events from all org sites and scores them together.</div>
-            </div>
-
-            {/* Cache Miss Threshold */}
-            <div style={{ marginBottom: "18px" }}>
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: "5px" }}>
-                <div style={{ color: "#888", fontSize: "11px" }}>CACHE MISS REFRESH THRESHOLD</div>
-                <div style={{ color: "#7ec8e3", fontSize: "13px", fontWeight: "bold" }}>{generalConfigDraft.cache_miss_refresh_threshold} misses</div>
-              </div>
-              <input type="range" min={1} max={100} value={generalConfigDraft.cache_miss_refresh_threshold} onChange={(e) => setGeneralConfigDraft(d => ({ ...d, cache_miss_refresh_threshold: Number(e.target.value) }))} style={{ width: "100%", accentColor: "#7ec8e3", cursor: "pointer" }} />
-              <div style={{ color: "#555", fontSize: "11px", marginTop: "4px" }}>Number of MAC cache misses per batch that trigger an early client cache refresh. Prevents stale device family labels mid-cycle.</div>
-            </div>
-
-            {/* Min MAC Events */}
-            <div style={{ marginBottom: "24px", paddingBottom: "20px", borderBottom: "1px solid #222" }}>
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: "5px" }}>
-                <div style={{ color: "#888", fontSize: "11px" }}>MIN MAC EVENTS FOR ML SCORING</div>
-                <div style={{ color: "#7ec8e3", fontSize: "13px", fontWeight: "bold" }}>{generalConfigDraft.anomaly_min_mac_events} events</div>
-              </div>
-              <input type="range" min={1} max={50} value={generalConfigDraft.anomaly_min_mac_events} onChange={(e) => setGeneralConfigDraft(d => ({ ...d, anomaly_min_mac_events: Number(e.target.value) }))} style={{ width: "100%", accentColor: "#7ec8e3", cursor: "pointer" }} />
-              <div style={{ color: "#555", fontSize: "11px", marginTop: "4px" }}>Minimum events a MAC must have in the rolling 24hr window to be included in anomaly scoring. Lower for IoT/device WLANs; raise for high-traffic WLANs.</div>
-            </div>
-
-            {/* Save / Cancel */}
-            <div style={{ display: "flex", gap: "10px", justifyContent: "flex-end" }}>
-              <button onClick={() => setGeneralConfigModalOpen(false)} style={{ background: "transparent", color: "#666", border: "1px solid #2a2a2a", borderRadius: "4px", padding: "6px 16px", cursor: "pointer", fontSize: "12px", fontFamily: "monospace" }}>Cancel</button>
-              <button
-                onClick={handleSaveGeneralConfig}
-                disabled={generalConfigSaveState === "saving"}
-                style={{ background: generalConfigSaveState === "ok" ? "#1a3a1a" : generalConfigSaveState === "error" ? "#2a1515" : "#0d2a38", color: generalConfigSaveState === "ok" ? "#2d7a4f" : generalConfigSaveState === "error" ? "#e05555" : "#7ec8e3", border: `1px solid ${generalConfigSaveState === "ok" ? "#2d7a4f55" : generalConfigSaveState === "error" ? "#e0555555" : "#2d5a8a"}`, borderRadius: "4px", padding: "6px 18px", cursor: generalConfigSaveState === "saving" ? "default" : "pointer", fontSize: "12px", fontFamily: "monospace" }}
-              >
-                {generalConfigSaveState === "saving" ? "Saving…" : generalConfigSaveState === "ok" ? "Saved ✓" : generalConfigSaveState === "error" ? "Error ✗" : "Save"}
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Anomaly Config Modal */}
-      {anomalyConfigModalOpen && anomalyConfigDraft && (
-        <div
-          style={{ position: "fixed", inset: 0, zIndex: 200, background: "rgba(0,0,0,0.65)", display: "flex", alignItems: "center", justifyContent: "center" }}
-          onClick={(e) => { if (e.target === e.currentTarget) setAnomalyConfigModalOpen(false); }}
-        >
-          <div style={{ background: "#161616", border: "1px solid #2a2a3a", borderRadius: "6px", padding: "24px 28px", width: "520px", maxWidth: "95vw", maxHeight: "90vh", overflowY: "auto", boxShadow: "0 8px 32px rgba(0,0,0,0.7)", fontFamily: "monospace" }}>
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "6px" }}>
-              <h2 style={{ margin: 0, fontSize: "15px", color: "#7ec8e3" }}>Anomaly Config</h2>
-              <button onClick={() => setAnomalyConfigModalOpen(false)} style={{ background: "none", border: "none", color: "#555", cursor: "pointer", fontSize: "18px", lineHeight: 1, padding: "0 2px" }}>×</button>
-            </div>
-            <div style={{ color: "#c08030", fontSize: "11px", marginBottom: "20px", background: "#2a1f10", border: "1px solid #3a2a10", borderRadius: "4px", padding: "7px 10px" }}>
-              Changes take effect on the next detection run. Click <strong>Re-detect Anomalies</strong> in the toolbar to apply immediately.
-            </div>
-
-            {/* ── Isolation Forest ── */}
-            <div style={{ color: "#555", fontSize: "10px", letterSpacing: "0.08em", marginBottom: "12px" }}>ISOLATION FOREST</div>
-
-            <div style={{ marginBottom: "18px" }}>
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: "5px" }}>
-                <div style={{ color: "#888", fontSize: "11px" }}>IF CONTAMINATION</div>
-                <div style={{ color: "#7ec8e3", fontSize: "13px", fontWeight: "bold" }}>{anomalyConfigDraft.anomaly_if_contamination.toFixed(2)}</div>
-              </div>
-              <input type="range" min={1} max={50} value={Math.round(anomalyConfigDraft.anomaly_if_contamination * 100)} onChange={(e) => setAnomalyConfigDraft(d => ({ ...d, anomaly_if_contamination: Number(e.target.value) / 100 }))} style={{ width: "100%", accentColor: "#7ec8e3", cursor: "pointer" }} />
-              <div style={{ color: "#555", fontSize: "11px", marginTop: "4px" }}>Expected fraction of MACs per family that are behavioral outliers. Lower = stricter (fewer individual flags). Range: 0.01–0.50.</div>
-            </div>
-
-            <div style={{ marginBottom: "18px" }}>
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: "5px" }}>
-                <div style={{ color: "#888", fontSize: "11px" }}>MIN PEERS FOR IF</div>
-                <div style={{ color: "#7ec8e3", fontSize: "13px", fontWeight: "bold" }}>{anomalyConfigDraft.anomaly_min_peers}</div>
-              </div>
-              <input type="range" min={2} max={20} value={anomalyConfigDraft.anomaly_min_peers} onChange={(e) => setAnomalyConfigDraft(d => ({ ...d, anomaly_min_peers: Number(e.target.value) }))} style={{ width: "100%", accentColor: "#7ec8e3", cursor: "pointer" }} />
-              <div style={{ color: "#555", fontSize: "11px", marginTop: "4px" }}>Minimum MACs a family needs at a site before Isolation Forest runs on it. Families below this threshold use org-level pooling.</div>
-            </div>
-
-            {/* ── DBSCAN ── */}
-            <div style={{ color: "#555", fontSize: "10px", letterSpacing: "0.08em", marginBottom: "12px", marginTop: "4px" }}>DBSCAN</div>
-
-            <div style={{ marginBottom: "18px" }}>
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: "5px" }}>
-                <div style={{ color: "#888", fontSize: "11px" }}>DBSCAN EPSILON (EPS)</div>
-                <div style={{ color: "#7ec8e3", fontSize: "13px", fontWeight: "bold" }}>{anomalyConfigDraft.anomaly_dbscan_eps.toFixed(1)}</div>
-              </div>
-              <input type="range" min={1} max={100} value={Math.round(anomalyConfigDraft.anomaly_dbscan_eps * 10)} onChange={(e) => setAnomalyConfigDraft(d => ({ ...d, anomaly_dbscan_eps: Number(e.target.value) / 10 }))} style={{ width: "100%", accentColor: "#7ec8e3", cursor: "pointer" }} />
-              <div style={{ color: "#555", fontSize: "11px", marginTop: "4px" }}>Neighborhood radius in PCA-reduced feature space. Higher = looser clusters (fewer noise/outlier points). Re-tune with a k-distance plot.</div>
-            </div>
-
-            <div style={{ marginBottom: "18px" }}>
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: "5px" }}>
-                <div style={{ color: "#888", fontSize: "11px" }}>DBSCAN MIN SAMPLES</div>
-                <div style={{ color: "#7ec8e3", fontSize: "13px", fontWeight: "bold" }}>{anomalyConfigDraft.anomaly_dbscan_min_samples}</div>
-              </div>
-              <input type="range" min={2} max={30} value={anomalyConfigDraft.anomaly_dbscan_min_samples} onChange={(e) => setAnomalyConfigDraft(d => ({ ...d, anomaly_dbscan_min_samples: Number(e.target.value) }))} style={{ width: "100%", accentColor: "#7ec8e3", cursor: "pointer" }} />
-              <div style={{ color: "#555", fontSize: "11px", marginTop: "4px" }}>Minimum neighbors required for a point to be a DBSCAN core point. Lower = easier cluster formation (fewer orphan noise points).</div>
-            </div>
-
-            <div style={{ marginBottom: "18px" }}>
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: "5px" }}>
-                <div style={{ color: "#888", fontSize: "11px" }}>DBSCAN MIN FAMILY SIZE</div>
-                <div style={{ color: "#7ec8e3", fontSize: "13px", fontWeight: "bold" }}>{anomalyConfigDraft.anomaly_dbscan_min_family_size}</div>
-              </div>
-              <input type="range" min={1} max={20} value={anomalyConfigDraft.anomaly_dbscan_min_family_size} onChange={(e) => setAnomalyConfigDraft(d => ({ ...d, anomaly_dbscan_min_family_size: Number(e.target.value) }))} style={{ width: "100%", accentColor: "#7ec8e3", cursor: "pointer" }} />
-              <div style={{ color: "#555", fontSize: "11px", marginTop: "4px" }}>Minimum MACs a family must have to participate in site-wide DBSCAN. Smaller families skip DBSCAN but still go through Isolation Forest.</div>
-            </div>
-
-            {/* ── Centroid Detection ── */}
-            <div style={{ color: "#555", fontSize: "10px", letterSpacing: "0.08em", marginBottom: "12px", marginTop: "4px" }}>CENTROID DETECTION (INTER-FAMILY)</div>
-
-            <div style={{ marginBottom: "18px" }}>
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: "5px" }}>
-                <div style={{ color: "#888", fontSize: "11px" }}>MIN QUALIFYING FAMILIES</div>
-                <div style={{ color: "#7ec8e3", fontSize: "13px", fontWeight: "bold" }}>{anomalyConfigDraft.anomaly_centroid_if_min_families}</div>
-              </div>
-              <input type="range" min={2} max={20} value={anomalyConfigDraft.anomaly_centroid_if_min_families} onChange={(e) => setAnomalyConfigDraft(d => ({ ...d, anomaly_centroid_if_min_families: Number(e.target.value) }))} style={{ width: "100%", accentColor: "#7ec8e3", cursor: "pointer" }} />
-              <div style={{ color: "#555", fontSize: "11px", marginTop: "4px" }}>Minimum qualifying device families required before inter-family centroid detection runs. Below this, all families pass (no family-level flags).</div>
-            </div>
-
-            <div style={{ marginBottom: "18px" }}>
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: "5px" }}>
-                <div style={{ color: "#888", fontSize: "11px" }}>COSINE DISTANCE MAX FAMILIES</div>
-                <div style={{ color: "#7ec8e3", fontSize: "13px", fontWeight: "bold" }}>{anomalyConfigDraft.anomaly_centroid_dist_max_families}</div>
-              </div>
-              <input type="range" min={3} max={30} value={anomalyConfigDraft.anomaly_centroid_dist_max_families} onChange={(e) => setAnomalyConfigDraft(d => ({ ...d, anomaly_centroid_dist_max_families: Number(e.target.value) }))} style={{ width: "100%", accentColor: "#7ec8e3", cursor: "pointer" }} />
-              <div style={{ color: "#555", fontSize: "11px", marginTop: "4px" }}>Sites with up to this many qualifying families use cosine-distance detection instead of Isolation Forest. IF is statistically unreliable at small N.</div>
-            </div>
-
-            <div style={{ marginBottom: "18px" }}>
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: "5px" }}>
-                <div style={{ color: "#888", fontSize: "11px" }}>COSINE DISTANCE THRESHOLD</div>
-                <div style={{ color: "#7ec8e3", fontSize: "13px", fontWeight: "bold" }}>{anomalyConfigDraft.anomaly_centroid_dist_threshold.toFixed(2)}</div>
-              </div>
-              <input type="range" min={0} max={100} value={Math.round(anomalyConfigDraft.anomaly_centroid_dist_threshold * 100)} onChange={(e) => setAnomalyConfigDraft(d => ({ ...d, anomaly_centroid_dist_threshold: Number(e.target.value) / 100 }))} style={{ width: "100%", accentColor: "#7ec8e3", cursor: "pointer" }} />
-              <div style={{ color: "#555", fontSize: "11px", marginTop: "4px" }}>Cosine distance from the population median above which a family centroid is flagged as a behavioral outlier (is_family_outlier). Higher = less sensitive.</div>
-            </div>
-
-            {/* ── Finding Rollup ── */}
-            <div style={{ color: "#555", fontSize: "10px", letterSpacing: "0.08em", marginBottom: "12px", marginTop: "4px" }}>FINDING ROLLUP</div>
-
-            <div style={{ marginBottom: "18px" }}>
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: "5px" }}>
-                <div style={{ color: "#888", fontSize: "11px" }}>FINDING THRESHOLD</div>
-                <div style={{ color: "#7ec8e3", fontSize: "13px", fontWeight: "bold" }}>{(anomalyConfigDraft.anomaly_finding_threshold * 100).toFixed(0)}%</div>
-              </div>
-              <input type="range" min={0} max={100} value={Math.round(anomalyConfigDraft.anomaly_finding_threshold * 100)} onChange={(e) => setAnomalyConfigDraft(d => ({ ...d, anomaly_finding_threshold: Number(e.target.value) / 100 }))} style={{ width: "100%", accentColor: "#7ec8e3", cursor: "pointer" }} />
-              <div style={{ color: "#555", fontSize: "11px", marginTop: "4px" }}>Fraction of outlier MACs required before a finding is generated for a device family. Lower = more findings. Severity is separate (minimal/moderate/significant).</div>
-            </div>
-
-            {/* ── Health Score ── */}
-            <div style={{ color: "#555", fontSize: "10px", letterSpacing: "0.08em", marginBottom: "12px", marginTop: "4px" }}>HEALTH SCORE</div>
-
-            <div style={{ marginBottom: "18px" }}>
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: "5px" }}>
-                <div style={{ color: "#888", fontSize: "11px" }}>HEALTH SCORE THRESHOLD</div>
-                <div style={{ color: "#7ec8e3", fontSize: "13px", fontWeight: "bold" }}>{(anomalyConfigDraft.anomaly_health_score_threshold * 100).toFixed(0)}%</div>
-              </div>
-              <input type="range" min={0} max={100} value={Math.round(anomalyConfigDraft.anomaly_health_score_threshold * 100)} onChange={(e) => setAnomalyConfigDraft(d => ({ ...d, anomaly_health_score_threshold: Number(e.target.value) / 100 }))} style={{ width: "100%", accentColor: "#7ec8e3", cursor: "pointer" }} />
-              <div style={{ color: "#555", fontSize: "11px", marginTop: "4px" }}>Health score below which a family is considered degraded. Both anomaly AND health must fail for the webhook dual gate to trigger an alert.</div>
-            </div>
-
-            {/* ── Markov Chain ── */}
-            <div style={{ color: "#555", fontSize: "10px", letterSpacing: "0.08em", marginBottom: "12px", marginTop: "4px" }}>MARKOV CHAIN</div>
-
-            <div style={{ marginBottom: "24px", paddingBottom: "20px", borderBottom: "1px solid #222" }}>
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: "5px" }}>
-                <div style={{ color: "#888", fontSize: "11px" }}>FAMILY OUTLIER RATIO</div>
-                <div style={{ color: "#7ec8e3", fontSize: "13px", fontWeight: "bold" }}>{(anomalyConfigDraft.markov_family_outlier_ratio * 100).toFixed(0)}%</div>
-              </div>
-              <input type="range" min={0} max={100} value={Math.round(anomalyConfigDraft.markov_family_outlier_ratio * 100)} onChange={(e) => setAnomalyConfigDraft(d => ({ ...d, markov_family_outlier_ratio: Number(e.target.value) / 100 }))} style={{ width: "100%", accentColor: "#7ec8e3", cursor: "pointer" }} />
-              <div style={{ color: "#555", fontSize: "11px", marginTop: "4px" }}>Fraction of clients in a family with anomalous Markov episode patterns before the family is flagged as is_family_markov_outlier.</div>
-            </div>
-
-            {/* Save / Cancel */}
-            <div style={{ display: "flex", gap: "10px", justifyContent: "flex-end" }}>
-              <button onClick={() => setAnomalyConfigModalOpen(false)} style={{ background: "transparent", color: "#666", border: "1px solid #2a2a2a", borderRadius: "4px", padding: "6px 16px", cursor: "pointer", fontSize: "12px", fontFamily: "monospace" }}>Cancel</button>
-              <button
-                onClick={handleSaveAnomalyConfig}
-                disabled={anomalyConfigSaveState === "saving"}
-                style={{ background: anomalyConfigSaveState === "ok" ? "#1a3a1a" : anomalyConfigSaveState === "error" ? "#2a1515" : "#0d2a38", color: anomalyConfigSaveState === "ok" ? "#2d7a4f" : anomalyConfigSaveState === "error" ? "#e05555" : "#7ec8e3", border: `1px solid ${anomalyConfigSaveState === "ok" ? "#2d7a4f55" : anomalyConfigSaveState === "error" ? "#e0555555" : "#2d5a8a"}`, borderRadius: "4px", padding: "6px 18px", cursor: anomalyConfigSaveState === "saving" ? "default" : "pointer", fontSize: "12px", fontFamily: "monospace" }}
-              >
-                {anomalyConfigSaveState === "saving" ? "Saving…" : anomalyConfigSaveState === "ok" ? "Saved ✓" : anomalyConfigSaveState === "error" ? "Error ✗" : "Save"}
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Webhook Configuration Modal */}
-      {webhookModalOpen && webhookDraft && (
-        <div
-          style={{
-            position: "fixed", inset: 0, zIndex: 200,
-            background: "rgba(0,0,0,0.65)",
-            display: "flex", alignItems: "center", justifyContent: "center",
-          }}
-          onClick={(e) => { if (e.target === e.currentTarget) setWebhookModalOpen(false); }}
-        >
-          <div style={{
-            background: "#161616",
-            border: "1px solid #2a2a3a",
-            borderRadius: "6px",
-            padding: "24px 28px",
-            width: "460px",
-            maxWidth: "95vw",
-            boxShadow: "0 8px 32px rgba(0,0,0,0.7)",
-            fontFamily: "monospace",
-          }}>
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "20px" }}>
-              <h2 style={{ margin: 0, fontSize: "15px", color: "#7ec8e3" }}>Webhook Configuration</h2>
-              <button
-                onClick={() => setWebhookModalOpen(false)}
-                style={{ background: "none", border: "none", color: "#555", cursor: "pointer", fontSize: "18px", lineHeight: 1, padding: "0 2px" }}
-              >×</button>
-            </div>
-
-            {/* Webhooks Enabled */}
-            <div style={{ marginBottom: "18px" }}>
-              <label style={{ display: "flex", alignItems: "center", gap: "10px", cursor: "pointer" }}>
-                <input
-                  type="checkbox"
-                  checked={!!webhookDraft.enabled}
-                  onChange={(e) => setWebhookDraft(d => ({ ...d, enabled: e.target.checked }))}
-                  style={{ width: "15px", height: "15px", accentColor: "#7ec8e3", cursor: "pointer" }}
-                />
-                <span style={{ color: "#e0e0e0", fontSize: "13px" }}>Webhooks enabled</span>
-              </label>
-            </div>
-
-            {/* Webhook URL */}
-            <div style={{ marginBottom: "18px" }}>
-              <div style={{ color: "#888", fontSize: "11px", marginBottom: "5px" }}>WEBHOOK HTTP TARGET</div>
-              <input
-                type="text"
-                value={webhookDraft.url ?? ""}
-                onChange={(e) => setWebhookDraft(d => ({ ...d, url: e.target.value }))}
-                placeholder="https://your-server/webhook"
-                disabled={!webhookDraft.enabled}
-                style={{
-                  width: "100%",
-                  boxSizing: "border-box",
-                  background: webhookDraft.enabled ? "#1e1e2e" : "#141414",
-                  color: webhookDraft.enabled ? "#e0e0e0" : "#444",
-                  border: "1px solid #2a2a3a",
-                  borderRadius: "4px",
-                  padding: "6px 10px",
-                  fontSize: "12px",
-                  fontFamily: "monospace",
-                }}
-              />
-            </div>
-
-            {/* Webhook Scope */}
-            <div style={{ marginBottom: "18px" }}>
-              <div style={{ color: "#888", fontSize: "11px", marginBottom: "8px" }}>WEBHOOK SCOPE</div>
+            {/* Tab bar */}
+            <div style={{ display: "flex", gap: "4px", marginBottom: "20px", borderBottom: "1px solid #2a2a2a", paddingBottom: "0" }}>
               {[
-                { value: "org_and_site", label: "Org alarms and site alarms", desc: "Dispatch for both org-wide and per-site dual-gate alerts" },
-                { value: "org_only",     label: "Org alarms only",            desc: "Suppress site-level dispatches; only fire on org-wide findings" },
-              ].map(opt => (
-                <label key={opt.value} style={{ display: "flex", alignItems: "flex-start", gap: "10px", marginBottom: "10px", cursor: webhookDraft.enabled ? "pointer" : "default" }}>
+                { key: "general", label: "General Config" },
+                { key: "anomaly", label: "Anomaly Config" },
+                { key: "webhook", label: "Webhook Config" },
+              ].map(tab => {
+                const active = configTab === tab.key;
+                return (
+                  <button
+                    key={tab.key}
+                    onClick={() => {
+                      setConfigTab(tab.key);
+                      if (tab.key === "general") handleOpenGeneralConfig();
+                      else if (tab.key === "anomaly") handleOpenAnomalyConfig();
+                      else handleOpenWebhookConfig();
+                    }}
+                    style={{
+                      background: active ? "#1a2a3a" : "transparent",
+                      color: active ? "#7ec8e3" : "#666",
+                      border: "1px solid",
+                      borderColor: active ? "#2d5a8a" : "transparent",
+                      borderBottom: active ? "1px solid #161616" : "1px solid #2a2a2a",
+                      borderRadius: "4px 4px 0 0",
+                      padding: "6px 14px",
+                      cursor: "pointer",
+                      fontSize: "12px",
+                      fontFamily: "monospace",
+                      marginBottom: "-1px",
+                    }}
+                  >
+                    {tab.label}
+                  </button>
+                );
+              })}
+            </div>
+
+            {/* ═══════ General Config Tab ═══════ */}
+            {configTab === "general" && generalConfigDraft && (<>
+              <div style={{ marginBottom: "18px" }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: "5px" }}>
+                  <div style={{ color: "#888", fontSize: "11px" }}>SITE DETECTION INTERVAL (MINUTES)</div>
+                  <div style={{ color: "#7ec8e3", fontSize: "13px", fontWeight: "bold" }}>{generalConfigDraft.site_focus_detection_interval} min</div>
+                </div>
+                <input type="range" min={1} max={120} value={generalConfigDraft.site_focus_detection_interval} onChange={(e) => setGeneralConfigDraft(d => ({ ...d, site_focus_detection_interval: Number(e.target.value) }))} style={{ width: "100%", accentColor: "#7ec8e3", cursor: "pointer" }} />
+                <div style={{ color: "#555", fontSize: "11px", marginTop: "4px" }}>How often the detection pipeline runs for the focused site. Lower values = more frequent detection but more Mist API calls.</div>
+              </div>
+
+              <div style={{ marginBottom: "18px" }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: "5px" }}>
+                  <div style={{ color: "#888", fontSize: "11px" }}>ORG DETECTION INTERVAL (HOURS)</div>
+                  <div style={{ color: "#7ec8e3", fontSize: "13px", fontWeight: "bold" }}>{generalConfigDraft.org_detection_interval_hours} hr</div>
+                </div>
+                <input type="range" min={1} max={24} value={generalConfigDraft.org_detection_interval_hours} onChange={(e) => setGeneralConfigDraft(d => ({ ...d, org_detection_interval_hours: Number(e.target.value) }))} style={{ width: "100%", accentColor: "#7ec8e3", cursor: "pointer" }} />
+                <div style={{ color: "#555", fontSize: "11px", marginTop: "4px" }}>How often the org-wide cross-site detection job runs. Each run collects events from all org sites and scores them together.</div>
+              </div>
+
+              <div style={{ marginBottom: "18px" }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: "5px" }}>
+                  <div style={{ color: "#888", fontSize: "11px" }}>CACHE MISS REFRESH THRESHOLD</div>
+                  <div style={{ color: "#7ec8e3", fontSize: "13px", fontWeight: "bold" }}>{generalConfigDraft.cache_miss_refresh_threshold} misses</div>
+                </div>
+                <input type="range" min={1} max={100} value={generalConfigDraft.cache_miss_refresh_threshold} onChange={(e) => setGeneralConfigDraft(d => ({ ...d, cache_miss_refresh_threshold: Number(e.target.value) }))} style={{ width: "100%", accentColor: "#7ec8e3", cursor: "pointer" }} />
+                <div style={{ color: "#555", fontSize: "11px", marginTop: "4px" }}>Number of MAC cache misses per batch that trigger an early client cache refresh. Prevents stale device family labels mid-cycle.</div>
+              </div>
+
+              <div style={{ marginBottom: "24px", paddingBottom: "20px", borderBottom: "1px solid #222" }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: "5px" }}>
+                  <div style={{ color: "#888", fontSize: "11px" }}>MIN MAC EVENTS FOR ML SCORING</div>
+                  <div style={{ color: "#7ec8e3", fontSize: "13px", fontWeight: "bold" }}>{generalConfigDraft.anomaly_min_mac_events} events</div>
+                </div>
+                <input type="range" min={1} max={50} value={generalConfigDraft.anomaly_min_mac_events} onChange={(e) => setGeneralConfigDraft(d => ({ ...d, anomaly_min_mac_events: Number(e.target.value) }))} style={{ width: "100%", accentColor: "#7ec8e3", cursor: "pointer" }} />
+                <div style={{ color: "#555", fontSize: "11px", marginTop: "4px" }}>Minimum events a MAC must have in the rolling 24hr window to be included in anomaly scoring. Lower for IoT/device WLANs; raise for high-traffic WLANs.</div>
+              </div>
+
+              <div style={{ display: "flex", gap: "10px", justifyContent: "flex-end" }}>
+                <button onClick={() => setConfigModalOpen(false)} style={{ background: "transparent", color: "#666", border: "1px solid #2a2a2a", borderRadius: "4px", padding: "6px 16px", cursor: "pointer", fontSize: "12px", fontFamily: "monospace" }}>Cancel</button>
+                <button
+                  onClick={handleSaveGeneralConfig}
+                  disabled={generalConfigSaveState === "saving"}
+                  style={{ background: generalConfigSaveState === "ok" ? "#1a3a1a" : generalConfigSaveState === "error" ? "#2a1515" : "#0d2a38", color: generalConfigSaveState === "ok" ? "#2d7a4f" : generalConfigSaveState === "error" ? "#e05555" : "#7ec8e3", border: `1px solid ${generalConfigSaveState === "ok" ? "#2d7a4f55" : generalConfigSaveState === "error" ? "#e0555555" : "#2d5a8a"}`, borderRadius: "4px", padding: "6px 18px", cursor: generalConfigSaveState === "saving" ? "default" : "pointer", fontSize: "12px", fontFamily: "monospace" }}
+                >
+                  {generalConfigSaveState === "saving" ? "Saving…" : generalConfigSaveState === "ok" ? "Saved ✓" : generalConfigSaveState === "error" ? "Error ✗" : "Save"}
+                </button>
+              </div>
+            </>)}
+
+            {/* ═══════ Anomaly Config Tab ═══════ */}
+            {configTab === "anomaly" && anomalyConfigDraft && (<>
+              <div style={{ color: "#c08030", fontSize: "11px", marginBottom: "20px", background: "#2a1f10", border: "1px solid #3a2a10", borderRadius: "4px", padding: "7px 10px" }}>
+                Changes take effect on the next detection run. Use <strong>Utilities → Re-detect Anomalies</strong> to apply immediately.
+              </div>
+
+              {/* ── Isolation Forest ── */}
+              <div style={{ color: "#555", fontSize: "10px", letterSpacing: "0.08em", marginBottom: "12px" }}>ISOLATION FOREST</div>
+
+              <div style={{ marginBottom: "18px" }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: "5px" }}>
+                  <div style={{ color: "#888", fontSize: "11px" }}>IF CONTAMINATION</div>
+                  <div style={{ color: "#7ec8e3", fontSize: "13px", fontWeight: "bold" }}>{anomalyConfigDraft.anomaly_if_contamination.toFixed(2)}</div>
+                </div>
+                <input type="range" min={1} max={50} value={Math.round(anomalyConfigDraft.anomaly_if_contamination * 100)} onChange={(e) => setAnomalyConfigDraft(d => ({ ...d, anomaly_if_contamination: Number(e.target.value) / 100 }))} style={{ width: "100%", accentColor: "#7ec8e3", cursor: "pointer" }} />
+                <div style={{ color: "#555", fontSize: "11px", marginTop: "4px" }}>Expected fraction of MACs per family that are behavioral outliers. Lower = stricter (fewer individual flags). Range: 0.01–0.50.</div>
+              </div>
+
+              <div style={{ marginBottom: "18px" }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: "5px" }}>
+                  <div style={{ color: "#888", fontSize: "11px" }}>MIN PEERS FOR IF</div>
+                  <div style={{ color: "#7ec8e3", fontSize: "13px", fontWeight: "bold" }}>{anomalyConfigDraft.anomaly_min_peers}</div>
+                </div>
+                <input type="range" min={2} max={20} value={anomalyConfigDraft.anomaly_min_peers} onChange={(e) => setAnomalyConfigDraft(d => ({ ...d, anomaly_min_peers: Number(e.target.value) }))} style={{ width: "100%", accentColor: "#7ec8e3", cursor: "pointer" }} />
+                <div style={{ color: "#555", fontSize: "11px", marginTop: "4px" }}>Minimum MACs a family needs at a site before Isolation Forest runs on it. Families below this threshold use org-level pooling.</div>
+              </div>
+
+              {/* ── DBSCAN ── */}
+              <div style={{ color: "#555", fontSize: "10px", letterSpacing: "0.08em", marginBottom: "12px", marginTop: "4px" }}>DBSCAN</div>
+
+              <div style={{ marginBottom: "18px" }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: "5px" }}>
+                  <div style={{ color: "#888", fontSize: "11px" }}>DBSCAN EPSILON (EPS)</div>
+                  <div style={{ color: "#7ec8e3", fontSize: "13px", fontWeight: "bold" }}>{anomalyConfigDraft.anomaly_dbscan_eps.toFixed(1)}</div>
+                </div>
+                <input type="range" min={1} max={100} value={Math.round(anomalyConfigDraft.anomaly_dbscan_eps * 10)} onChange={(e) => setAnomalyConfigDraft(d => ({ ...d, anomaly_dbscan_eps: Number(e.target.value) / 10 }))} style={{ width: "100%", accentColor: "#7ec8e3", cursor: "pointer" }} />
+                <div style={{ color: "#555", fontSize: "11px", marginTop: "4px" }}>Neighborhood radius in PCA-reduced feature space. Higher = looser clusters (fewer noise/outlier points). Re-tune with a k-distance plot.</div>
+              </div>
+
+              <div style={{ marginBottom: "18px" }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: "5px" }}>
+                  <div style={{ color: "#888", fontSize: "11px" }}>DBSCAN MIN SAMPLES</div>
+                  <div style={{ color: "#7ec8e3", fontSize: "13px", fontWeight: "bold" }}>{anomalyConfigDraft.anomaly_dbscan_min_samples}</div>
+                </div>
+                <input type="range" min={2} max={30} value={anomalyConfigDraft.anomaly_dbscan_min_samples} onChange={(e) => setAnomalyConfigDraft(d => ({ ...d, anomaly_dbscan_min_samples: Number(e.target.value) }))} style={{ width: "100%", accentColor: "#7ec8e3", cursor: "pointer" }} />
+                <div style={{ color: "#555", fontSize: "11px", marginTop: "4px" }}>Minimum neighbors required for a point to be a DBSCAN core point. Lower = easier cluster formation (fewer orphan noise points).</div>
+              </div>
+
+              <div style={{ marginBottom: "18px" }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: "5px" }}>
+                  <div style={{ color: "#888", fontSize: "11px" }}>DBSCAN MIN FAMILY SIZE</div>
+                  <div style={{ color: "#7ec8e3", fontSize: "13px", fontWeight: "bold" }}>{anomalyConfigDraft.anomaly_dbscan_min_family_size}</div>
+                </div>
+                <input type="range" min={1} max={20} value={anomalyConfigDraft.anomaly_dbscan_min_family_size} onChange={(e) => setAnomalyConfigDraft(d => ({ ...d, anomaly_dbscan_min_family_size: Number(e.target.value) }))} style={{ width: "100%", accentColor: "#7ec8e3", cursor: "pointer" }} />
+                <div style={{ color: "#555", fontSize: "11px", marginTop: "4px" }}>Minimum MACs a family must have to participate in site-wide DBSCAN. Smaller families skip DBSCAN but still go through Isolation Forest.</div>
+              </div>
+
+              {/* ── Centroid Detection ── */}
+              <div style={{ color: "#555", fontSize: "10px", letterSpacing: "0.08em", marginBottom: "12px", marginTop: "4px" }}>CENTROID DETECTION (INTER-FAMILY)</div>
+
+              <div style={{ marginBottom: "18px" }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: "5px" }}>
+                  <div style={{ color: "#888", fontSize: "11px" }}>MIN QUALIFYING FAMILIES</div>
+                  <div style={{ color: "#7ec8e3", fontSize: "13px", fontWeight: "bold" }}>{anomalyConfigDraft.anomaly_centroid_if_min_families}</div>
+                </div>
+                <input type="range" min={2} max={20} value={anomalyConfigDraft.anomaly_centroid_if_min_families} onChange={(e) => setAnomalyConfigDraft(d => ({ ...d, anomaly_centroid_if_min_families: Number(e.target.value) }))} style={{ width: "100%", accentColor: "#7ec8e3", cursor: "pointer" }} />
+                <div style={{ color: "#555", fontSize: "11px", marginTop: "4px" }}>Minimum qualifying device families required before inter-family centroid detection runs. Below this, all families pass (no family-level flags).</div>
+              </div>
+
+              <div style={{ marginBottom: "18px" }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: "5px" }}>
+                  <div style={{ color: "#888", fontSize: "11px" }}>COSINE DISTANCE MAX FAMILIES</div>
+                  <div style={{ color: "#7ec8e3", fontSize: "13px", fontWeight: "bold" }}>{anomalyConfigDraft.anomaly_centroid_dist_max_families}</div>
+                </div>
+                <input type="range" min={3} max={30} value={anomalyConfigDraft.anomaly_centroid_dist_max_families} onChange={(e) => setAnomalyConfigDraft(d => ({ ...d, anomaly_centroid_dist_max_families: Number(e.target.value) }))} style={{ width: "100%", accentColor: "#7ec8e3", cursor: "pointer" }} />
+                <div style={{ color: "#555", fontSize: "11px", marginTop: "4px" }}>Sites with up to this many qualifying families use cosine-distance detection instead of Isolation Forest. IF is statistically unreliable at small N.</div>
+              </div>
+
+              <div style={{ marginBottom: "18px" }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: "5px" }}>
+                  <div style={{ color: "#888", fontSize: "11px" }}>COSINE DISTANCE THRESHOLD</div>
+                  <div style={{ color: "#7ec8e3", fontSize: "13px", fontWeight: "bold" }}>{anomalyConfigDraft.anomaly_centroid_dist_threshold.toFixed(2)}</div>
+                </div>
+                <input type="range" min={0} max={100} value={Math.round(anomalyConfigDraft.anomaly_centroid_dist_threshold * 100)} onChange={(e) => setAnomalyConfigDraft(d => ({ ...d, anomaly_centroid_dist_threshold: Number(e.target.value) / 100 }))} style={{ width: "100%", accentColor: "#7ec8e3", cursor: "pointer" }} />
+                <div style={{ color: "#555", fontSize: "11px", marginTop: "4px" }}>Cosine distance from the population median above which a family centroid is flagged as a behavioral outlier (is_family_outlier). Higher = less sensitive.</div>
+              </div>
+
+              {/* ── Centroid Healthy Ref ── */}
+              <div style={{ color: "#555", fontSize: "10px", letterSpacing: "0.08em", marginBottom: "12px", marginTop: "4px" }}>CENTROID HEALTHY REFERENCE</div>
+
+              <div style={{ marginBottom: "18px" }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: "5px" }}>
+                  <div style={{ color: "#888", fontSize: "11px" }}>HEALTHY REF THRESHOLD</div>
+                  <div style={{ color: "#7ec8e3", fontSize: "13px", fontWeight: "bold" }}>{((anomalyConfigDraft.anomaly_centroid_healthy_ref_threshold ?? 0.75) * 100).toFixed(0)}%</div>
+                </div>
+                <input type="range" min={0} max={100} value={Math.round((anomalyConfigDraft.anomaly_centroid_healthy_ref_threshold ?? 0.75) * 100)} onChange={(e) => setAnomalyConfigDraft(d => ({ ...d, anomaly_centroid_healthy_ref_threshold: Number(e.target.value) / 100 }))} style={{ width: "100%", accentColor: "#7ec8e3", cursor: "pointer" }} />
+                <div style={{ color: "#555", fontSize: "11px", marginTop: "4px" }}>Families with mean health above this form the healthy reference pool for centroid detection. Below this they are measured against it, not part of it.</div>
+              </div>
+
+              {/* ── Finding Rollup ── */}
+              <div style={{ color: "#555", fontSize: "10px", letterSpacing: "0.08em", marginBottom: "12px", marginTop: "4px" }}>FINDING ROLLUP</div>
+
+              <div style={{ marginBottom: "18px" }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: "5px" }}>
+                  <div style={{ color: "#888", fontSize: "11px" }}>FINDING THRESHOLD</div>
+                  <div style={{ color: "#7ec8e3", fontSize: "13px", fontWeight: "bold" }}>{(anomalyConfigDraft.anomaly_finding_threshold * 100).toFixed(0)}%</div>
+                </div>
+                <input type="range" min={0} max={100} value={Math.round(anomalyConfigDraft.anomaly_finding_threshold * 100)} onChange={(e) => setAnomalyConfigDraft(d => ({ ...d, anomaly_finding_threshold: Number(e.target.value) / 100 }))} style={{ width: "100%", accentColor: "#7ec8e3", cursor: "pointer" }} />
+                <div style={{ color: "#555", fontSize: "11px", marginTop: "4px" }}>Fraction of outlier MACs required before a finding is generated for a device family. Lower = more findings. Severity is separate (minimal/moderate/significant).</div>
+              </div>
+
+              {/* ── Health Score ── */}
+              <div style={{ color: "#555", fontSize: "10px", letterSpacing: "0.08em", marginBottom: "12px", marginTop: "4px" }}>HEALTH SCORE</div>
+
+              <div style={{ marginBottom: "18px" }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: "5px" }}>
+                  <div style={{ color: "#888", fontSize: "11px" }}>HEALTH SCORE THRESHOLD</div>
+                  <div style={{ color: "#7ec8e3", fontSize: "13px", fontWeight: "bold" }}>{(anomalyConfigDraft.anomaly_health_score_threshold * 100).toFixed(0)}%</div>
+                </div>
+                <input type="range" min={0} max={100} value={Math.round(anomalyConfigDraft.anomaly_health_score_threshold * 100)} onChange={(e) => setAnomalyConfigDraft(d => ({ ...d, anomaly_health_score_threshold: Number(e.target.value) / 100 }))} style={{ width: "100%", accentColor: "#7ec8e3", cursor: "pointer" }} />
+                <div style={{ color: "#555", fontSize: "11px", marginTop: "4px" }}>Health score below which a family is considered degraded. Both anomaly AND health must fail for the webhook dual gate to trigger an alert.</div>
+              </div>
+
+              {/* ── Markov Chain ── */}
+              <div style={{ color: "#555", fontSize: "10px", letterSpacing: "0.08em", marginBottom: "12px", marginTop: "4px" }}>MARKOV CHAIN</div>
+
+              <div style={{ marginBottom: "18px" }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: "5px" }}>
+                  <div style={{ color: "#888", fontSize: "11px" }}>FAMILY OUTLIER RATIO</div>
+                  <div style={{ color: "#7ec8e3", fontSize: "13px", fontWeight: "bold" }}>{(anomalyConfigDraft.markov_family_outlier_ratio * 100).toFixed(0)}%</div>
+                </div>
+                <input type="range" min={0} max={100} value={Math.round(anomalyConfigDraft.markov_family_outlier_ratio * 100)} onChange={(e) => setAnomalyConfigDraft(d => ({ ...d, markov_family_outlier_ratio: Number(e.target.value) / 100 }))} style={{ width: "100%", accentColor: "#7ec8e3", cursor: "pointer" }} />
+                <div style={{ color: "#555", fontSize: "11px", marginTop: "4px" }}>Fraction of clients in a family with anomalous Markov episode patterns before the family is flagged as is_family_markov_outlier.</div>
+              </div>
+
+              <div style={{ marginBottom: "18px" }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: "5px" }}>
+                  <div style={{ color: "#888", fontSize: "11px" }}>STUCK LOOP THRESHOLD</div>
+                  <div style={{ color: "#7ec8e3", fontSize: "13px", fontWeight: "bold" }}>{(anomalyConfigDraft.markov_stuck_loop_threshold * 100).toFixed(0)}%</div>
+                </div>
+                <input type="range" min={10} max={90} value={Math.round(anomalyConfigDraft.markov_stuck_loop_threshold * 100)} onChange={(e) => setAnomalyConfigDraft(d => ({ ...d, markov_stuck_loop_threshold: Number(e.target.value) / 100 }))} style={{ width: "100%", accentColor: "#7ec8e3", cursor: "pointer" }} />
+                <div style={{ color: "#555", fontSize: "11px", marginTop: "4px" }}>Fraction of a MAC's transition pairs dominated by a single failure pair to flag it as stuck in a loop. Baseline-independent — catches devices that contaminate their own Markov baseline.</div>
+              </div>
+
+              <div style={{ marginBottom: "18px" }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: "5px" }}>
+                  <div style={{ color: "#888", fontSize: "11px" }}>STUCK LOOP MIN EVENTS</div>
+                  <div style={{ color: "#7ec8e3", fontSize: "13px", fontWeight: "bold" }}>{anomalyConfigDraft.markov_stuck_loop_min_events}</div>
+                </div>
+                <input type="range" min={5} max={200} value={anomalyConfigDraft.markov_stuck_loop_min_events} onChange={(e) => setAnomalyConfigDraft(d => ({ ...d, markov_stuck_loop_min_events: Number(e.target.value) }))} style={{ width: "100%", accentColor: "#7ec8e3", cursor: "pointer" }} />
+                <div style={{ color: "#555", fontSize: "11px", marginTop: "4px" }}>Minimum events a MAC must have before stuck-loop detection runs. Fewer events makes single-pair dominance statistically noisy.</div>
+              </div>
+
+              <div style={{ marginBottom: "18px" }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: "5px" }}>
+                  <div style={{ color: "#888", fontSize: "11px" }}>MIN EPISODE LENGTH</div>
+                  <div style={{ color: "#7ec8e3", fontSize: "13px", fontWeight: "bold" }}>{anomalyConfigDraft.markov_min_episode_length}</div>
+                </div>
+                <input type="range" min={2} max={20} value={anomalyConfigDraft.markov_min_episode_length} onChange={(e) => setAnomalyConfigDraft(d => ({ ...d, markov_min_episode_length: Number(e.target.value) }))} style={{ width: "100%", accentColor: "#7ec8e3", cursor: "pointer" }} />
+                <div style={{ color: "#555", fontSize: "11px", marginTop: "4px" }}>Episodes shorter than this go into the short-episode state machine. Longer episodes are scored via the event-level transition matrix.</div>
+              </div>
+
+              <div style={{ marginBottom: "18px" }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: "5px" }}>
+                  <div style={{ color: "#888", fontSize: "11px" }}>EPISODE OUTLIER RATIO</div>
+                  <div style={{ color: "#7ec8e3", fontSize: "13px", fontWeight: "bold" }}>{(anomalyConfigDraft.markov_outlier_episode_ratio * 100).toFixed(0)}%</div>
+                </div>
+                <input type="range" min={10} max={100} value={Math.round(anomalyConfigDraft.markov_outlier_episode_ratio * 100)} onChange={(e) => setAnomalyConfigDraft(d => ({ ...d, markov_outlier_episode_ratio: Number(e.target.value) / 100 }))} style={{ width: "100%", accentColor: "#7ec8e3", cursor: "pointer" }} />
+                <div style={{ color: "#555", fontSize: "11px", marginTop: "4px" }}>Fraction of a MAC's scoreable normal episodes that must be anomalous to flag the MAC as a Markov outlier.</div>
+              </div>
+
+              <div style={{ marginBottom: "18px" }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: "5px" }}>
+                  <div style={{ color: "#888", fontSize: "11px" }}>SHORT EPISODE MIN COUNT</div>
+                  <div style={{ color: "#7ec8e3", fontSize: "13px", fontWeight: "bold" }}>{anomalyConfigDraft.markov_short_episode_min_count}</div>
+                </div>
+                <input type="range" min={1} max={20} value={anomalyConfigDraft.markov_short_episode_min_count} onChange={(e) => setAnomalyConfigDraft(d => ({ ...d, markov_short_episode_min_count: Number(e.target.value) }))} style={{ width: "100%", accentColor: "#7ec8e3", cursor: "pointer" }} />
+                <div style={{ color: "#555", fontSize: "11px", marginTop: "4px" }}>Minimum number of short episodes before the repeated-short-episode flag can trigger.</div>
+              </div>
+
+              <div style={{ marginBottom: "24px", paddingBottom: "20px", borderBottom: "1px solid #222" }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: "5px" }}>
+                  <div style={{ color: "#888", fontSize: "11px" }}>MIN SCOREABLE EPISODES</div>
+                  <div style={{ color: "#7ec8e3", fontSize: "13px", fontWeight: "bold" }}>{anomalyConfigDraft.markov_min_scoreable_episodes}</div>
+                </div>
+                <input type="range" min={1} max={20} value={anomalyConfigDraft.markov_min_scoreable_episodes} onChange={(e) => setAnomalyConfigDraft(d => ({ ...d, markov_min_scoreable_episodes: Number(e.target.value) }))} style={{ width: "100%", accentColor: "#7ec8e3", cursor: "pointer" }} />
+                <div style={{ color: "#555", fontSize: "11px", marginTop: "4px" }}>Minimum scoreable normal episodes required before event-level ratio is computed. MACs with fewer are evaluated only via short-episode and sequence rules.</div>
+              </div>
+
+              <div style={{ display: "flex", gap: "10px", justifyContent: "flex-end" }}>
+                <button onClick={() => setConfigModalOpen(false)} style={{ background: "transparent", color: "#666", border: "1px solid #2a2a2a", borderRadius: "4px", padding: "6px 16px", cursor: "pointer", fontSize: "12px", fontFamily: "monospace" }}>Cancel</button>
+                <button
+                  onClick={handleSaveAnomalyConfig}
+                  disabled={anomalyConfigSaveState === "saving"}
+                  style={{ background: anomalyConfigSaveState === "ok" ? "#1a3a1a" : anomalyConfigSaveState === "error" ? "#2a1515" : "#0d2a38", color: anomalyConfigSaveState === "ok" ? "#2d7a4f" : anomalyConfigSaveState === "error" ? "#e05555" : "#7ec8e3", border: `1px solid ${anomalyConfigSaveState === "ok" ? "#2d7a4f55" : anomalyConfigSaveState === "error" ? "#e0555555" : "#2d5a8a"}`, borderRadius: "4px", padding: "6px 18px", cursor: anomalyConfigSaveState === "saving" ? "default" : "pointer", fontSize: "12px", fontFamily: "monospace" }}
+                >
+                  {anomalyConfigSaveState === "saving" ? "Saving…" : anomalyConfigSaveState === "ok" ? "Saved ✓" : anomalyConfigSaveState === "error" ? "Error ✗" : "Save"}
+                </button>
+              </div>
+            </>)}
+
+            {/* ═══════ Webhook Config Tab ═══════ */}
+            {configTab === "webhook" && webhookDraft && (<>
+              <div style={{ marginBottom: "18px" }}>
+                <label style={{ display: "flex", alignItems: "center", gap: "10px", cursor: "pointer" }}>
                   <input
-                    type="radio"
-                    name="webhook-scope"
-                    value={opt.value}
-                    checked={webhookDraft.scope === opt.value}
-                    onChange={() => setWebhookDraft(d => ({ ...d, scope: opt.value }))}
+                    type="checkbox"
+                    checked={!!webhookDraft.enabled}
+                    onChange={(e) => setWebhookDraft(d => ({ ...d, enabled: e.target.checked }))}
+                    style={{ width: "15px", height: "15px", accentColor: "#7ec8e3", cursor: "pointer" }}
+                  />
+                  <span style={{ color: "#e0e0e0", fontSize: "13px" }}>Webhooks enabled</span>
+                </label>
+              </div>
+
+              <div style={{ marginBottom: "18px" }}>
+                <div style={{ color: "#888", fontSize: "11px", marginBottom: "5px" }}>WEBHOOK HTTP TARGET</div>
+                <input
+                  type="text"
+                  value={webhookDraft.url ?? ""}
+                  onChange={(e) => setWebhookDraft(d => ({ ...d, url: e.target.value }))}
+                  placeholder="https://your-server/webhook"
+                  disabled={!webhookDraft.enabled}
+                  style={{
+                    width: "100%", boxSizing: "border-box",
+                    background: webhookDraft.enabled ? "#1e1e2e" : "#141414",
+                    color: webhookDraft.enabled ? "#e0e0e0" : "#444",
+                    border: "1px solid #2a2a3a", borderRadius: "4px",
+                    padding: "6px 10px", fontSize: "12px", fontFamily: "monospace",
+                  }}
+                />
+              </div>
+
+              <div style={{ marginBottom: "18px" }}>
+                <div style={{ color: "#888", fontSize: "11px", marginBottom: "8px" }}>WEBHOOK SCOPE</div>
+                {[
+                  { value: "org_and_site", label: "Org alarms and site alarms", desc: "Dispatch for both org-wide and per-site dual-gate alerts" },
+                  { value: "org_only",     label: "Org alarms only",            desc: "Suppress site-level dispatches; only fire on org-wide findings" },
+                ].map(opt => (
+                  <label key={opt.value} style={{ display: "flex", alignItems: "flex-start", gap: "10px", marginBottom: "10px", cursor: webhookDraft.enabled ? "pointer" : "default" }}>
+                    <input
+                      type="radio"
+                      name="webhook-scope"
+                      value={opt.value}
+                      checked={webhookDraft.scope === opt.value}
+                      onChange={() => setWebhookDraft(d => ({ ...d, scope: opt.value }))}
+                      disabled={!webhookDraft.enabled}
+                      style={{ marginTop: "2px", accentColor: "#7ec8e3", cursor: "pointer" }}
+                    />
+                    <div>
+                      <div style={{ color: webhookDraft.enabled ? "#e0e0e0" : "#444", fontSize: "13px" }}>{opt.label}</div>
+                      <div style={{ color: webhookDraft.enabled ? "#555" : "#333", fontSize: "11px" }}>{opt.desc}</div>
+                    </div>
+                  </label>
+                ))}
+              </div>
+
+              <div style={{ marginBottom: "18px" }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: "5px" }}>
+                  <div style={{ color: "#888", fontSize: "11px" }}>MINIMUM FAMILY SIZE FOR WEBHOOK</div>
+                  <div style={{ color: webhookDraft.enabled ? "#7ec8e3" : "#444", fontSize: "13px", fontWeight: "bold" }}>
+                    {webhookDraft.family_size_threshold ?? 1} {(webhookDraft.family_size_threshold ?? 1) === 1 ? "device" : "devices"}
+                  </div>
+                </div>
+                <input
+                  type="range" min={1} max={50}
+                  value={webhookDraft.family_size_threshold ?? 1}
+                  onChange={(e) => setWebhookDraft(d => ({ ...d, family_size_threshold: Number(e.target.value) }))}
+                  disabled={!webhookDraft.enabled}
+                  style={{ width: "100%", accentColor: "#7ec8e3", cursor: webhookDraft.enabled ? "pointer" : "default" }}
+                />
+                <div style={{ color: "#555", fontSize: "11px", marginTop: "4px" }}>
+                  Families with fewer affected devices than this threshold appear in the UI as alarms but do not trigger a webhook.
+                </div>
+              </div>
+
+              <div style={{ marginBottom: "24px", paddingBottom: "20px", borderBottom: "1px solid #222" }}>
+                <label style={{ display: "flex", alignItems: "flex-start", gap: "10px", cursor: webhookDraft.enabled ? "pointer" : "default" }}>
+                  <input
+                    type="checkbox"
+                    checked={!!webhookDraft.marvis_tshoot_enabled}
+                    onChange={(e) => setWebhookDraft(d => ({ ...d, marvis_tshoot_enabled: e.target.checked }))}
                     disabled={!webhookDraft.enabled}
-                    style={{ marginTop: "2px", accentColor: "#7ec8e3", cursor: "pointer" }}
+                    style={{ marginTop: "2px", width: "15px", height: "15px", accentColor: "#7ec8e3", cursor: "pointer" }}
                   />
                   <div>
-                    <div style={{ color: webhookDraft.enabled ? "#e0e0e0" : "#444", fontSize: "13px" }}>{opt.label}</div>
-                    <div style={{ color: webhookDraft.enabled ? "#555" : "#333", fontSize: "11px" }}>{opt.desc}</div>
+                    <div style={{ color: webhookDraft.enabled ? "#e0e0e0" : "#444", fontSize: "13px" }}>Marvis TSHOOT augmentation</div>
+                    <div style={{ color: webhookDraft.enabled ? "#555" : "#333", fontSize: "11px" }}>Enrich webhook payloads with Marvis client troubleshoot results for worst-health MACs</div>
                   </div>
                 </label>
-              ))}
-            </div>
-
-            {/* Family Size Threshold */}
-            <div style={{ marginBottom: "18px" }}>
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: "5px" }}>
-                <div style={{ color: "#888", fontSize: "11px" }}>MINIMUM FAMILY SIZE FOR WEBHOOK</div>
-                <div style={{ color: webhookDraft.enabled ? "#7ec8e3" : "#444", fontSize: "13px", fontWeight: "bold" }}>
-                  {webhookDraft.family_size_threshold ?? 1} {(webhookDraft.family_size_threshold ?? 1) === 1 ? "device" : "devices"}
-                </div>
               </div>
-              <input
-                type="range"
-                min={1}
-                max={50}
-                value={webhookDraft.family_size_threshold ?? 1}
-                onChange={(e) => setWebhookDraft(d => ({ ...d, family_size_threshold: Number(e.target.value) }))}
-                disabled={!webhookDraft.enabled}
-                style={{ width: "100%", accentColor: "#7ec8e3", cursor: webhookDraft.enabled ? "pointer" : "default" }}
-              />
-              <div style={{ color: "#555", fontSize: "11px", marginTop: "4px" }}>
-                Families with fewer affected devices than this threshold appear in the UI as alarms but do not trigger a webhook.
+
+              <div style={{ display: "flex", gap: "10px", justifyContent: "flex-end" }}>
+                <button onClick={() => setConfigModalOpen(false)} style={{ background: "transparent", color: "#666", border: "1px solid #2a2a2a", borderRadius: "4px", padding: "6px 16px", cursor: "pointer", fontSize: "12px", fontFamily: "monospace" }}>Cancel</button>
+                <button
+                  onClick={handleSaveWebhookConfig}
+                  disabled={webhookSaveState === "saving"}
+                  style={{
+                    background: webhookSaveState === "ok" ? "#1a3a1a" : webhookSaveState === "error" ? "#2a1515" : "#0d2a38",
+                    color: webhookSaveState === "ok" ? "#2d7a4f" : webhookSaveState === "error" ? "#e05555" : "#7ec8e3",
+                    border: `1px solid ${webhookSaveState === "ok" ? "#2d7a4f55" : webhookSaveState === "error" ? "#e0555555" : "#2d5a8a"}`,
+                    borderRadius: "4px", padding: "6px 18px", cursor: webhookSaveState === "saving" ? "default" : "pointer",
+                    fontSize: "12px", fontFamily: "monospace",
+                  }}
+                >
+                  {webhookSaveState === "saving" ? "Saving…" : webhookSaveState === "ok" ? "Saved ✓" : webhookSaveState === "error" ? "Error ✗" : "Save"}
+                </button>
               </div>
-            </div>
-
-            {/* Marvis TSHOOT */}
-            <div style={{ marginBottom: "24px", paddingBottom: "20px", borderBottom: "1px solid #222" }}>
-              <label style={{ display: "flex", alignItems: "flex-start", gap: "10px", cursor: webhookDraft.enabled ? "pointer" : "default" }}>
-                <input
-                  type="checkbox"
-                  checked={!!webhookDraft.marvis_tshoot_enabled}
-                  onChange={(e) => setWebhookDraft(d => ({ ...d, marvis_tshoot_enabled: e.target.checked }))}
-                  disabled={!webhookDraft.enabled}
-                  style={{ marginTop: "2px", width: "15px", height: "15px", accentColor: "#7ec8e3", cursor: "pointer" }}
-                />
-                <div>
-                  <div style={{ color: webhookDraft.enabled ? "#e0e0e0" : "#444", fontSize: "13px" }}>Marvis TSHOOT augmentation</div>
-                  <div style={{ color: webhookDraft.enabled ? "#555" : "#333", fontSize: "11px" }}>Enrich webhook payloads with Marvis client troubleshoot results for worst-health MACs</div>
-                </div>
-              </label>
-            </div>
-
-            {/* Save / Cancel */}
-            <div style={{ display: "flex", gap: "10px", justifyContent: "flex-end" }}>
-              <button
-                onClick={() => setWebhookModalOpen(false)}
-                style={{
-                  background: "transparent", color: "#666", border: "1px solid #2a2a2a",
-                  borderRadius: "4px", padding: "6px 16px", cursor: "pointer", fontSize: "12px", fontFamily: "monospace",
-                }}
-              >
-                Cancel
-              </button>
-              <button
-                onClick={handleSaveWebhookConfig}
-                disabled={webhookSaveState === "saving"}
-                style={{
-                  background: webhookSaveState === "ok" ? "#1a3a1a" : webhookSaveState === "error" ? "#2a1515" : "#0d2a38",
-                  color: webhookSaveState === "ok" ? "#2d7a4f" : webhookSaveState === "error" ? "#e05555" : "#7ec8e3",
-                  border: `1px solid ${webhookSaveState === "ok" ? "#2d7a4f55" : webhookSaveState === "error" ? "#e0555555" : "#2d5a8a"}`,
-                  borderRadius: "4px", padding: "6px 18px", cursor: webhookSaveState === "saving" ? "default" : "pointer",
-                  fontSize: "12px", fontFamily: "monospace",
-                }}
-              >
-                {webhookSaveState === "saving" ? "Saving…" : webhookSaveState === "ok" ? "Saved ✓" : webhookSaveState === "error" ? "Error ✗" : "Save"}
-              </button>
-            </div>
+            </>)}
           </div>
         </div>
       )}

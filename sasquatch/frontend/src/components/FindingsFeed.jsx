@@ -13,8 +13,8 @@ const ALERT_BG    = "#2a1515";
 const HEALTH_COLOR = "#e0a835";
 const HEALTH_BG    = "#2a2015";
 
-// Families below this health score are considered unhealthy
-const HEALTH_THRESHOLD = 0.75;
+// Default — overridden at runtime by anomaly-config endpoint
+const HEALTH_THRESHOLD_DEFAULT = 0.75;
 
 function shapleyScoreFromIfScore(ifScore) {
   if (ifScore == null) return null;
@@ -135,11 +135,11 @@ function SectionHeader({ label, color, count }) {
   );
 }
 
-function AnomalyFindingCard({ finding, healthData, isAlert, expanded, onToggle, onMacSelect }) {
+function AnomalyFindingCard({ finding, healthData, isAlert, expanded, onToggle, onMacSelect, healthThreshold }) {
   const sev        = finding.severity;
   const hs         = healthData?.health_score ?? null;
   const components = healthData?.components ?? null;
-  const isUnhealthy = hs != null && hs < HEALTH_THRESHOLD;
+  const isUnhealthy = hs != null && hs < healthThreshold;
   const cardColor  = isAlert ? ALERT_COLOR : ANOMALY_COLOR[sev];
   const cardBg     = isAlert ? ALERT_BG    : ANOMALY_BG[sev];
 
@@ -188,7 +188,7 @@ function AnomalyFindingCard({ finding, healthData, isAlert, expanded, onToggle, 
           {finding.is_family_outlier && (
             <span style={{ background: "#2a1a3a", color: "#b06ad4", border: "1px solid #6a3a8a", borderRadius: "3px", padding: "2px 7px", fontSize: "10px" }}
               title="Centroid IF/distance: whole family's collective behavior differs from other families at this site">
-              IF family
+              Centroid
             </span>
           )}
           {finding.is_family_dbscan_outlier && (
@@ -350,9 +350,16 @@ function HealthOnlyCard({ family, data }) {
 export default function FindingsFeed({ siteId, apiBase, onMacSelect, refreshToken, wlan }) {
   const [findings, setFindings] = useState([]);
   const [health, setHealth]     = useState({});
+  const [healthThreshold, setHealthThreshold] = useState(HEALTH_THRESHOLD_DEFAULT);
   const [loading, setLoading]   = useState(true);
   const [error, setError]       = useState(null);
   const [expanded, setExpanded] = useState({});
+
+  useEffect(() => {
+    apiFetch(`${apiBase}/api/v1/anomaly-config`).then(r => r.json())
+      .then(cfg => { if (cfg.anomaly_health_score_threshold != null) setHealthThreshold(cfg.anomaly_health_score_threshold); })
+      .catch(() => {});
+  }, [apiBase]);
 
   const load = useCallback(() => {
     Promise.all([
@@ -396,7 +403,7 @@ export default function FindingsFeed({ siteId, apiBase, onMacSelect, refreshToke
   // GENERAL HEALTH: unhealthy families NOT triggering any anomaly finding
   const findingFamilies = new Set(findings.map(f => f.device_family));
   const healthOnlyFamilies = Object.entries(health)
-    .filter(([fam, data]) => data.health_score < HEALTH_THRESHOLD && !findingFamilies.has(fam))
+    .filter(([fam, data]) => data.health_score < healthThreshold && !findingFamilies.has(fam))
     .sort(([, a], [, b]) => a.health_score - b.health_score);
 
   const hasAnything = ifSectionFindings.length > 0 || dbscanFindings.length > 0 || markovFindings.length > 0 || healthOnlyFamilies.length > 0;
@@ -419,10 +426,11 @@ export default function FindingsFeed({ siteId, apiBase, onMacSelect, refreshToke
         key={`${prefix}-${idx}`}
         finding={finding}
         healthData={familyHealth(finding.device_family)}
-        isAlert={familyHealthScore(finding.device_family) < HEALTH_THRESHOLD}
+        isAlert={familyHealthScore(finding.device_family) < healthThreshold}
         expanded={expanded[`${prefix}-${idx}`]}
         onToggle={() => toggleExpand(`${prefix}-${idx}`)}
         onMacSelect={onMacSelect}
+        healthThreshold={healthThreshold}
       />
     ));
   }
@@ -436,7 +444,7 @@ export default function FindingsFeed({ siteId, apiBase, onMacSelect, refreshToke
       {/* IF CENTROID — whole-family centroid outlier (+ per-device IF catch-all) */}
       {ifSectionFindings.length > 0 && (
         <div>
-          <SectionHeader label="IF CENTROID" color={IF_COLOR} count={ifSectionFindings.length} />
+          <SectionHeader label="CENTROID" color={IF_COLOR} count={ifSectionFindings.length} />
           <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
             {renderFindingCards(ifSectionFindings, "if")}
           </div>
@@ -446,7 +454,7 @@ export default function FindingsFeed({ siteId, apiBase, onMacSelect, refreshToke
       {/* DBSCAN — % of device family are site-wide behavioral outliers */}
       {dbscanFindings.length > 0 && (
         <div>
-          <SectionHeader label="DBSCAN % OF FAMILY" color={DBSCAN_COLOR} count={dbscanFindings.length} />
+          <SectionHeader label="DBSCAN" color={DBSCAN_COLOR} count={dbscanFindings.length} />
           <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
             {renderFindingCards(dbscanFindings, "dbscan")}
           </div>
@@ -456,7 +464,7 @@ export default function FindingsFeed({ siteId, apiBase, onMacSelect, refreshToke
       {/* MARKOV — % of device family have anomalous event-chain patterns */}
       {markovFindings.length > 0 && (
         <div>
-          <SectionHeader label="MARKOV % OF FAMILY" color={MARKOV_COLOR} count={markovFindings.length} />
+          <SectionHeader label="MARKOV" color={MARKOV_COLOR} count={markovFindings.length} />
           <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
             {renderFindingCards(markovFindings, "markov")}
           </div>

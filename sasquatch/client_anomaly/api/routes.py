@@ -165,6 +165,7 @@ async def _run_wlan_detection_bg(site_id: str, redis_client, progress_key: str, 
             await score_health(site_id, wlan)
             scored = await score(site_id, wlan)
             total_macs = max(total_macs, scored)
+            await evaluate_and_dispatch(site_id, wlan=wlan)
         except Exception:
             log.exception(f"WLAN detection failed for site={site_id} wlan={wlan}")
 
@@ -224,11 +225,6 @@ async def _detection_background_task(site_id: str) -> None:
         await wp({"phase": "scoring", "events_fetched": event_count, "total_estimated": event_count, "pages": -1})
 
         wlan_summary = await _run_wlan_detection_bg(site_id, redis_client, progress_key, wp)
-
-        try:
-            await evaluate_and_dispatch(site_id)
-        except Exception:
-            log.exception(f"Webhook dispatch failed for site {site_id} (non-fatal)")
 
         await wp({
             "phase": "complete",
@@ -366,6 +362,8 @@ async def set_webhook_config(body: dict):
 
 # ── General Config + Anomaly Config (file-persisted, survives reboots) ────────
 
+from .. import config as _config_mod
+
 import pathlib as _pathlib
 
 _CONFIG_OVERRIDES_FILE = _pathlib.Path(__file__).parent.parent / "config_overrides.json"
@@ -388,16 +386,8 @@ def _save_config_section(section: str, values: dict) -> None:
 
 @router.get("/general-config")
 async def get_general_config():
-    """Return current general config (env defaults merged with persisted overrides)."""
-    overrides = _load_config_overrides().get("general", {})
-    config = {
-        "site_focus_detection_interval": int(os.getenv("SITE_FOCUS_DETECTION_INTERVAL", "60")),
-        "org_detection_interval_hours": int(os.getenv("ORG_DETECTION_INTERVAL_HOURS", "1")),
-        "cache_miss_refresh_threshold": int(os.getenv("CACHE_MISS_REFRESH_THRESHOLD", "10")),
-        "anomaly_min_mac_events": int(os.getenv("ANOMALY_MIN_MAC_EVENTS", "5")),
-    }
-    config.update(overrides)
-    return config
+    """Return current general config — resolved values from config module."""
+    return _config_mod.get_section("general")
 
 
 @router.post("/general-config")
@@ -428,23 +418,8 @@ async def set_general_config(body: dict):
 
 @router.get("/anomaly-config")
 async def get_anomaly_config():
-    """Return current anomaly detection config (env defaults merged with persisted overrides)."""
-    overrides = _load_config_overrides().get("anomaly", {})
-    config = {
-        "anomaly_if_contamination": float(os.getenv("ANOMALY_IF_CONTAMINATION", "0.05")),
-        "anomaly_dbscan_eps": float(os.getenv("ANOMALY_DBSCAN_EPS", "2.5")),
-        "anomaly_dbscan_min_samples": int(os.getenv("ANOMALY_DBSCAN_MIN_SAMPLES", "5")),
-        "anomaly_dbscan_min_family_size": int(os.getenv("ANOMALY_DBSCAN_MIN_FAMILY_SIZE", "2")),
-        "anomaly_finding_threshold": float(os.getenv("ANOMALY_FINDING_THRESHOLD", "0.2")),
-        "anomaly_min_peers": int(os.getenv("ANOMALY_MIN_PEERS", "3")),
-        "anomaly_centroid_if_min_families": int(os.getenv("ANOMALY_CENTROID_IF_MIN_FAMILIES", "3")),
-        "anomaly_centroid_dist_max_families": int(os.getenv("ANOMALY_CENTROID_DIST_MAX_FAMILIES", "8")),
-        "anomaly_centroid_dist_threshold": float(os.getenv("ANOMALY_CENTROID_DIST_THRESHOLD", "0.35")),
-        "anomaly_health_score_threshold": float(os.getenv("ANOMALY_HEALTH_SCORE_THRESHOLD", "0.80")),
-        "markov_family_outlier_ratio": float(os.getenv("MARKOV_FAMILY_OUTLIER_RATIO", "0.5")),
-    }
-    config.update(overrides)
-    return config
+    """Return current anomaly detection config — all resolved values from config module."""
+    return _config_mod.get_section("anomaly")
 
 
 @router.post("/anomaly-config")
@@ -454,18 +429,32 @@ async def set_anomaly_config(body: dict):
 
     float_bounds = {
         "anomaly_if_contamination": (0.01, 0.5),
+        "anomaly_centroid_if_contamination": (0.01, 0.5),
+        "anomaly_dbscan_pca_variance": (0.5, 1.0),
         "anomaly_dbscan_eps": (0.01, 100.0),
+        "anomaly_dbscan_family_noise_threshold": (0.0, 1.0),
         "anomaly_finding_threshold": (0.0, 1.0),
         "anomaly_centroid_dist_threshold": (0.0, 2.0),
+        "anomaly_centroid_healthy_ref_threshold": (0.0, 1.0),
         "anomaly_health_score_threshold": (0.0, 1.0),
         "markov_family_outlier_ratio": (0.0, 1.0),
+        "markov_outlier_episode_ratio": (0.0, 1.0),
+        "markov_stuck_loop_threshold": (0.0, 1.0),
     }
     int_bounds = {
+        "anomaly_if_n_estimators": (10, 1000),
+        "anomaly_random_state": (-1, 999999),
+        "anomaly_min_peers": (1, 500),
         "anomaly_dbscan_min_samples": (1, 500),
         "anomaly_dbscan_min_family_size": (1, 500),
-        "anomaly_min_peers": (1, 500),
         "anomaly_centroid_if_min_families": (1, 100),
         "anomaly_centroid_dist_max_families": (1, 200),
+        "anomaly_centroid_healthy_ref_min": (1, 100),
+        "anomaly_finding_min_size": (1, 500),
+        "markov_min_episode_length": (1, 100),
+        "markov_short_episode_min_count": (1, 100),
+        "markov_min_scoreable_episodes": (1, 100),
+        "markov_stuck_loop_min_events": (1, 10000),
     }
     for key, (lo, hi) in float_bounds.items():
         if key in body:
@@ -564,7 +553,8 @@ async def get_org_summary(wlan: str = Query(..., description="WLAN (SSID) name t
         raw_org = pipeline_results[n * 2]
         org_findings = json.loads(raw_org) if raw_org else []
 
-        _SUMMARY_HEALTH_THRESHOLD = 0.75
+        from ..webhook_dispatcher import get_health_score_threshold
+        _SUMMARY_HEALTH_THRESHOLD = get_health_score_threshold()
 
         result = []
         for sid, site_name in sites_sorted:
@@ -955,7 +945,8 @@ async def get_org_alerts(wlan: str = Query(..., description="WLAN (SSID) name to
     if not MIST_ORG_ID or not MIST_API_TOKEN:
         raise HTTPException(status_code=500, detail="MIST_ORG_ID or MIST_API_TOKEN not configured.")
 
-    _ALERT_HEALTH_THRESHOLD = 0.75
+    from ..webhook_dispatcher import get_health_score_threshold
+    _ALERT_HEALTH_THRESHOLD = get_health_score_threshold()
 
     redis_client = _get_redis()
     try:

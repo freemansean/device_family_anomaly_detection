@@ -16,7 +16,7 @@ Detects anomalous client behavior at a Juniper Mist site by:
    - **Stage 1 — DBSCAN** (site-wide): flags MACs that don't cluster with any site peer group
    - **Stage 1b — Family Centroid IF**: flags entire device families behaving differently from all other families
    - **Stage 2 — Isolation Forest** (per device family): flags individual MACs anomalous within their family
-   - **Stage 4 — Markov Chain** (see `markov_analyzer.py`): scores event-transition sequences within episodes against a 24hr site baseline; flags families where ≥ `MARKOV_FAMILY_OUTLIER_RATIO` of clients have anomalous connection patterns or repeated short (failed) episodes
+   - **Stage 4 — Markov Chain** (see `markov_analyzer.py`): scores event-transition sequences within episodes against a 24hr site baseline; flags families where ≥ `MARKOV_FAMILY_OUTLIER_RATIO` of clients have anomalous connection patterns, repeated short (failed) episodes, or stuck failure loops (baseline-independent)
 5. Computing a separate per-family **Health Score** (see `health_scorer.py`): mean of per-MAC
    failure rates across AUTH, ROAM, DHCP, DNS, and ARP — independent of the anomaly pipeline
 6. Rolling up MAC-level anomalies to device type findings
@@ -507,7 +507,7 @@ a reminder that it applies to both timing features and the frequency vector.
 
 ### `anomaly_detector.py`
 
-**Purpose:** Score each MAC through a two-stage ML detection pipeline. Produce per-MAC
+**Purpose:** Score each MAC through a four-stage ML detection pipeline. Produce per-MAC
 anomaly scores and roll up to device type findings. Does NOT compute health scores —
 that is handled separately by `health_scorer.py`.
 
@@ -540,8 +540,26 @@ feature vectors concatenated with the component-wise maximum. This is then fed i
 two methods depending on how many qualifying families are present:
 
 - **N < `ANOMALY_CENTROID_IF_MIN_FAMILIES` (default 3):** Step skipped entirely. `is_family_outlier` remains False.
-- **`ANOMALY_CENTROID_IF_MIN_FAMILIES` ≤ N ≤ `ANOMALY_CENTROID_DIST_MAX_FAMILIES` (default 8):** Cosine-distance fallback. Each family row is L2-normalized to a unit vector before computing distances (cosine distance is scale-invariant but requires non-zero-magnitude vectors — do NOT use StandardScaler here as it makes rows zero-mean and causes the median reference to approach the zero vector, producing spuriously high distances everywhere). The element-wise median of all L2-normalized rows is re-normalized to a unit vector and used as the population reference. Each family's cosine distance from that reference is computed. Families exceeding `ANOMALY_CENTROID_DIST_THRESHOLD` (default 0.55) are flagged.
+- **`ANOMALY_CENTROID_IF_MIN_FAMILIES` ≤ N ≤ `ANOMALY_CENTROID_DIST_MAX_FAMILIES` (default 10):** Cosine-distance fallback. Each family row is L2-normalized to a unit vector before computing distances (cosine distance is scale-invariant but requires non-zero-magnitude vectors — do NOT use StandardScaler here as it makes rows zero-mean and causes the median reference to approach the zero vector, producing spuriously high distances everywhere). The element-wise median of L2-normalized rows is re-normalized to a unit vector and used as the population reference. Each family's cosine distance from that reference is computed. Families exceeding `ANOMALY_CENTROID_DIST_THRESHOLD` (default 0.55) are flagged.
 - **N > `ANOMALY_CENTROID_DIST_MAX_FAMILIES`:** Full `IsolationForest` run across all family centroid rows. Families with `decision_function < 0` are flagged.
+
+**Healthy-only reference centroid:** Both the distance and IF paths support a health-aware
+reference mode. Before centroid detection runs, `score()` / `score_org_wide()` computes
+per-family mean health scores from the feature vectors. Families with mean health >=
+`ANOMALY_CENTROID_HEALTHY_REF_THRESHOLD` (default 0.75) form the "healthy reference pool":
+
+- **Distance path:** The reference centroid (element-wise median) is built from healthy
+  families only. All families — including unhealthy ones — are measured against this
+  healthy reference. This prevents a group of failing families from hiding behind each
+  other: even if Awair, Raspberry Pi, and Texas Instruments all share the same auth-failure
+  behavioral signature (and thus look "normal" relative to each other), their centroids
+  point far from the healthy reference and get flagged.
+- **IF path:** The IsolationForest is fitted on healthy family rows only, then all family
+  rows are scored via `decision_function`. Families that don't resemble the healthy model
+  score as anomalous.
+- **Fallback:** If fewer than `ANOMALY_CENTROID_HEALTHY_REF_MIN` (default 2) families are
+  healthy, both paths fall back to the standard all-family reference. The log line reports
+  which mode ran each cycle.
 
 The cosine-distance path exists because IF is statistically unreliable at small N (5–8 rows): contamination-derived thresholds carry little statistical meaning and scores can be noisy between cycles. The distance approach is simpler, more stable, and produces interpretable scores that can be logged and monitored.
 
@@ -573,11 +591,33 @@ passes raw normalized frequencies to StandardScaler without any column weighting
 signals are captured by the separate Health Score — mixing them into the anomaly feature
 space conflates "behaves differently" with "is failing", which are distinct signals.
 
+**Stage 4 — Markov Chain stuck-loop detection (baseline-independent):**
+
+In addition to the existing Markov episode analysis (event-level transition scoring,
+episode-type sequence scoring, repeated-short-episode detection — all baseline-relative),
+`markov_analyzer.py` includes a **stuck-loop detector** (`detect_stuck_loop()`) that runs
+independently of the Markov baseline.
+
+The stuck-loop detector counts all consecutive `(A→B)` event-type transition pairs across
+a MAC's full event stream. If the single most common pair accounts for ≥
+`MARKOV_STUCK_LOOP_THRESHOLD` (default 0.4) of all transitions AND at least one of the
+two event types is a failure/disassoc type, the MAC is flagged `is_stuck_loop=True` →
+`is_markov_outlier=True`.
+
+This is critical for catching devices that contaminate their own Markov baseline: a device
+cycling through `AUTH_FAILURE → DISASSOC` at 149k events will dominate the site-level
+transition matrix, making that pattern appear "normal" to the baseline-relative scorer.
+The stuck-loop detector ignores the baseline entirely — it flags based on absolute
+transition concentration, so the contamination problem is bypassed.
+
+New fields on anomaly records: `is_stuck_loop`, `stuck_loop_pair` (e.g.
+`"MARVIS_EVENT_CLIENT_AUTH_FAILURE→CLIENT_DEAUTHENTICATION"`), `stuck_loop_fraction`.
+
 **Finding rollup logic:**
 
-After both stages, roll up to device family findings:
+After all stages, roll up to device family findings:
 - For each device family: count `is_outlier` MACs / total MACs in family
-- `is_outlier = is_if_outlier OR is_dbscan_outlier OR is_family_outlier`
+- `is_outlier = is_if_outlier OR is_dbscan_outlier OR is_family_outlier OR is_markov_outlier`
 - If outlier_ratio >= `ANOMALY_FINDING_THRESHOLD` (default 0.2), generate a finding
 - Minimum family size to generate a finding:
   - Families that used org-level IF pooling: **MIN_PEERS** (`ANOMALY_MIN_PEERS`, default 3) — higher bar because cross-site data was borrowed; avoids hallucinated site findings driven by org noise
@@ -964,7 +1004,7 @@ computed as a mac_count-weighted average of per-site health scores across all si
 
 ### Findings Alert Logic — Health Threshold
 
-The health threshold used across the frontend and backend is **0.75** (`ANOMALY_HEALTH_SCORE_THRESHOLD`). A device family is "unhealthy" when its health score falls below this value. This threshold is hardcoded as `HEALTH_THRESHOLD = 0.75` in `FindingsFeed.jsx` and `OrgFindingsFeed.jsx`, and as `_ALERT_HEALTH_THRESHOLD = 0.75` in `OrgAlerts.jsx` and `routes.py` (`get_org_alerts`, `get_org_summary`). If the env var threshold is changed, all these frontend constants must be updated to match.
+The health threshold is **dynamic** — set via the Anomaly Config GUI, persisted to `config_overrides.json`, and read at runtime by all consumers. The env var `ANOMALY_HEALTH_SCORE_THRESHOLD` (default 0.75) is used only as a fallback when no GUI override exists. The single source of truth is `webhook_dispatcher.get_health_score_threshold()`, which reads the config overrides file first. Backend routes (`get_org_alerts`, `get_org_summary`) import this function. Frontend components (`FindingsFeed.jsx`, `OrgFindingsFeed.jsx`) fetch the threshold from `GET /api/v1/anomaly-config` on mount. Changes take effect immediately — no restart required.
 
 ### Drilldown Navigation
 
@@ -1003,8 +1043,14 @@ ANOMALY_FINDING_THRESHOLD=0.2
 ANOMALY_MIN_PEERS=5
 ANOMALY_MIN_MAC_EVENTS=20
 ANOMALY_CENTROID_IF_MIN_FAMILIES=3
-ANOMALY_CENTROID_DIST_MAX_FAMILIES=8   # sites with ≤ this many families use cosine-distance; above uses IF
+ANOMALY_CENTROID_DIST_MAX_FAMILIES=10  # sites with ≤ this many families use cosine-distance; above uses IF
 ANOMALY_CENTROID_DIST_THRESHOLD=0.55   # cosine distance (L2-normalized unit vectors) above which a family centroid is flagged
+ANOMALY_CENTROID_HEALTHY_REF_THRESHOLD=0.75  # families below this health excluded from centroid reference population
+ANOMALY_CENTROID_HEALTHY_REF_MIN=2     # minimum healthy families to activate healthy-only reference; otherwise all-family
+
+# Markov Chain stuck-loop detector (markov_analyzer.py)
+MARKOV_STUCK_LOOP_THRESHOLD=0.4        # fraction of transitions dominated by one failure pair to flag stuck-loop
+MARKOV_STUCK_LOOP_MIN_EVENTS=20        # minimum events before stuck-loop detection runs
 
 # Health Score (health_scorer.py)
 # Families with health_score below this value are considered degraded for webhook gating.
