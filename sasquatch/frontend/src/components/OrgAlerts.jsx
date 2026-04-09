@@ -128,8 +128,21 @@ function AlertCard({ finding, onFamilyClick }) {
             </span>
           )}
           {finding.is_family_outlier && (
-            <span style={{ background: "#2a1a3a", color: "#b06ad4", border: "1px solid #6a3a8a", borderRadius: "3px", padding: "2px 7px", fontSize: "10px" }}>
-              family-wide
+            <span style={{ background: "#2a1a3a", color: "#b06ad4", border: "1px solid #6a3a8a", borderRadius: "3px", padding: "2px 7px", fontSize: "10px" }}
+              title="Centroid IF/distance: whole family's collective behavior differs from other families">
+              Centroid
+            </span>
+          )}
+          {finding.is_family_dbscan_outlier && (
+            <span style={{ background: "#1a2a1a", color: "#5ab86c", border: "1px solid #2a6a3a", borderRadius: "3px", padding: "2px 7px", fontSize: "10px" }}
+              title={`DBSCAN: ${finding.dbscan_family_noise_ratio != null ? (finding.dbscan_family_noise_ratio * 100).toFixed(0) + "%" : ""} of family MACs are site-wide behavioral outliers`}>
+              DBSCAN {finding.dbscan_family_noise_ratio != null ? `${(finding.dbscan_family_noise_ratio * 100).toFixed(0)}%` : ""}
+            </span>
+          )}
+          {finding.is_family_markov_outlier && (
+            <span style={{ background: "#1a2a3a", color: "#4ab0e8", border: "1px solid #2a6a8a", borderRadius: "3px", padding: "2px 7px", fontSize: "10px" }}
+              title={`Markov: ${finding.markov_family_anomalous_count ?? ""}/${finding.markov_evaluatable_count ?? ""} clients have anomalous event chain patterns`}>
+              Markov {finding.markov_family_anomaly_ratio != null ? `${(finding.markov_family_anomaly_ratio * 100).toFixed(0)}%` : ""}
             </span>
           )}
         </div>

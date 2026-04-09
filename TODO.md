@@ -57,16 +57,11 @@ so the dashboard can display a warning.
 
 ## Feature Engineering / ML
 
-### 6. `_enrich_event` device_family taken from first event only
-**File:** `sasquatch/client_anomaly/feature_engineer.py:263`
-
-When building feature vectors, `device_family` is read from `evts[0]` — the first event
-for that MAC. If a MAC's events span a cache refresh boundary (old events labeled Unknown,
-new events labeled correctly), the feature record inherits the label of whichever event
-happened to sort first.
-
-**Fix:** Take the majority-vote `device_family` across all events for a MAC, preferring
-any non-Unknown label over Unknown.
+### ~~6. `_enrich_event` device_family taken from first event only~~ RESOLVED
+`build_features()` now majority-votes `device_family` across all events for a MAC.
+Any non-Unknown label beats Unknown — if even one event carries a resolved family
+(post-cache-refresh), the feature record uses it. When all labels are Unknown variants,
+the most frequent one wins. Handles MACs whose events span a cache refresh boundary.
 
 ---
 
@@ -492,6 +487,55 @@ genuine problems. The `GET /sites/{site_id}/status` response should convey
 
 ## Backend — Event Filtering
 
+### 25. Transient failure dampening — failures that self-resolve within 30s should carry reduced weight
+
+**Files:** `sasquatch/client_anomaly/feature_engineer.py`, `health_scorer.py`
+
+A failure event immediately followed by its success counterpart within ~30 seconds represents
+a self-healing transient, not a persistent problem. Examples:
+- `MARVIS_EVENT_CLIENT_AUTH_FAILURE` → `CLIENT_AUTHENTICATED` within 30s (auth retry succeeded)
+- `MARVIS_EVENT_CLIENT_DHCP_FAILURE` → `CLIENT_IP_ASSIGNED` within 30s (DHCP retry succeeded)
+- `MARVIS_EVENT_CLIENT_FBT_FAILURE` → `CLIENT_AUTH_REASSOCIATION_11R` within 30s (roam retry succeeded)
+
+Currently, the failure event counts at full weight in the feature vector and health score
+regardless of whether it resolved. This inflates `failure_ratio_*` dimensions and depresses
+health scores for devices with normal retry behavior, producing false anomaly signal.
+
+**Related:** Item 8 covers auth-burst-specific noise in the timeline display. This item
+addresses the broader dampening problem at the feature engineering and health scoring level
+across all failure categories.
+
+**Design decision — health score only vs. both:**
+
+Dampening transient failures in the ML feature vector may be counterproductive. The ML's
+job is to detect *behavioral patterns*, and a device that repeatedly retries-then-succeeds
+has a genuinely different behavioral signature from one that never fails — that retry loop
+IS part of its behavior and may be worth detecting. Dampening it from the feature vector
+would suppress that signal.
+
+The health score, however, is meant to answer "is this device experiencing real connectivity
+problems?" A transient that resolved within 30s is not a real problem — it should not
+count against health. Dampening only in `health_scorer.py` gives a more accurate health
+signal without interfering with the ML's behavioral pattern detection.
+
+**Preferred approach: health scorer only**
+- In `health_scorer.py`, scan each MAC's events for failure→success pairs within the
+  resolution window before computing the failure rate. Exclude resolved transients from
+  both the failure numerator and denominator (they are non-events for health purposes).
+- Leave `build_mac_feature_vector()` unchanged — the retry behavior remains visible to
+  IF and DBSCAN as a behavioral signal.
+- Store `transient_resolved_count` and `persistent_failure_count` as post-hoc explainer
+  fields for display in the MacDrilldown timeline and finding tooltip.
+- The 30s window should apply to same-category pairs only (auth failure → auth success,
+  DHCP failure → DHCP success, etc.) — do not cross-match across categories.
+
+**Env var to add:**
+```
+ANOMALY_TRANSIENT_RESOLUTION_WINDOW=30   # seconds; failure→success pairs within this window are dampened
+```
+
+---
+
 ### 22. Drop weak-signal events below configurable RSSI threshold
 **File:** `sasquatch/client_anomaly/event_collector.py`
 
@@ -678,34 +722,24 @@ Client devices that are service accounts (e.g., shared login terminals, IoT mana
 
 ---
 
-### 24. GUI-based configuration — move env vars out of .env
+### ~~24. GUI-based configuration — move env vars out of .env~~ RESOLVED
+All General Config and Anomaly Config settings now have best-practice defaults hardcoded
+in `config.py`. Resolution order: `config_overrides.json` (GUI) → env var → hardcoded default.
+No ML/scheduling/health settings need to be present in `.env` — they are fully optional
+overrides. The `.env` file now only contains infrastructure secrets (Mist API, Redis,
+webhook URL, auth credentials, frontend URL).
 
-Currently all tuning parameters live in `.env`, which requires server access to change and makes the system hard to hand off to others. The goal is a settings UI that lets operators configure the system without touching the filesystem.
+---
 
-**Proposed layout:** Two new panels in the header toolbar, positioned just before the existing "Webhook Config" button:
-
-- **General Config** — operational settings:
-  - `SITE_FOCUS_DETECTION_INTERVAL` (minutes between detection runs)
-  - `ORG_DETECTION_INTERVAL_HOURS`
-  - `CACHE_MISS_REFRESH_THRESHOLD`
-  - `MIST_TSHOOT_ENABLED` / `TSHOOT_TIMEOUT_SECONDS` / `TSHOOT_STALENESS_SECONDS`
-  - `ANOMALY_MIN_MAC_EVENTS`
-
-- **Anomaly Config** — ML tuning:
-  - `ANOMALY_IF_CONTAMINATION`
-  - `ANOMALY_DBSCAN_EPS` / `ANOMALY_DBSCAN_MIN_SAMPLES` / `ANOMALY_DBSCAN_MIN_FAMILY_SIZE`
-  - `ANOMALY_FINDING_THRESHOLD`
-  - `ANOMALY_MIN_PEERS`
-  - `ANOMALY_CENTROID_IF_MIN_FAMILIES` / `ANOMALY_CENTROID_DIST_MAX_FAMILIES` / `ANOMALY_CENTROID_DIST_THRESHOLD`
-  - `ANOMALY_HEALTH_SCORE_THRESHOLD`
-  - `MARKOV_FAMILY_OUTLIER_RATIO`
-
-**Implementation approach:**
-- Backend: new `GET /api/v1/config` and `POST /api/v1/config` routes; persist overrides to a `config_overrides.json` file (or a Redis key) so the `.env` remains the baseline default and GUI values take precedence at runtime
-- Frontend: modal panels matching the existing Webhook Config modal style
-- Sensitive values (`MIST_API_TOKEN`, `MIST_ORG_ID`, `MIST_SITE_ID`, `MIST_CLOUD_HOST`, `REDIS_URL`) stay in `.env` only — do not expose in the GUI
-
-**File scope:** `api/routes.py` (new config endpoints), `scheduler.py` (read config at job dispatch time, not module load), frontend config modal components, `.env` (remains authoritative for secrets)
+### ~~25. GUI config overrides not read at runtime — values frozen at import time~~ RESOLVED
+Created `config.py` with a `get(section, key)` function that reads from
+`config_overrides.json` → env var → hardcoded default on every call. All consumer modules
+(`anomaly_detector.py`, `markov_analyzer.py`, `feature_engineer.py`, `event_collector.py`,
+`scheduler.py`) replaced import-time `os.getenv()` constants with runtime `config.get()`
+calls. GUI changes take effect on the next detection cycle without a restart.
+`webhook_dispatcher.get_health_score_threshold()` now delegates to `config.get()` as well.
+Routes (`GET /general-config`, `GET /anomaly-config`) use `config.get_section()` to return
+resolved values instead of manually merging env defaults with overrides.
 
 ---
 

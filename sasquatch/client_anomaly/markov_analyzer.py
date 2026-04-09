@@ -6,7 +6,7 @@ Layer 1 — Event-level transition matrix:
   Scored per episode; episodes below a log-probability threshold are flagged.
 
 Layer 2 — Episode-type state machine:
-  States: "short" (< MARKOV_MIN_EPISODE_LENGTH events) and "normal".
+  States: "short" (< _cfg("markov_min_episode_length") events) and "normal".
   Tracks whether a client is stuck in a repeated-short-episode loop (e.g., repeatedly
   connecting and failing DHCP before the session gets long enough to appear normal).
 
@@ -30,7 +30,8 @@ from collections import Counter, defaultdict
 import numpy as np
 import redis.asyncio as aioredis
 
-from .event_collector import sanitize_wlan_key, MIST_CLIENT_EVENT_TYPES
+from . import config
+from .event_collector import sanitize_wlan_key, MIST_CLIENT_EVENT_TYPES, EVENT_CATEGORIES
 
 log = logging.getLogger(__name__)
 
@@ -58,48 +59,70 @@ EPISODE_BOUNDARY_EVENTS: frozenset[str] = frozenset({
     "CLIENT_ASSOCIATION_PMKC",
 })
 
-# ---------------------------------------------------------------------------
-# Tunables — all configurable via environment variables
-# ---------------------------------------------------------------------------
 
-# Episodes shorter than this go into the short-episode state machine.
-MARKOV_MIN_EPISODE_LENGTH = int(os.getenv("MARKOV_MIN_EPISODE_LENGTH", "3"))
+def _cfg(key: str) -> int | float:
+    """Shorthand to read an anomaly-section config value at runtime."""
+    return config.get("anomaly", key)
 
-# Mean log-probability threshold per transition below which an event-level episode
-# is flagged anomalous.  More negative = stricter.  Default: -4.0 means the geometric
-# mean per-transition probability is below e^-4 ≈ 0.018.
+
+# Non-env-controlled threshold (no GUI counterpart; kept as module constant)
 MARKOV_EPISODE_LOG_PROB_THRESHOLD = float(
     os.getenv("MARKOV_EPISODE_LOG_PROB_THRESHOLD", "-4.0")
 )
-
-# Fraction of a MAC's scoreable normal episodes that must be anomalous to flag the MAC.
-MARKOV_OUTLIER_EPISODE_RATIO = float(os.getenv("MARKOV_OUTLIER_EPISODE_RATIO", "0.5"))
-
-# Fraction of a family's evaluatable MACs that must be Markov-outliers to flag the family.
-MARKOV_FAMILY_OUTLIER_RATIO = float(os.getenv("MARKOV_FAMILY_OUTLIER_RATIO", "0.5"))
-
-# Minimum number of short episodes before the repeated-short-episode flag can trigger.
-MARKOV_SHORT_EPISODE_MIN_COUNT = int(os.getenv("MARKOV_SHORT_EPISODE_MIN_COUNT", "3"))
-
-# Fraction of total episodes that must be short to trigger the repeated-short-episode flag.
 MARKOV_SHORT_EPISODE_RATIO_THRESHOLD = float(
     os.getenv("MARKOV_SHORT_EPISODE_RATIO_THRESHOLD", "0.5")
 )
-
-# Episode-type sequence: mean log-prob per transition threshold for the Layer 2 sequence.
 MARKOV_EPISODE_SEQ_LOG_PROB_THRESHOLD = float(
     os.getenv("MARKOV_EPISODE_SEQ_LOG_PROB_THRESHOLD", "-2.0")
 )
 
-# Minimum scoreable normal episodes required before event-level ratio is computed.
-# MACs with fewer than this are evaluated only via short-episode and sequence rules.
-MARKOV_MIN_SCOREABLE_EPISODES = int(os.getenv("MARKOV_MIN_SCOREABLE_EPISODES", "2"))
+# Event types that can form one end of a stuck-loop transition pair.
+# At least one of (A→B) must be in this set before the stuck-loop flag triggers,
+# preventing high-frequency healthy patterns (e.g. REASSOCIATION → ARP_OK) from firing.
+_STUCK_LOOP_FAILURE_TYPES: frozenset[str] = frozenset({
+    "MARVIS_EVENT_CLIENT_AUTH_FAILURE",
+    "MARVIS_EVENT_CLIENT_AUTH_DENIED",
+    "MARVIS_EVENT_CLIENT_MAC_AUTH_FAILURE",
+    "MARVIS_EVENT_CLIENT_DHCP_FAILURE",
+    "MARVIS_EVENT_CLIENT_DHCPV6_FAILURE",
+    "MARVIS_EVENT_CLIENT_DHCP_NAK",
+    "MARVIS_EVENT_CLIENT_DHCPV6_NAK",
+    "MARVIS_EVENT_CLIENT_DHCP_STUCK",
+    "MARVIS_EVENT_CLIENT_DHCPV6_STUCK",
+    "MARVIS_EVENT_CLIENT_FAILED_DHCP_INFORM",
+    "MARVIS_DNS_FAILURE",
+    "MARVIS_EVENT_CLIENT_FBT_FAILURE",
+    "MARVIS_EVENT_CLIENT_AUTH_FAILURE_OKC",
+    "MARVIS_EVENT_CLIENT_AUTH_FAILURE_11R",
+    "MARVIS_EVENT_WLC_FT_KEY_NOT_FOUND",
+    "CLIENT_DEASSOCIATION",
+    "CLIENT_DEAUTHENTICATION",
+    "CLIENT_DEAUTHENTICATED",
+    "MARVIS_EVENT_STA_LEAVING",
+    "CLIENT_GW_ARP_FAILURE",
+    "CLIENT_ARP_FAILURE",
+    "CLIENT_EXCESSIVE_ARPING_GW",
+})
+
+# Reverse mapping: raw event type → category name, built from EVENT_CATEGORIES.
+# Used by stuck-loop detection to aggregate transitions at the category level.
+_EVENT_TYPE_TO_CATEGORY: dict[str, str] = {
+    event_type: category
+    for category, event_types in EVENT_CATEGORIES.items()
+    for event_type in event_types
+}
+
+# Category-level failure classes for stuck-loop detection.
+_STUCK_LOOP_FAILURE_CATEGORIES: frozenset[str] = frozenset({
+    "DHCP_FAILURE", "DNS_FAILURE", "AUTH_FAILURE", "ROAM_FAILURE",
+    "ARP_FAILURE", "DISASSOC",
+})
 
 # ---------------------------------------------------------------------------
 # Episode-level state constants
 # ---------------------------------------------------------------------------
-_EP_SHORT = 0   # episode shorter than MARKOV_MIN_EPISODE_LENGTH
-_EP_NORMAL = 1  # episode at or above MARKOV_MIN_EPISODE_LENGTH
+_EP_SHORT = 0   # episode shorter than _cfg("markov_min_episode_length")
+_EP_NORMAL = 1  # episode at or above _cfg("markov_min_episode_length")
 _N_EP_STATES = 2
 
 
@@ -150,12 +173,12 @@ def segment_episodes(
 ) -> tuple[list[list[dict]], list[list[dict]]]:
     """
     Returns (normal_episodes, short_episodes) for a MAC's event stream.
-    Normal: len >= MARKOV_MIN_EPISODE_LENGTH. Short: len < MARKOV_MIN_EPISODE_LENGTH.
+    Normal: len >= _cfg("markov_min_episode_length"). Short: len < _cfg("markov_min_episode_length").
     Temporal order is NOT preserved in either list — use _segment_ordered for that.
     """
     all_eps = _segment_ordered(mac_events)
-    normal = [ep for ep in all_eps if len(ep) >= MARKOV_MIN_EPISODE_LENGTH]
-    short = [ep for ep in all_eps if len(ep) < MARKOV_MIN_EPISODE_LENGTH]
+    normal = [ep for ep in all_eps if len(ep) >= _cfg("markov_min_episode_length")]
+    short = [ep for ep in all_eps if len(ep) < _cfg("markov_min_episode_length")]
     return normal, short
 
 
@@ -305,6 +328,107 @@ def score_episode_sequence(
 
 
 # ---------------------------------------------------------------------------
+# Stuck-loop detection (baseline-independent)
+# ---------------------------------------------------------------------------
+
+def detect_stuck_loop(mac_events: list[dict]) -> tuple[bool, str | None, float]:
+    """
+    Detect if a MAC is stuck in a repetitive failure-involving transition loop.
+
+    Two passes:
+      1. Raw event-type pairs: catches tight two-event loops like
+         AUTH_FAILURE → DEAUTH → AUTH_FAILURE → DEAUTH.
+      2. Category-level pairs: catches loops distributed across subtypes, e.g.
+         ROAM_SUCCESS (via multiple reassociation types) → ARP_FAILURE (via
+         CLIENT_GW_ARP_FAILURE + CLIENT_ARP_FAILURE). Without this, a family
+         whose transitions are spread across 6 roam subtypes × 3 ARP subtypes
+         would never have a single raw pair reach the threshold.
+
+    In both passes, the single most common pair must account for >=
+    _cfg("markov_stuck_loop_threshold") of all transitions AND at least one side must
+    be a failure type/category.
+
+    Returns:
+      (is_stuck, dominant_pair_label, dominant_pair_fraction)
+      dominant_pair_label is "TYPE_A→TYPE_B" or "CAT_A→CAT_B" when stuck.
+    """
+    if len(mac_events) < _cfg("markov_stuck_loop_min_events"):
+        return False, None, 0.0
+
+    sorted_events = sorted(mac_events, key=lambda e: e.get("timestamp", 0))
+    pair_counts: Counter = Counter()
+    cat_pair_counts: Counter = Counter()
+    for k in range(len(sorted_events) - 1):
+        a = sorted_events[k].get("type", "")
+        b = sorted_events[k + 1].get("type", "")
+        if a and b:
+            pair_counts[(a, b)] += 1
+            cat_a = _EVENT_TYPE_TO_CATEGORY.get(a, "OTHER")
+            cat_b = _EVENT_TYPE_TO_CATEGORY.get(b, "OTHER")
+            cat_pair_counts[(cat_a, cat_b)] += 1
+
+    total_pairs = sum(pair_counts.values())
+    if total_pairs == 0:
+        return False, None, 0.0
+
+    # Pass 1: raw event-type pairs
+    (top_a, top_b), top_count = pair_counts.most_common(1)[0]
+    top_fraction = top_count / total_pairs
+
+    if (
+        top_fraction >= _cfg("markov_stuck_loop_threshold")
+        and (top_a in _STUCK_LOOP_FAILURE_TYPES or top_b in _STUCK_LOOP_FAILURE_TYPES)
+    ):
+        log.info(
+            "[stuck-loop] fired (raw): %s→%s at %.1f%% (%d events)",
+            top_a, top_b, top_fraction * 100, len(mac_events),
+        )
+        return True, f"{top_a}→{top_b}", top_fraction
+
+    # Pass 2: category-level pairs — aggregate subtypes
+    (cat_top_a, cat_top_b), cat_top_count = cat_pair_counts.most_common(1)[0]
+    cat_top_fraction = cat_top_count / total_pairs
+
+    if (
+        cat_top_fraction >= _cfg("markov_stuck_loop_threshold")
+        and (cat_top_a in _STUCK_LOOP_FAILURE_CATEGORIES or cat_top_b in _STUCK_LOOP_FAILURE_CATEGORIES)
+    ):
+        log.info(
+            "[stuck-loop] fired (category): %s→%s at %.1f%% (%d events, raw top: %s→%s at %.1f%%)",
+            cat_top_a, cat_top_b, cat_top_fraction * 100, len(mac_events),
+            top_a, top_b, top_fraction * 100,
+        )
+        return True, f"{cat_top_a}→{cat_top_b}", cat_top_fraction
+
+    # Pass 3: failure-dominated transitions — catches multi-step failure cycles
+    # (3+ events) where no single pair dominates at the threshold but ALL
+    # transitions involve failure categories. Example: AUTH_SUCCESS → AUTH_FAILURE
+    # → DISASSOC → AUTH_SUCCESS → ... is a 3-step loop where each pair is ~33%,
+    # but 2/3 of pairs involve a failure category. A healthy 3-step cycle like
+    # AUTH_SUCCESS → ROAM_SUCCESS → ARP_SUCCESS has 0% failure-involving pairs.
+    failure_involving_count = sum(
+        count for (ca, cb), count in cat_pair_counts.items()
+        if ca in _STUCK_LOOP_FAILURE_CATEGORIES or cb in _STUCK_LOOP_FAILURE_CATEGORIES
+    )
+    failure_transition_fraction = failure_involving_count / total_pairs
+    if failure_transition_fraction >= _cfg("markov_stuck_loop_threshold"):
+        # Find the dominant failure pair for the label
+        failure_pairs = [
+            ((ca, cb), count) for (ca, cb), count in cat_pair_counts.items()
+            if ca in _STUCK_LOOP_FAILURE_CATEGORIES or cb in _STUCK_LOOP_FAILURE_CATEGORIES
+        ]
+        (fp_a, fp_b), _ = max(failure_pairs, key=lambda x: x[1])
+        log.info(
+            "[stuck-loop] fired (failure-dominated): %.1f%% of transitions involve "
+            "failure categories (%d events, top failure pair: %s→%s)",
+            failure_transition_fraction * 100, len(mac_events), fp_a, fp_b,
+        )
+        return True, f"{fp_a}→{fp_b}", failure_transition_fraction
+
+    return False, None, max(top_fraction, cat_top_fraction)
+
+
+# ---------------------------------------------------------------------------
 # Per-MAC analysis
 # ---------------------------------------------------------------------------
 
@@ -324,11 +448,13 @@ def analyze_mac(
     Returns dict with all Markov anomaly fields; see _empty_markov_result() for keys.
 
     Outlier conditions (any one triggers is_markov_outlier=True):
-      1. event_level: scoreable >= MARKOV_MIN_SCOREABLE_EPISODES AND
-         anomalous episodes / scoreable >= MARKOV_OUTLIER_EPISODE_RATIO
+      1. event_level: scoreable >= _cfg("markov_min_scoreable_episodes") AND
+         anomalous episodes / scoreable >= _cfg("markov_outlier_episode_ratio")
       2. episode_sequence: episode-type sequence score < MARKOV_EPISODE_SEQ_LOG_PROB_THRESHOLD
-      3. repeated_short: short episodes >= MARKOV_SHORT_EPISODE_MIN_COUNT AND
+      3. repeated_short: short episodes >= _cfg("markov_short_episode_min_count") AND
          short_ratio >= MARKOV_SHORT_EPISODE_RATIO_THRESHOLD
+      4. stuck_loop: single failure-involving transition pair dominates >= _cfg("markov_stuck_loop_threshold")
+         of all transitions (baseline-independent — catches devices that contaminate baseline)
     """
     all_episodes = _segment_ordered(mac_events)
     if not all_episodes:
@@ -342,7 +468,7 @@ def analyze_mac(
     episode_type_seq: list[int] = []
 
     for ep in all_episodes:
-        if len(ep) >= MARKOV_MIN_EPISODE_LENGTH:
+        if len(ep) >= _cfg("markov_min_episode_length"):
             normal_episodes.append(ep)
             episode_type_seq.append(_EP_NORMAL)
         else:
@@ -359,7 +485,7 @@ def analyze_mac(
         Counter(short_patterns).most_common(1)[0][0] if short_patterns else None
     )
     has_repeated_short = (
-        short_count >= MARKOV_SHORT_EPISODE_MIN_COUNT
+        short_count >= _cfg("markov_short_episode_min_count")
         and short_ratio >= MARKOV_SHORT_EPISODE_RATIO_THRESHOLD
     )
 
@@ -375,7 +501,7 @@ def analyze_mac(
     scoreable = normal_count
     episode_anomaly_ratio = (
         anomalous_count / scoreable
-        if scoreable >= MARKOV_MIN_SCOREABLE_EPISODES
+        if scoreable >= _cfg("markov_min_scoreable_episodes")
         else 0.0
     )
 
@@ -388,10 +514,15 @@ def analyze_mac(
 
     # Aggregate outlier determination
     event_level_anomalous = (
-        scoreable >= MARKOV_MIN_SCOREABLE_EPISODES
-        and episode_anomaly_ratio >= MARKOV_OUTLIER_EPISODE_RATIO
+        scoreable >= _cfg("markov_min_scoreable_episodes")
+        and episode_anomaly_ratio >= _cfg("markov_outlier_episode_ratio")
     )
-    is_outlier = event_level_anomalous or ep_seq_anomalous or has_repeated_short
+
+    # Stuck-loop detection: baseline-independent, catches devices that dominate
+    # the transition matrix with their own failure pattern.
+    is_stuck, stuck_pair, stuck_fraction = detect_stuck_loop(mac_events)
+
+    is_outlier = event_level_anomalous or ep_seq_anomalous or has_repeated_short or is_stuck
 
     return {
         "markov_total_episodes": total_episodes,
@@ -404,6 +535,9 @@ def analyze_mac(
         "markov_episode_seq_score": round(ep_seq_score, 4),
         "has_repeated_short_episodes": has_repeated_short,
         "short_episode_dominant_pattern": dominant_short_pattern,
+        "is_stuck_loop": is_stuck,
+        "stuck_loop_pair": stuck_pair,
+        "stuck_loop_fraction": round(stuck_fraction, 4),
         "is_markov_outlier": is_outlier,
         "markov_episode_scores": [round(s, 4) for s in episode_scores],
     }
@@ -421,6 +555,9 @@ def _empty_markov_result() -> dict:
         "markov_episode_seq_score": 0.0,
         "has_repeated_short_episodes": False,
         "short_episode_dominant_pattern": None,
+        "is_stuck_loop": False,
+        "stuck_loop_pair": None,
+        "stuck_loop_fraction": 0.0,
         "is_markov_outlier": False,
         "markov_episode_scores": [],
     }
@@ -475,7 +612,7 @@ async def build_and_store_baseline(
             ordered = _segment_ordered(mac_evts)
             seq: list[int] = []
             for ep in ordered:
-                if len(ep) >= MARKOV_MIN_EPISODE_LENGTH:
+                if len(ep) >= _cfg("markov_min_episode_length"):
                     all_normal_episodes.append(ep)
                     seq.append(_EP_NORMAL)
                 else:
@@ -608,16 +745,38 @@ async def run_markov_analysis(
         scoreable_macs = [
             m for m in family_macs
             if m in mac_results
-            and mac_results[m]["markov_scoreable_episodes"] >= MARKOV_MIN_SCOREABLE_EPISODES
+            and mac_results[m]["markov_scoreable_episodes"] >= _cfg("markov_min_scoreable_episodes")
         ]
         short_flagged_macs = [
             m for m in family_macs
             if m in mac_results and mac_results[m]["has_repeated_short_episodes"]
         ]
-        # Union so short-episode-only MACs aren't excluded from the family ratio
-        evaluatable = list({*scoreable_macs, *short_flagged_macs})
+        stuck_loop_macs = [
+            m for m in family_macs
+            if m in mac_results and mac_results[m]["is_stuck_loop"]
+        ]
+        # Union so short-episode-only and stuck-loop MACs aren't excluded from
+        # the family ratio. Stuck-loop devices (e.g. AUTH_FAILURE → DEAUTH
+        # cycles) often have zero proper episodes, so without this they would
+        # never contribute to is_family_markov_outlier.
+        evaluatable = list({*scoreable_macs, *short_flagged_macs, *stuck_loop_macs})
 
         if not evaluatable:
+            # Log families with MACs that exist in family_groups but have no
+            # evaluatable signal — helps debug why stuck-loop isn't firing.
+            in_results = [m for m in family_macs if m in mac_results]
+            if in_results:
+                sample = in_results[0]
+                r = mac_results[sample]
+                log.info(
+                    "[markov] Family [%s] not evaluatable: %d MACs in family_groups, "
+                    "%d in mac_results, stuck_loop=%s, events=%d, episodes=%d, "
+                    "stuck_fraction=%.2f [site=%s wlan=%s]",
+                    family, len(family_macs), len(in_results),
+                    r.get("is_stuck_loop"), len(mac_raw_events.get(sample, [])),
+                    r.get("markov_total_episodes", 0),
+                    r.get("stuck_loop_fraction", 0.0), site_id, wlan,
+                )
             family_markov[family] = {
                 "is_family_markov_outlier": False,
                 "markov_family_anomaly_ratio": 0.0,
@@ -631,7 +790,7 @@ async def run_markov_analysis(
             if m in mac_results and mac_results[m]["is_markov_outlier"]
         ]
         ratio = len(anomalous_macs) / len(evaluatable)
-        is_family_outlier = ratio >= MARKOV_FAMILY_OUTLIER_RATIO
+        is_family_outlier = ratio >= _cfg("markov_family_outlier_ratio")
 
         family_markov[family] = {
             "is_family_markov_outlier": is_family_outlier,

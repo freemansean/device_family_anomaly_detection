@@ -34,7 +34,7 @@ from datetime import datetime, timezone
 import httpx
 import redis.asyncio as aioredis
 
-from . import alert_tracker
+from . import alert_tracker, config
 from .anomaly_detector import get_findings, get_org_findings
 from .client_cache import get_client_cache
 from .health_scorer import get_health
@@ -42,12 +42,20 @@ from .health_scorer import get_health
 log = logging.getLogger(__name__)
 
 WEBHOOK_URL = os.getenv("ANOMALY_WEBHOOK_URL", "")
-HEALTH_SCORE_THRESHOLD = float(os.getenv("ANOMALY_HEALTH_SCORE_THRESHOLD", "0.75"))
 
 MIST_CLOUD_HOST = os.getenv("MIST_CLOUD_HOST", "api.mist.com")
 MIST_API_TOKEN = os.getenv("MIST_API_TOKEN", "")
 MIST_ORG_ID = os.getenv("MIST_ORG_ID", "")
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
+
+
+def get_health_score_threshold() -> float:
+    """Read health score threshold via the centralised config module.
+
+    Resolution: config_overrides.json → env var → hardcoded default (0.80).
+    Imported by routes.py so the same value is used for API alert filtering.
+    """
+    return config.get("anomaly", "anomaly_health_score_threshold")
 
 
 async def _get_webhook_config() -> dict:
@@ -206,6 +214,7 @@ async def evaluate_and_dispatch(
     Returns True if webhook was sent (or no qualifying findings), False on delivery failure.
     """
     config = await _get_webhook_config()
+    threshold = get_health_score_threshold()
 
     effective_url = config["url"]
     if not config["enabled"] or not effective_url:
@@ -245,11 +254,11 @@ async def evaluate_and_dispatch(
             health_score = family_health.get("health_score", 1.0)
             health_components = family_health.get("components", {})
 
-        if health_score >= HEALTH_SCORE_THRESHOLD:
+        if health_score >= threshold:
             log.debug(
                 "[%s] Skipping webhook for [%s]: family anomaly label present but "
                 "health_score=%.3f >= threshold %.3f (if=%s dbscan=%s markov=%s)",
-                wlan, family, health_score, HEALTH_SCORE_THRESHOLD,
+                wlan, family, health_score, threshold,
                 f.get("is_family_outlier"), f.get("is_family_dbscan_outlier"),
                 f.get("is_family_markov_outlier"),
             )
@@ -286,7 +295,7 @@ async def evaluate_and_dispatch(
     if not qualifying:
         log.info(
             f"[{wlan}] No findings passed dual alert gate "
-            f"(family_outlier + health < {HEALTH_SCORE_THRESHOLD}) — no webhook sent"
+            f"(family_outlier + health < {threshold}) — no webhook sent"
         )
         return True
 
@@ -342,7 +351,7 @@ async def evaluate_and_dispatch(
 
     log.info(
         f"[{wlan}] Dispatching webhook: {len(qualifying)} finding(s) passed dual alert gate "
-        f"(is_family_outlier + health_score < {HEALTH_SCORE_THRESHOLD})\n"
+        f"(is_family_outlier + health_score < {threshold})\n"
         f"Payload: {json.dumps(payload, indent=2)}"
     )
     return await _post_with_retry(effective_url, payload)

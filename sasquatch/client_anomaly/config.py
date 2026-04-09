@@ -1,0 +1,150 @@
+"""
+config.py — Centralised configuration with hardcoded best-practice defaults.
+
+Resolution order for every setting:
+  1. config_overrides.json  (GUI-set values, persisted across restarts)
+  2. Environment variable   (operator override via .env or shell)
+  3. Hardcoded default      (best-practice value defined here)
+
+No setting in the General Config or Anomaly Config sections needs to be
+present in .env — they all have sensible defaults baked in below.
+"""
+
+import json
+import logging
+import os
+import pathlib
+
+log = logging.getLogger(__name__)
+
+_CONFIG_FILE = pathlib.Path(__file__).parent / "config_overrides.json"
+
+# ─────────────────────────────────────────────────────────────────────
+# Best-practice defaults — the single source of truth for every
+# GUI-configurable setting.  Organised by config section.
+# ─────────────────────────────────────────────────────────────────────
+
+DEFAULTS = {
+    # ── General Config ──────────────────────────────────────────────
+    "general": {
+        # How often (minutes) to run site-focused detection
+        "site_focus_detection_interval": {"default": 60, "env": "SITE_FOCUS_DETECTION_INTERVAL", "cast": int},
+        # How often (hours) to run org-wide cross-site detection
+        "org_detection_interval_hours": {"default": 1, "env": "ORG_DETECTION_INTERVAL_HOURS", "cast": int},
+        # Cache-miss count before early client-cache refresh
+        "cache_miss_refresh_threshold": {"default": 10, "env": "CACHE_MISS_REFRESH_THRESHOLD", "cast": int},
+        # Minimum events per MAC to be included in ML feature matrix
+        "anomaly_min_mac_events": {"default": 5, "env": "ANOMALY_MIN_MAC_EVENTS", "cast": int},
+    },
+
+    # ── Anomaly Config ──────────────────────────────────────────────
+    "anomaly": {
+        # Isolation Forest contamination (per-family, Stage 2)
+        "anomaly_if_contamination": {"default": 0.05, "env": "ANOMALY_IF_CONTAMINATION", "cast": float},
+        # Centroid IF contamination (inter-family, Stage 1b)
+        "anomaly_centroid_if_contamination": {"default": 0.15, "env": "ANOMALY_CENTROID_IF_CONTAMINATION", "cast": float},
+        # Number of IF trees
+        "anomaly_if_n_estimators": {"default": 200, "env": "ANOMALY_IF_N_ESTIMATORS", "cast": int},
+        # Random seed (-1 for random)
+        "anomaly_random_state": {"default": 42, "env": "ANOMALY_RANDOM_STATE", "cast": int},
+        # Min MACs per family before IF runs
+        "anomaly_min_peers": {"default": 3, "env": "ANOMALY_MIN_PEERS", "cast": int},
+        # PCA variance retained for DBSCAN
+        "anomaly_dbscan_pca_variance": {"default": 0.95, "env": "ANOMALY_DBSCAN_PCA_VARIANCE", "cast": float},
+        # DBSCAN epsilon
+        "anomaly_dbscan_eps": {"default": 2.5, "env": "ANOMALY_DBSCAN_EPS", "cast": float},
+        # DBSCAN min_samples
+        "anomaly_dbscan_min_samples": {"default": 5, "env": "ANOMALY_DBSCAN_MIN_SAMPLES", "cast": int},
+        # Min family size for DBSCAN participation
+        "anomaly_dbscan_min_family_size": {"default": 2, "env": "ANOMALY_DBSCAN_MIN_FAMILY_SIZE", "cast": int},
+        # DBSCAN family noise threshold
+        "anomaly_dbscan_family_noise_threshold": {"default": 0.5, "env": "ANOMALY_DBSCAN_FAMILY_NOISE_THRESHOLD", "cast": float},
+        # Min qualifying families for centroid detection
+        "anomaly_centroid_if_min_families": {"default": 3, "env": "ANOMALY_CENTROID_IF_MIN_FAMILIES", "cast": int},
+        # Max families for cosine-distance fallback path
+        "anomaly_centroid_dist_max_families": {"default": 10, "env": "ANOMALY_CENTROID_DIST_MAX_FAMILIES", "cast": int},
+        # Cosine distance threshold for family flagging
+        "anomaly_centroid_dist_threshold": {"default": 0.35, "env": "ANOMALY_CENTROID_DIST_THRESHOLD", "cast": float},
+        # Health threshold for healthy-only centroid reference
+        "anomaly_centroid_healthy_ref_threshold": {"default": 0.75, "env": "ANOMALY_CENTROID_HEALTHY_REF_THRESHOLD", "cast": float},
+        # Min healthy families for healthy-only reference mode
+        "anomaly_centroid_healthy_ref_min": {"default": 2, "env": "ANOMALY_CENTROID_HEALTHY_REF_MIN", "cast": int},
+        # Finding rollup outlier ratio threshold
+        "anomaly_finding_threshold": {"default": 0.2, "env": "ANOMALY_FINDING_THRESHOLD", "cast": float},
+        # Min family size for site-level finding generation
+        "anomaly_finding_min_size": {"default": 2, "env": "ANOMALY_FINDING_MIN_SIZE", "cast": int},
+        # Health score threshold for dual-gate webhook dispatch
+        "anomaly_health_score_threshold": {"default": 0.80, "env": "ANOMALY_HEALTH_SCORE_THRESHOLD", "cast": float},
+        # Markov: fraction of family clients that must be outliers
+        "markov_family_outlier_ratio": {"default": 0.5, "env": "MARKOV_FAMILY_OUTLIER_RATIO", "cast": float},
+        # Markov: min episode length
+        "markov_min_episode_length": {"default": 3, "env": "MARKOV_MIN_EPISODE_LENGTH", "cast": int},
+        # Markov: episode anomaly ratio to flag a MAC
+        "markov_outlier_episode_ratio": {"default": 0.5, "env": "MARKOV_OUTLIER_EPISODE_RATIO", "cast": float},
+        # Markov: min repeated short episodes to flag
+        "markov_short_episode_min_count": {"default": 3, "env": "MARKOV_SHORT_EPISODE_MIN_COUNT", "cast": int},
+        # Markov: min scoreable episodes before analysis runs
+        "markov_min_scoreable_episodes": {"default": 2, "env": "MARKOV_MIN_SCOREABLE_EPISODES", "cast": int},
+        # Markov: stuck-loop transition dominance threshold
+        "markov_stuck_loop_threshold": {"default": 0.4, "env": "MARKOV_STUCK_LOOP_THRESHOLD", "cast": float},
+        # Markov: min events before stuck-loop detection runs
+        "markov_stuck_loop_min_events": {"default": 20, "env": "MARKOV_STUCK_LOOP_MIN_EVENTS", "cast": int},
+    },
+}
+
+
+def _load_overrides() -> dict:
+    """Load config_overrides.json. Returns empty dict on missing/corrupt file."""
+    try:
+        return json.loads(_CONFIG_FILE.read_text())
+    except (FileNotFoundError, json.JSONDecodeError, ValueError):
+        return {}
+
+
+def get(section: str, key: str) -> int | float | str:
+    """Return the runtime value for a config key.
+
+    Resolution: config_overrides.json → env var → hardcoded default.
+    """
+    spec = DEFAULTS.get(section, {}).get(key)
+    if spec is None:
+        raise KeyError(f"Unknown config key: {section}.{key}")
+
+    cast = spec["cast"]
+
+    # 1. GUI override (config_overrides.json)
+    overrides = _load_overrides().get(section, {})
+    gui_val = overrides.get(key)
+    if gui_val is not None:
+        try:
+            return cast(gui_val)
+        except (ValueError, TypeError):
+            pass
+
+    # 2. Environment variable
+    env_val = os.environ.get(spec["env"])
+    if env_val is not None:
+        try:
+            return cast(env_val)
+        except (ValueError, TypeError):
+            pass
+
+    # 3. Hardcoded default
+    return spec["default"]
+
+
+def get_section_defaults(section: str) -> dict:
+    """Return {key: default_value} for all keys in a section.
+
+    Used by the config GET endpoints to build the base dict before
+    applying overrides.
+    """
+    return {key: spec["default"] for key, spec in DEFAULTS.get(section, {}).items()}
+
+
+def get_section(section: str) -> dict:
+    """Return {key: resolved_value} for all keys in a section.
+
+    Each value goes through the full resolution chain.
+    """
+    return {key: get(section, key) for key in DEFAULTS.get(section, {})}

@@ -52,6 +52,7 @@ from sklearn.ensemble import IsolationForest
 from sklearn.metrics.pairwise import cosine_distances
 from sklearn.preprocessing import StandardScaler
 
+from . import config
 from .event_collector import get_events, sanitize_wlan_key
 from .feature_engineer import (
     FEATURE_KEYS,
@@ -59,7 +60,7 @@ from .feature_engineer import (
     get_features,
 )
 from .health_scorer import _mac_health_score
-from .markov_analyzer import run_markov_analysis, MARKOV_FAMILY_OUTLIER_RATIO
+from .markov_analyzer import run_markov_analysis
 
 log = logging.getLogger(__name__)
 
@@ -67,46 +68,16 @@ REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 ANOMALIES_TTL = 24 * 3600
 FINDINGS_TTL = 24 * 3600
 
-MIN_PEERS = int(os.getenv("ANOMALY_MIN_PEERS", "5"))
-# Intra-family: fraction of MACs within a device family expected to be outliers (Stage 2 IF).
-IF_CONTAMINATION = float(os.getenv("ANOMALY_IF_CONTAMINATION", "0.1"))
-# Inter-family: fraction of device families expected to be behavioral outliers (Stage 1b centroid IF).
-# Higher than IF_CONTAMINATION because at a site with a real problem, 1 in 6-8 families
-# being anomalous is plausible — a much higher rate than individual-MAC outliers within a family.
-CENTROID_IF_CONTAMINATION = float(os.getenv("ANOMALY_CENTROID_IF_CONTAMINATION", "0.15"))
-# Number of trees in every IsolationForest (Stage 2 and centroid IF). More trees = more
-# stable scores at the cost of compute. 100 is the sklearn default and sufficient for this data size.
-IF_N_ESTIMATORS = int(os.getenv("ANOMALY_IF_N_ESTIMATORS", "100"))
-# Global random seed for all ML components (IsolationForest, PCA). Set to a fixed integer
-# for reproducible scores across detection cycles. Set to -1 to use a random seed each run.
-_random_state_env = os.getenv("ANOMALY_RANDOM_STATE", "42")
-RANDOM_STATE: int | None = None if _random_state_env.strip() == "-1" else int(_random_state_env)
-# Fraction of variance to retain when PCA reduces dimensions before DBSCAN.
-# Lower = more aggressive reduction (faster, less precise). 0.95 typically collapses
-# 61 dims to 8–15 components on sparse event-frequency vectors.
-PCA_VARIANCE = float(os.getenv("ANOMALY_DBSCAN_PCA_VARIANCE", "0.95"))
-DBSCAN_EPS = float(os.getenv("ANOMALY_DBSCAN_EPS", "0.5"))
-DBSCAN_MIN_SAMPLES = int(os.getenv("ANOMALY_DBSCAN_MIN_SAMPLES", "5"))
-DBSCAN_MIN_FAMILY_SIZE = int(os.getenv("ANOMALY_DBSCAN_MIN_FAMILY_SIZE", "5"))
-# Fraction of a family's MACs that must be DBSCAN noise to flag the whole family.
-DBSCAN_FAMILY_NOISE_THRESHOLD = float(os.getenv("ANOMALY_DBSCAN_FAMILY_NOISE_THRESHOLD", "0.5"))
-# Minimum number of qualifying families (≥2 MACs each) required to run any centroid
-# detection. Below this threshold the step is skipped entirely.
-CENTROID_IF_MIN_FAMILIES = int(os.getenv("ANOMALY_CENTROID_IF_MIN_FAMILIES", "3"))
-# Upper bound on qualifying families for the cosine-distance fallback.
-# Sites with 3–CENTROID_DIST_MAX_FAMILIES qualifying families use distance-from-median
-# instead of IF (IF is statistically weak at small N). Sites above this threshold use IF.
-CENTROID_DIST_MAX_FAMILIES = int(os.getenv("ANOMALY_CENTROID_DIST_MAX_FAMILIES", "8"))
-# Cosine distance from the population centroid (element-wise median of all family centroid
-# rows) above which a family is flagged as a behavioral outlier.
-# Range 0.0–2.0 (practically 0.0–1.0 for typical scaled vectors). Higher = less sensitive.
-CENTROID_DIST_THRESHOLD = float(os.getenv("ANOMALY_CENTROID_DIST_THRESHOLD", "0.55"))
-FINDING_THRESHOLD = float(os.getenv("ANOMALY_FINDING_THRESHOLD", "0.3"))
-# Minimum number of local MACs a family must have before a site-level finding is generated
-# (applies to families that did NOT use org-level IF pooling). Families with fewer MACs
-# than this are skipped in finding rollup even if centroid detection flagged them.
-# Org-pooled families use MIN_PEERS as their minimum instead.
-FINDING_MIN_SIZE = int(os.getenv("ANOMALY_FINDING_MIN_SIZE", "2"))
+
+def _cfg(key: str) -> int | float:
+    """Shorthand to read an anomaly-section config value at runtime."""
+    return config.get("anomaly", key)
+
+
+def _random_state() -> int | None:
+    """Return the ML random seed, or None when set to -1 (random each run)."""
+    val = _cfg("anomaly_random_state")
+    return None if val == -1 else int(val)
 
 
 
@@ -151,7 +122,7 @@ def _run_isolation_forest(
     Returns per-MAC dict with if_score and is_if_outlier.
     """
     X = _extract_vector_array(feature_records)
-    if X.shape[0] < MIN_PEERS:
+    if X.shape[0] < _cfg("anomaly_min_peers"):
         return {
             mac: {"if_score": None, "is_if_outlier": False}
             for mac in macs
@@ -161,9 +132,9 @@ def _run_isolation_forest(
     X_scaled = scaler.fit_transform(X)
 
     clf = IsolationForest(
-        contamination=IF_CONTAMINATION,
-        random_state=RANDOM_STATE,
-        n_estimators=IF_N_ESTIMATORS,
+        contamination=_cfg("anomaly_if_contamination"),
+        random_state=_random_state(),
+        n_estimators=_cfg("anomaly_if_n_estimators"),
     )
     labels = clf.fit_predict(X_scaled)
     raw_scores = clf.decision_function(X_scaled)
@@ -188,7 +159,7 @@ def _run_dbscan(macs: list[str], feature_records: list[dict]) -> dict[str, dict]
     Returns per-MAC dict with dbscan_label and is_dbscan_outlier.
     """
     X = _extract_vector_array(feature_records)
-    if X.shape[0] < DBSCAN_MIN_SAMPLES:
+    if X.shape[0] < _cfg("anomaly_dbscan_min_samples"):
         return {
             mac: {"dbscan_label": -1, "is_dbscan_outlier": True}
             for mac in macs
@@ -202,7 +173,7 @@ def _run_dbscan(macs: list[str], feature_records: list[dict]) -> dict[str, dict]
     # collapses to 8–15 components, making Euclidean distance meaningful again.
     # Cap at n_samples - 1 so PCA doesn't fail on small populations.
     max_components = min(X_scaled.shape[0] - 1, X_scaled.shape[1])
-    pca = PCA(n_components=min(PCA_VARIANCE, max_components), random_state=RANDOM_STATE)
+    pca = PCA(n_components=min(_cfg("anomaly_dbscan_pca_variance"), max_components), random_state=_random_state())
     X_reduced = pca.fit_transform(X_scaled)
     log.info(
         "DBSCAN PCA: %d MACs, %d→%d dims (%.1f%% variance explained)",
@@ -212,7 +183,7 @@ def _run_dbscan(macs: list[str], feature_records: list[dict]) -> dict[str, dict]
         pca.explained_variance_ratio_.sum() * 100,
     )
 
-    db = DBSCAN(eps=DBSCAN_EPS, min_samples=DBSCAN_MIN_SAMPLES)
+    db = DBSCAN(eps=_cfg("anomaly_dbscan_eps"), min_samples=_cfg("anomaly_dbscan_min_samples"))
     labels = db.fit_predict(X_reduced)
 
     return {
@@ -297,6 +268,7 @@ def _classify_probable_pattern(posthoc: dict) -> str:
 def _run_family_centroid_if(
     family_groups: dict[str, list[str]],
     features: dict[str, dict],
+    family_health: dict[str, float] | None = None,
 ) -> dict[str, float]:
     """
     Family centroid Isolation Forest.
@@ -315,6 +287,14 @@ def _run_family_centroid_if(
     one healthy and one anomalous MAC no longer collapses to a midpoint —
     the max vector preserves the anomalous MAC's signal on the dimensions
     where it is extreme.
+
+    family_health: optional dict of {family: mean_health_score}. When provided
+    and at least CENTROID_HEALTHY_REF_MIN families are healthy (score >=
+    CENTROID_HEALTHY_REF_THRESHOLD), the IF model is fitted on healthy families
+    only. All families — including unhealthy ones — are then scored against that
+    healthy model via decision_function. Families that fail together form their
+    own cluster that the healthy-fitted model has never seen, so they score as
+    anomalous even when they are internally consistent with each other.
 
     Returns {family_name: if_score} for every qualifying family.
     Negative scores indicate the row is an outlier among family rows.
@@ -336,25 +316,63 @@ def _run_family_centroid_if(
         combined = np.concatenate([median_vec, max_vec])
         qualifying.append((family, combined))
 
-    if len(qualifying) < CENTROID_IF_MIN_FAMILIES:
+    centroid_min = _cfg("anomaly_centroid_if_min_families")
+    if len(qualifying) < centroid_min:
         log.info(
             f"Centroid IF: skipped — only {len(qualifying)} qualifying "
-            f"families (need >= {CENTROID_IF_MIN_FAMILIES})"
+            f"families (need >= {centroid_min})"
         )
         return {}
 
     family_names = [name for name, _ in qualifying]
     X = np.array([vec for _, vec in qualifying])
 
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
+    # Determine whether to use healthy-only reference for fitting.
+    healthy_ref_threshold = _cfg("anomaly_centroid_healthy_ref_threshold")
+    healthy_ref_min = _cfg("anomaly_centroid_healthy_ref_min")
+    healthy_indices: list[int] = []
+    if family_health is not None:
+        healthy_indices = [
+            i for i, name in enumerate(family_names)
+            if family_health.get(name, 1.0) >= healthy_ref_threshold
+        ]
 
-    clf = IsolationForest(
-        contamination=CENTROID_IF_CONTAMINATION,
-        random_state=RANDOM_STATE,
-        n_estimators=IF_N_ESTIMATORS,
-    )
-    clf.fit(X_scaled)
+    use_healthy_ref = len(healthy_indices) >= healthy_ref_min
+    centroid_contamination = _cfg("anomaly_centroid_if_contamination")
+    rs = _random_state()
+    n_est = _cfg("anomaly_if_n_estimators")
+    if use_healthy_ref:
+        X_healthy = X[healthy_indices]
+        scaler = StandardScaler()
+        scaler.fit(X_healthy)
+        X_scaled = scaler.transform(X)
+        X_healthy_scaled = scaler.transform(X_healthy)
+        clf = IsolationForest(
+            contamination=centroid_contamination,
+            random_state=rs,
+            n_estimators=n_est,
+        )
+        clf.fit(X_healthy_scaled)
+        log.info(
+            "Centroid IF: using healthy-only reference (%d/%d families, health >= %.2f)",
+            len(healthy_indices), len(family_names), healthy_ref_threshold,
+        )
+    else:
+        scaler = StandardScaler()
+        X_scaled = scaler.fit_transform(X)
+        clf = IsolationForest(
+            contamination=centroid_contamination,
+            random_state=rs,
+            n_estimators=n_est,
+        )
+        clf.fit(X_scaled)
+        if family_health is not None:
+            log.info(
+                "Centroid IF: fell back to all-family reference "
+                "(only %d healthy families, need >= %d)",
+                len(healthy_indices), healthy_ref_min,
+            )
+
     raw_scores = clf.decision_function(X_scaled)
 
     return {family_names[i]: float(raw_scores[i]) for i in range(len(family_names))}
@@ -363,6 +381,7 @@ def _run_family_centroid_if(
 def _run_family_centroid_distance(
     family_groups: dict[str, list[str]],
     features: dict[str, dict],
+    family_health: dict[str, float] | None = None,
 ) -> dict[str, float]:
     """
     Cosine-distance fallback for inter-family centroid anomaly detection.
@@ -372,17 +391,25 @@ def _run_family_centroid_distance(
     distance-based approach gives more interpretable and stable results.
 
     Builds the same dual-representation rows as _run_family_centroid_if (element-wise
-    median + max of per-MAC vectors, concatenated). After StandardScaler normalization,
-    computes the element-wise median of all family rows as the population reference
-    point. Each family's cosine distance from that reference is returned.
+    median + max of per-MAC vectors, concatenated). After L2-normalization, computes
+    the element-wise median of family rows as the population reference point. Each
+    family's cosine distance from that reference is returned.
 
     The median (not mean) is used as the reference to resist the masking effect:
     if one family is genuinely anomalous its centroid row would pull a mean reference
     toward itself, artificially reducing its apparent distance. The median is resistant
     to this shift.
 
+    family_health: optional dict of {family: mean_health_score}. When provided and at
+    least CENTROID_HEALTHY_REF_MIN families are healthy (score >= CENTROID_HEALTHY_REF_THRESHOLD),
+    the reference centroid is built from ONLY those healthy families. Every family —
+    including unhealthy ones — is then measured against this healthy reference. This
+    means families that all fail the same way (forming their own cluster) are still
+    flagged because their shared failure signature points away from the healthy reference,
+    even if none of them looks anomalous relative to the others.
+
     Returns {family_name: cosine_distance} for every qualifying family.
-    Values near 0.0 are behaviorally close to the population center.
+    Values near 0.0 are behaviorally close to the reference.
     Values approaching or exceeding CENTROID_DIST_THRESHOLD are flagged as outliers.
     Returns {} if fewer than CENTROID_IF_MIN_FAMILIES families qualify.
     """
@@ -402,10 +429,11 @@ def _run_family_centroid_distance(
         combined = np.concatenate([median_vec, max_vec])
         qualifying.append((family, combined))
 
-    if len(qualifying) < CENTROID_IF_MIN_FAMILIES:
+    centroid_min = _cfg("anomaly_centroid_if_min_families")
+    if len(qualifying) < centroid_min:
         log.info(
             "Centroid distance: skipped — only %d qualifying families (need >= %d)",
-            len(qualifying), CENTROID_IF_MIN_FAMILIES,
+            len(qualifying), centroid_min,
         )
         return {}
 
@@ -422,11 +450,35 @@ def _run_family_centroid_distance(
     norms = np.where(norms == 0, 1.0, norms)
     X_norm = X / norms
 
-    # Element-wise median of all L2-normalized family rows.
-    # More resistant to outlier pull than the mean — a single anomalous family
-    # shifts the median far less, preserving its apparent distance.
-    reference = np.median(X_norm, axis=0).reshape(1, -1)
-    # Re-normalize the median reference so it is also a unit vector.
+    # Build reference from healthy families only (when health data is available and
+    # enough healthy families exist). All families are measured against this reference.
+    healthy_ref_threshold = _cfg("anomaly_centroid_healthy_ref_threshold")
+    healthy_ref_min = _cfg("anomaly_centroid_healthy_ref_min")
+    healthy_indices: list[int] = []
+    if family_health is not None:
+        healthy_indices = [
+            i for i, name in enumerate(family_names)
+            if family_health.get(name, 1.0) >= healthy_ref_threshold
+        ]
+
+    use_healthy_ref = len(healthy_indices) >= healthy_ref_min
+    if use_healthy_ref:
+        X_ref = X_norm[healthy_indices]
+        log.info(
+            "Centroid distance: using healthy-only reference (%d/%d families, health >= %.2f)",
+            len(healthy_indices), len(family_names), healthy_ref_threshold,
+        )
+    else:
+        X_ref = X_norm
+        if family_health is not None:
+            log.info(
+                "Centroid distance: fell back to all-family reference "
+                "(only %d healthy families, need >= %d)",
+                len(healthy_indices), healthy_ref_min,
+            )
+
+    # Element-wise median of reference rows, re-normalized to a unit vector.
+    reference = np.median(X_ref, axis=0).reshape(1, -1)
     ref_norm = np.linalg.norm(reference)
     if ref_norm > 0:
         reference = reference / ref_norm
@@ -439,6 +491,7 @@ def _dispatch_centroid_detection(
     family_groups: dict[str, list[str]],
     features: dict[str, dict],
     wlan: str = "?",
+    family_health: dict[str, float] | None = None,
 ) -> tuple[dict[str, float], dict[str, float], str]:
     """
     Select and run the appropriate inter-family centroid anomaly check based on N:
@@ -446,21 +499,26 @@ def _dispatch_centroid_detection(
       - CENTROID_IF_MIN_FAMILIES <= N <= CENTROID_DIST_MAX_FAMILIES: cosine distance
       - N > CENTROID_DIST_MAX_FAMILIES: Isolation Forest
 
+    family_health: optional per-family mean health scores passed through to the
+    sub-functions so they can build a healthy-only reference centroid. See
+    _run_family_centroid_distance and _run_family_centroid_if for details.
+
     Returns (centroid_if_scores, centroid_dist_scores, method).
     Exactly one score dict will be non-empty, or both empty if skipped.
     method is one of "if", "distance", or "skipped".
     """
     n_qualifying = sum(1 for macs in family_groups.values() if len(macs) >= 2)
 
-    if n_qualifying < CENTROID_IF_MIN_FAMILIES:
+    centroid_min = _cfg("anomaly_centroid_if_min_families")
+    if n_qualifying < centroid_min:
         log.info(
             "Centroid detection [%s]: skipped — %d qualifying families (need >= %d)",
-            wlan, n_qualifying, CENTROID_IF_MIN_FAMILIES,
+            wlan, n_qualifying, centroid_min,
         )
         return {}, {}, "skipped"
 
-    if n_qualifying <= CENTROID_DIST_MAX_FAMILIES:
-        dist_scores = _run_family_centroid_distance(family_groups, features)
+    if n_qualifying <= _cfg("anomaly_centroid_dist_max_families"):
+        dist_scores = _run_family_centroid_distance(family_groups, features, family_health)
         log.info(
             "Centroid detection [%s]: distance method (%d families) — scores: %s",
             wlan, n_qualifying,
@@ -468,7 +526,7 @@ def _dispatch_centroid_detection(
         )
         return {}, dist_scores, "distance"
 
-    if_scores = _run_family_centroid_if(family_groups, features)
+    if_scores = _run_family_centroid_if(family_groups, features, family_health)
     log.info(
         "Centroid detection [%s]: IF method (%d families) — scores: %s",
         wlan, n_qualifying,
@@ -556,7 +614,7 @@ async def score(
         # Only include MACs from families large enough to contribute meaningful signal.
         dbscan_eligible_macs = [
             mac for mac in features
-            if len(family_groups.get(features[mac].get("device_family", "Unknown"), [])) >= DBSCAN_MIN_FAMILY_SIZE
+            if len(family_groups.get(features[mac].get("device_family", "Unknown"), [])) >= _cfg("anomaly_dbscan_min_family_size")
         ]
         excluded_from_dbscan = set(features.keys()) - set(dbscan_eligible_macs)
 
@@ -587,22 +645,37 @@ async def score(
             family_dbscan_noise_ratio[family] = ratio
 
         # --- Family centroid detection: determine which families are anomalous ---
+        # Compute per-family mean health so the centroid detection can build a
+        # healthy-only reference (families with low health are excluded from the
+        # reference population but are still scored against it).
+        family_health: dict[str, float] = {}
+        for _fam, _macs in family_groups.items():
+            _scores = [_mac_health_score(features[m]["vector"])[0] for m in _macs if m in features]
+            family_health[_fam] = sum(_scores) / len(_scores) if _scores else 1.0
+        log.info(
+            "Family health scores [%s]: %s",
+            wlan,
+            {f: f"{s:.2f}" for f, s in sorted(family_health.items(), key=lambda x: x[1])},
+        )
+
         # Dispatches to cosine-distance (small N) or IF (large N) based on how many
         # qualifying families are present. See _dispatch_centroid_detection for thresholds.
         centroid_if_scores, centroid_dist_scores, centroid_method = (
-            _dispatch_centroid_detection(family_groups, features, wlan)
+            _dispatch_centroid_detection(family_groups, features, wlan, family_health)
         )
         flagged_families: set[str] = set()
         for family, if_score in centroid_if_scores.items():
             if if_score < 0:
                 flagged_families.add(family)
                 log.info("Centroid IF [%s]: family [%s] flagged (score=%.4f)", wlan, family, if_score)
+        dist_threshold = _cfg("anomaly_centroid_dist_threshold")
         for family, dist in centroid_dist_scores.items():
-            if dist > CENTROID_DIST_THRESHOLD:
+            if dist > dist_threshold:
                 flagged_families.add(family)
                 log.info("Centroid distance [%s]: family [%s] flagged (dist=%.4f)", wlan, family, dist)
 
         # --- Stage 2: Isolation Forest per device family ---
+        min_peers = _cfg("anomaly_min_peers")
         if_results: dict[str, dict] = {}
         families_with_org_if: set[str] = set()
         for family, family_macs in family_groups.items():
@@ -611,13 +684,13 @@ async def score(
 
             # Supplement with org-level context when this site's family is too small.
             ctx_records: list[dict] = []
-            if n < MIN_PEERS and org_family_contexts:
+            if n < min_peers and org_family_contexts:
                 ctx_records = org_family_contexts.get(family, [])
 
             combined_count = n + len(ctx_records)
-            if combined_count < MIN_PEERS:
+            if combined_count < min_peers:
                 if_results.update({mac: {"if_score": None, "is_if_outlier": False} for mac in family_macs})
-                log.info(f"IF [{wlan}] [{family}]: skipped (only {n} MACs site-wide, {combined_count} org-wide, need {MIN_PEERS})")
+                log.info(f"IF [{wlan}] [{family}]: skipped (only {n} MACs site-wide, {combined_count} org-wide, need {min_peers})")
                 continue
 
             if ctx_records:
@@ -666,6 +739,9 @@ async def score(
                 "has_repeated_short_episodes": markov_rec.get("has_repeated_short_episodes", False),
                 "short_episode_dominant_pattern": markov_rec.get("short_episode_dominant_pattern"),
                 "markov_episode_seq_score": markov_rec.get("markov_episode_seq_score", 0.0),
+                "is_stuck_loop": markov_rec.get("is_stuck_loop", False),
+                "stuck_loop_pair": markov_rec.get("stuck_loop_pair"),
+                "stuck_loop_fraction": markov_rec.get("stuck_loop_fraction", 0.0),
                 "is_outlier": is_if or is_db or is_family or is_markov,
                 "device_family": family,
                 "event_count": features[mac].get("event_count", 0),
@@ -683,15 +759,15 @@ async def score(
             total = len(family_macs)
 
             # Org-pooled families borrowed cross-site data to run IF, so require
-            # MIN_PEERS local MACs before surfacing a site-level finding (avoids
+            # anomaly_min_peers local MACs before surfacing a site-level finding (avoids
             # hallucinated site findings driven by org noise).
             # Site-only families (IF ran locally or was skipped entirely) use the
-            # lower FINDING_MIN_SIZE threshold — even 2 devices flagged by centroid
+            # lower anomaly_finding_min_size threshold — even 2 devices flagged by centroid
             # detection is real site signal worth reporting.
             if family in families_with_org_if:
-                min_for_finding = MIN_PEERS
+                min_for_finding = min_peers
             else:
-                min_for_finding = FINDING_MIN_SIZE
+                min_for_finding = _cfg("anomaly_finding_min_size")
             if total < min_for_finding:
                 continue
 
@@ -702,14 +778,15 @@ async def score(
             # Evaluate Markov family flag here so it can bypass the finding threshold.
             # A family where enough MACs have anomalous episode patterns warrants a
             # finding even if the combined IF/DBSCAN/Markov MAC-level outlier ratio
-            # is below FINDING_THRESHOLD.
+            # is below the finding threshold.
             fam_markov = markov_family_flags.get(family, {})
             is_family_markov_outlier = fam_markov.get("is_family_markov_outlier", False)
             markov_family_anomaly_ratio = fam_markov.get("markov_family_anomaly_ratio", 0.0)
             markov_evaluatable_count = fam_markov.get("markov_evaluatable_count", 0)
             markov_family_anomalous_count = fam_markov.get("markov_family_anomalous_count", 0)
 
-            if outlier_ratio < FINDING_THRESHOLD and not is_family_markov_outlier:
+            finding_threshold = _cfg("anomaly_finding_threshold")
+            if outlier_ratio < finding_threshold and not is_family_markov_outlier:
                 continue
 
             # DBSCAN-specific rollup (used by Site Overview severity badge)
@@ -778,10 +855,11 @@ async def score(
 
             # Markov family-level flags — already computed above before the threshold check.
 
-            # DBSCAN family-level flag: families where > DBSCAN_FAMILY_NOISE_THRESHOLD
-            # fraction of eligible MACs are DBSCAN noise are considered family-level anomalies.
+            # DBSCAN family-level flag: families where noise ratio exceeds threshold
+            # are considered family-level anomalies.
+            dbscan_noise_thresh = _cfg("anomaly_dbscan_family_noise_threshold")
             is_family_dbscan_outlier = (
-                family_dbscan_noise_ratio.get(family, 0.0) >= DBSCAN_FAMILY_NOISE_THRESHOLD
+                family_dbscan_noise_ratio.get(family, 0.0) >= dbscan_noise_thresh
             )
 
             finding = {
@@ -894,7 +972,7 @@ async def score_org_wide(
         k for k in composite_macs
         if len(org_family_groups.get(
             composite_features[k].get("device_family", "Unknown"), []
-        )) >= DBSCAN_MIN_FAMILY_SIZE
+        )) >= _cfg("anomaly_dbscan_min_family_size")
     ]
     excluded_from_dbscan = set(composite_macs) - set(dbscan_eligible_keys)
 
@@ -928,8 +1006,24 @@ async def score_org_wide(
         family_dbscan_noise_ratio[family] = noise_count / len(eligible)
 
     # --- Family centroid detection across all org families ---
+    # Compute per-family mean health from feature vectors so the centroid detection
+    # can build a healthy-only reference. Unhealthy families are still scored against it.
+    org_family_health: dict[str, float] = {}
+    for _fam, _cks in org_family_groups.items():
+        _scores = [
+            _mac_health_score(composite_features[k]["vector"])[0]
+            for k in _cks
+            if k in composite_features
+        ]
+        org_family_health[_fam] = sum(_scores) / len(_scores) if _scores else 1.0
+    log.info(
+        "[org] Family health scores [%s]: %s",
+        wlan,
+        {f: f"{s:.2f}" for f, s in sorted(org_family_health.items(), key=lambda x: x[1])},
+    )
+
     centroid_if_scores, centroid_dist_scores, centroid_method = (
-        _dispatch_centroid_detection(org_family_groups, composite_features, f"org/{wlan}")
+        _dispatch_centroid_detection(org_family_groups, composite_features, f"org/{wlan}", org_family_health)
     )
     flagged_families: set[str] = set()
     for family, if_score in centroid_if_scores.items():
@@ -939,8 +1033,9 @@ async def score_org_wide(
                 "[org Centroid IF] wlan=%s: family [%s] flagged (score=%.4f)",
                 wlan, family, if_score,
             )
+    org_dist_threshold = _cfg("anomaly_centroid_dist_threshold")
     for family, dist in centroid_dist_scores.items():
-        if dist > CENTROID_DIST_THRESHOLD:
+        if dist > org_dist_threshold:
             flagged_families.add(family)
             log.info(
                 "[org Centroid distance] wlan=%s: family [%s] flagged (dist=%.4f)",
@@ -1026,7 +1121,7 @@ async def score_org_wide(
             continue
         markov_outlier_cks = [k for k in family_cks if org_anomalies_flat[k].get("is_markov_outlier")]
         ratio = len(markov_outlier_cks) / total_cks
-        org_family_markov_flags[family] = ratio >= MARKOV_FAMILY_OUTLIER_RATIO
+        org_family_markov_flags[family] = ratio >= _cfg("markov_family_outlier_ratio")
         org_family_markov_ratio[family] = ratio
 
     # Raw events cache for post-hoc explainer — loaded once per site on demand
@@ -1073,8 +1168,8 @@ async def score_org_wide(
 
         for family, family_cks in org_family_groups.items():
             total = len(family_cks)
-            min_for_finding = MIN_PEERS
-            if total < min_for_finding:
+            org_min_for_finding = _cfg("anomaly_min_peers")
+            if total < org_min_for_finding:
                 continue
 
             outlier_cks = [k for k in family_cks if org_anomalies_flat[k]["is_outlier"]]
@@ -1083,12 +1178,14 @@ async def score_org_wide(
 
             # Evaluate family-level DBSCAN and Markov flags before the threshold gate so
             # they can bypass it — mirrors site-level rollup logic (line ~712).
+            org_dbscan_noise_thresh = _cfg("anomaly_dbscan_family_noise_threshold")
             is_family_dbscan_outlier = (
-                family_dbscan_noise_ratio.get(family, 0.0) >= DBSCAN_FAMILY_NOISE_THRESHOLD
+                family_dbscan_noise_ratio.get(family, 0.0) >= org_dbscan_noise_thresh
             )
             is_family_markov_outlier = org_family_markov_flags.get(family, False)
 
-            if outlier_ratio < FINDING_THRESHOLD and not is_family_dbscan_outlier and not is_family_markov_outlier:
+            org_finding_threshold = _cfg("anomaly_finding_threshold")
+            if outlier_ratio < org_finding_threshold and not is_family_dbscan_outlier and not is_family_markov_outlier:
                 continue
 
             # Per-site breakdown for the sites_affected field

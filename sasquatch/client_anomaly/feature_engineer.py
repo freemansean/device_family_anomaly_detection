@@ -35,11 +35,12 @@ from .event_collector import (
     sanitize_wlan_key,
 )
 
+from . import config
+
 log = logging.getLogger(__name__)
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 FEATURES_TTL = 24 * 3600
-MIN_MAC_EVENTS = int(os.getenv("ANOMALY_MIN_MAC_EVENTS", "5"))
 
 # For post-hoc explainer
 DHCP_SUCCESS_TYPES = {"CLIENT_IP_ASSIGNED", "CLIENT_IPV6_ASSIGNED"}
@@ -283,12 +284,24 @@ async def build_features(site_id: str, wlan: str) -> int:
         # Build feature vector for each MAC
         features: dict[str, dict] = {}
         skipped = 0
+        min_mac_events = config.get("general", "anomaly_min_mac_events")
         for mac, evts in mac_events.items():
-            if len(evts) < MIN_MAC_EVENTS:
+            if len(evts) < min_mac_events:
                 skipped += 1
                 continue
             vec = build_mac_feature_vector(evts)
-            device_family = evts[0].get("device_family", "Unknown") if evts else "Unknown"
+            # Majority-vote device_family across all events for this MAC.
+            # Any non-Unknown label beats Unknown — handles MACs whose events span
+            # a cache refresh boundary (early events labeled Unknown, later ones correct).
+            family_counts: dict[str, int] = {}
+            for e in evts:
+                f = e.get("device_family") or "Unknown"
+                family_counts[f] = family_counts.get(f, 0) + 1
+            non_unknown = {f: c for f, c in family_counts.items() if not f.startswith("Unknown")}
+            if non_unknown:
+                device_family = max(non_unknown, key=non_unknown.__getitem__)
+            else:
+                device_family = max(family_counts, key=family_counts.__getitem__)
             volume_concentration_weight = math.log1p(len(evts)) * vec["top_category_fraction"]
             features[mac] = {
                 "vector": vec,
@@ -302,7 +315,7 @@ async def build_features(site_id: str, wlan: str) -> int:
         await redis_client.set(key, json.dumps(features), ex=FEATURES_TTL)
         log.info(
             f"Built features for {len(features)} MACs → {key} "
-            f"({skipped} skipped with < {MIN_MAC_EVENTS} events) [wlan={wlan}]"
+            f"({skipped} skipped with < {min_mac_events} events) [wlan={wlan}]"
         )
         return len(features)
 

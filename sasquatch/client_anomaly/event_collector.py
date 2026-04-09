@@ -32,6 +32,8 @@ from .oui_lookup import lookup as oui_lookup
 
 log = logging.getLogger(__name__)
 
+from . import config
+
 MIST_CLOUD_HOST = os.getenv("MIST_CLOUD_HOST", "api.mist.com")
 MIST_API_TOKEN = os.getenv("MIST_API_TOKEN", "")
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
@@ -39,11 +41,6 @@ REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 # Events are kept for 7 days in the global sorted set.
 EVENTS_TTL = 7 * 24 * 3600
 EVENT_TYPE_INDEX_TTL = 7 * 24 * 3600  # 7 days
-
-# If an incremental collect() batch contains this many distinct cache-miss MACs,
-# the client cache is refreshed from the Mist API and the batch re-enriched.
-# Covers devices that joined after the last midnight refresh.
-CACHE_MISS_REFRESH_THRESHOLD = int(os.getenv("CACHE_MISS_REFRESH_THRESHOLD", "10"))
 
 # DHCPv6 failure events are excluded from analysis — they are frequent noise on
 # dual-stack networks and do not correlate with actionable client connectivity issues.
@@ -547,9 +544,13 @@ async def _load_events_from_site_sets(
 
 async def reenrich_stale_events(site_id: str, client_cache: dict[str, dict]) -> int:
     """
-    Re-enrich stored events whose device_family is "Unknown" (or "Unknown/...") where
-    the MAC is now present in client_cache. Intended to be called after a cache refresh
-    so that historical events gain correct family labels rather than staying Unknown.
+    Re-enrich stored events whose device_family is "Unknown" (or "Unknown/...").
+
+    Two enrichment paths run in a single pass:
+    - Cache-hit MACs: re-enriched from client_cache (may now have a resolved family).
+    - Cache-miss MACs: re-enriched via OUI lookup (updated OUI DB may now resolve the
+      manufacturer, upgrading "Unknown" to "Unknown/<Manufacturer>"). These are IoT/
+      unregistered devices that never appear in Mist's clients/search results.
 
     Atomically replaces each stale sorted-set member with its freshly enriched version
     at the same timestamp score (ZREM + ZADD in a single pipeline). Members whose
@@ -557,9 +558,7 @@ async def reenrich_stale_events(site_id: str, client_cache: dict[str, dict]) -> 
 
     Returns the count of events re-enriched.
     """
-    if not client_cache:
-        return 0
-
+    # client_cache may be empty (e.g. new site) — OUI path still runs for cache-miss MACs.
     redis_client = aioredis.from_url(REDIS_URL, decode_responses=True)
     try:
         events_key = f"sasquatch:events:{site_id}"
@@ -580,12 +579,13 @@ async def reenrich_stale_events(site_id: str, client_cache: dict[str, dict]) -> 
             if not family.startswith("Unknown"):
                 continue
             mac = (event.get("mac") or "").replace(":", "").lower()
-            if mac not in client_cache:
-                continue
-            new_event = _enrich_event(event, client_cache)
+            # Pass the full client_cache for cache-hit MACs; pass empty dict for
+            # cache-miss MACs so _enrich_event falls through to OUI lookup.
+            cache_for_mac = client_cache if mac in client_cache else {}
+            new_event = _enrich_event(event, cache_for_mac)
             new_member = json.dumps(new_event, sort_keys=True)
             if new_member == member:
-                continue  # no change — family already matched
+                continue  # no change — skip
             replacements.append((member, new_member, score))
 
         if not replacements:
@@ -637,10 +637,11 @@ async def collect(site_id: str, duration: str = "1h") -> int:
 
         new_enriched, unknown_types, miss_macs = _enrich_batch(new_raw, client_cache)
 
-        if len(miss_macs) >= CACHE_MISS_REFRESH_THRESHOLD:
+        cache_miss_threshold = config.get("general", "cache_miss_refresh_threshold")
+        if len(miss_macs) >= cache_miss_threshold:
             log.info(
                 f"{len(miss_macs)} cache-miss MACs in batch for site {site_id} "
-                f"(threshold={CACHE_MISS_REFRESH_THRESHOLD}) — refreshing client cache"
+                f"(threshold={cache_miss_threshold}) — refreshing client cache"
             )
             await refresh_client_cache(site_id)
             client_cache = await get_client_cache(site_id)

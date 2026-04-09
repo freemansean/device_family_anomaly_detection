@@ -27,11 +27,11 @@ from .markov_analyzer import baseline_exists as markov_baseline_exists
 from .markov_analyzer import build_and_store_baseline as build_markov_baseline
 from .webhook_dispatcher import evaluate_and_dispatch
 
+from . import config
+
 log = logging.getLogger(__name__)
 
 SITE_ID = os.getenv("MIST_SITE_ID", "")
-SITE_FOCUS_DETECTION_INTERVAL = int(os.getenv("SITE_FOCUS_DETECTION_INTERVAL", "60"))
-ORG_DETECTION_INTERVAL_HOURS = int(os.getenv("ORG_DETECTION_INTERVAL_HOURS", "1"))
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 MIST_API_TOKEN = os.getenv("MIST_API_TOKEN", "")
 MIST_CLOUD_HOST = os.getenv("MIST_CLOUD_HOST", "api.mist.com")
@@ -402,7 +402,7 @@ async def org_cross_site_detect_job() -> None:
         # Acquire the per-site lock before collecting to avoid a duplicate Mist API
         # call when event_and_detect_job is already running collect() for the same site.
         # If the lock is held, skip collection and use whatever events are already in Redis.
-        org_duration = f"{ORG_DETECTION_INTERVAL_HOURS}h"
+        org_duration = f"{config.get('general', 'org_detection_interval_hours')}h"
         for sid in site_ids:
             try:
                 cache = await get_client_cache(sid)
@@ -581,10 +581,11 @@ def create_scheduler() -> AsyncIOScheduler:
     )
 
     # Periodic per-site detection cycle
+    site_interval = config.get("general", "site_focus_detection_interval")
     scheduler.add_job(
         event_and_detect_job,
         "interval",
-        minutes=SITE_FOCUS_DETECTION_INTERVAL,
+        minutes=site_interval,
         id="event_and_detect",
         name="Event Collection + Anomaly Detection",
     )
@@ -592,15 +593,16 @@ def create_scheduler() -> AsyncIOScheduler:
     # Org-wide cross-site detection — only active when MIST_ORG_ID is configured.
     # Pools all org MACs together so each MAC is scored against the full org population.
     if MIST_ORG_ID:
+        org_interval = config.get("general", "org_detection_interval_hours")
         scheduler.add_job(
             org_cross_site_detect_job,
             "interval",
-            hours=ORG_DETECTION_INTERVAL_HOURS,
+            hours=org_interval,
             id="org_cross_site_detect",
             name="Org Cross-Site Anomaly Detection",
         )
         log.info(
-            f"Org cross-site detection scheduled every {ORG_DETECTION_INTERVAL_HOURS}h "
+            f"Org cross-site detection scheduled every {org_interval}h "
             f"(org={MIST_ORG_ID})"
         )
 

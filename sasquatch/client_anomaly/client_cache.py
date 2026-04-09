@@ -11,6 +11,7 @@ import os
 
 import httpx
 import redis.asyncio as aioredis
+from .oui_lookup import lookup as oui_lookup
 
 log = logging.getLogger(__name__)
 
@@ -64,6 +65,8 @@ def classify_family(client: dict) -> str:
         return "Linux"
     if "printer" in combined or "print" in combined:
         return "Printer"
+    if "awair" in combined:
+        return "Awair"
     # Use OS type if available; fall back to manufacturer name.
     # Skip generic IoT/embedded markers that Mist uses as placeholder OS labels —
     # they add no information over the manufacturer name.
@@ -94,14 +97,30 @@ async def fetch_all_clients(site_id: str) -> list[dict]:
     return all_clients
 
 
-def _build_client_record(client: dict) -> dict:
+def _build_client_record(client: dict, mac: str = "") -> dict:
     # last_model / last_os / last_device are scalar strings in the enriched search results.
     # The raw client record may also have array fields; prefer last_* scalars.
+    #
+    # When Mist returns no mfg, supplement with a local OUI lookup so that
+    # classify_family() has something to match against (e.g. "Awair" IoT devices
+    # that Mist tracks as clients but has no manufacturer string for).
+    _mfg_raw = (client.get("mfg") or "").strip()
+    # Treat Mist's placeholder strings as empty — they carry no information.
+    _MFG_PLACEHOLDERS = {"unknown", "unknown manufacturer", "private", ""}
+    mfg = "" if _mfg_raw.lower() in _MFG_PLACEHOLDERS else _mfg_raw
+    if not mfg and mac:
+        oui_result = oui_lookup(mac)
+        if oui_result != "Unknown":
+            mfg = oui_result
+    # Inject resolved mfg back into the dict so classify_family sees it.
+    enriched_client = dict(client)
+    if mfg:
+        enriched_client["mfg"] = mfg
     return {
-        "family": classify_family(client),
+        "family": classify_family(enriched_client),
         "model": client.get("last_model") or "",
         "os": client.get("last_os") or "",
-        "manufacturer": client.get("mfg") or "",
+        "manufacturer": mfg or client.get("mfg") or "",
         "random_mac": client.get("random_mac", False),
         "last_ssid": client.get("last_ssid") or "",
         "last_ap": client.get("last_ap") or "",
@@ -126,7 +145,7 @@ async def refresh_client_cache(site_id: str) -> int:
         mac = (c.get("mac") or "").replace(":", "").lower()
         if not mac:
             continue
-        lookup[mac] = _build_client_record(c)
+        lookup[mac] = _build_client_record(c, mac)
 
     redis_client = aioredis.from_url(REDIS_URL, decode_responses=True)
     try:
