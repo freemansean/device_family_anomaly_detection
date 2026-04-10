@@ -13,6 +13,10 @@ const ALERT_BG    = "#2a1515";
 const HEALTH_COLOR = "#e0a835";
 const HEALTH_BG    = "#2a2015";
 
+// Service-account virtual family
+const SA_COLOR = "#d4a06a";
+const SA_BG    = "#2a1f15";
+
 // Default — overridden at runtime by anomaly-config endpoint
 const HEALTH_THRESHOLD_DEFAULT = 0.75;
 
@@ -175,8 +179,22 @@ function AnomalyFindingCard({ finding, healthData, isAlert, expanded, onToggle, 
             {sev}
           </span>
           <span style={{ fontWeight: "bold", fontSize: "14px", color: "#ddd" }}>
-            {finding.device_family}
+            {finding.family_kind === "service_account" && finding.service_account_label
+              ? finding.service_account_label
+              : finding.device_family}
           </span>
+          {finding.family_kind === "service_account" && (
+            <span
+              style={{ background: SA_BG, color: SA_COLOR, border: `1px solid ${SA_COLOR}55`, borderRadius: "3px", padding: "2px 7px", fontSize: "10px", fontWeight: "bold", letterSpacing: "0.05em" }}
+              title={
+                finding.service_account_member_families?.length
+                  ? `Service account spanning: ${finding.service_account_member_families.join(", ")}`
+                  : "Service account (shared username across multiple devices)"
+              }
+            >
+              SVC ACCT{finding.service_account_member_families?.length ? ` · ${finding.service_account_member_families.length} families` : ""}
+            </span>
+          )}
           <span style={{ color: "#666", fontSize: "12px" }}>
             {PATTERN_LABELS[finding.probable_pattern] || finding.probable_pattern}
           </span>
@@ -200,9 +218,9 @@ function AnomalyFindingCard({ finding, healthData, isAlert, expanded, onToggle, 
           {finding.is_family_markov_outlier && (
             <span
               style={{ background: "#1a2a3a", color: "#4ab0e8", border: "1px solid #2a6a8a", borderRadius: "3px", padding: "2px 7px", fontSize: "10px" }}
-              title={`Markov: ${finding.markov_family_anomalous_count}/${finding.markov_evaluatable_count} clients have anomalous event chain patterns (${finding.markov_family_anomaly_ratio != null ? (finding.markov_family_anomaly_ratio * 100).toFixed(0) + "%" : ""})`}
+              title={`Markov ${finding.markov_family_reason || "anomaly"}: ${finding.markov_family_anomalous_count}/${finding.markov_evaluatable_count} clients flagged${finding.markov_family_anomaly_ratio != null ? ` (${(finding.markov_family_anomaly_ratio * 100).toFixed(0)}%)` : ""}`}
             >
-              Markov {finding.markov_family_anomaly_ratio != null ? `${(finding.markov_family_anomaly_ratio * 100).toFixed(0)}%` : ""}
+              Markov {finding.markov_family_reason || "chain"}
             </span>
           )}
           {isUnhealthy && (
@@ -347,7 +365,7 @@ function HealthOnlyCard({ family, data }) {
   );
 }
 
-export default function FindingsFeed({ siteId, apiBase, onMacSelect, refreshToken, wlan }) {
+export default function FindingsFeed({ siteId, apiBase, onMacSelect, refreshToken, wlan, detectionInProgress }) {
   const [findings, setFindings] = useState([]);
   const [health, setHealth]     = useState({});
   const [healthThreshold, setHealthThreshold] = useState(HEALTH_THRESHOLD_DEFAULT);
@@ -437,6 +455,11 @@ export default function FindingsFeed({ siteId, apiBase, onMacSelect, refreshToke
 
   return (
     <div>
+      {detectionInProgress && (
+        <div style={{ background: "#0d2a38", border: "1px solid #2d5a8a", borderRadius: "4px", padding: "6px 12px", marginBottom: "10px", fontSize: "11px", color: "#7ec8e3" }}>
+          Detection in progress… results will refresh automatically.
+        </div>
+      )}
       <h2 style={{ fontSize: "15px", color: "#aaa", marginBottom: "4px" }}>
         Anomaly Findings — {findings.length} active
       </h2>

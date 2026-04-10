@@ -104,7 +104,7 @@ function SiteCard({ site, onClick }) {
   );
 }
 
-export default function OrgOverview({ apiBase, onSiteSelect, onMacSiteSelect, refreshToken, wlan, onLoaded }) {
+export default function OrgOverview({ apiBase, onSiteSelect, onMacSiteSelect, refreshToken, wlan, onLoaded, detectionInProgress }) {
   const [summary, setSummary]       = useState(null);
   const [loading, setLoading]       = useState(true);
   const [error, setError]           = useState(null);
@@ -120,8 +120,16 @@ export default function OrgOverview({ apiBase, onSiteSelect, onMacSiteSelect, re
       .finally(() => { setLoading(false); onLoaded?.(); });
   }, [apiBase, refreshToken, wlan]);
 
-  const sites             = (summary?.sites || []).slice().sort((a, b) => (b.event_count || 0) - (a.event_count || 0));
-  const sitesWithData     = sites.filter(s => s.has_data).length;
+  const MAX_SITE_CARDS    = 20;
+  const allSites          = (summary?.sites || []).slice().sort((a, b) => {
+    const aAlerts = a.alert_count || 0;
+    const bAlerts = b.alert_count || 0;
+    if (bAlerts !== aAlerts) return bAlerts - aAlerts;
+    return (b.event_count || 0) - (a.event_count || 0);
+  });
+  const sites             = allSites.slice(0, MAX_SITE_CARDS);
+  const hiddenSiteCount   = Math.max(0, allSites.length - sites.length);
+  const sitesWithData     = allSites.filter(s => s.has_data).length;
   const orgAlertCount     = summary?.org_alert_count ?? 0;
   const orgSignificant    = summary?.org_significant_count ?? 0;
   const orgModerate       = summary?.org_moderate_count ?? 0;
@@ -160,7 +168,7 @@ export default function OrgOverview({ apiBase, onSiteSelect, onMacSiteSelect, re
       </div>
 
       {activeView === "alerts" && (
-        <OrgAlerts apiBase={apiBase} onMacSiteSelect={onMacSiteSelect} refreshToken={refreshToken} wlan={wlan} />
+        <OrgAlerts apiBase={apiBase} onMacSiteSelect={onMacSiteSelect} refreshToken={refreshToken} wlan={wlan} detectionInProgress={detectionInProgress} />
       )}
 
       {activeView === "overview" && (
@@ -170,7 +178,7 @@ export default function OrgOverview({ apiBase, onSiteSelect, onMacSiteSelect, re
             <h2 style={{ margin: 0, fontSize: "15px", color: "#7ec8e3" }}>Org Overview</h2>
             {loading
               ? <span style={{ color: "#555", fontSize: "12px" }}>Loading…</span>
-              : <span style={{ color: "#555", fontSize: "12px" }}>{sites.length} sites</span>
+              : <span style={{ color: "#555", fontSize: "12px" }}>{allSites.length} sites</span>
             }
             {sitesWithData > 0 && (
               <span style={{ color: "#555", fontSize: "12px" }}>{sitesWithData} with data</span>
@@ -223,6 +231,11 @@ export default function OrgOverview({ apiBase, onSiteSelect, onMacSiteSelect, re
                   <SiteCard key={site.site_id} site={site} onClick={() => onSiteSelect(site.site_id)} />
                 ))}
               </div>
+              {hiddenSiteCount > 0 && (
+                <div style={{ color: "#555", fontSize: "11px", marginTop: "12px", textAlign: "center", fontStyle: "italic" }}>
+                  Showing top {sites.length} of {allSites.length} sites (ranked by alerts, then event volume). Use the Site dropdown above to jump to the {hiddenSiteCount} site{hiddenSiteCount === 1 ? "" : "s"} not listed.
+                </div>
+              )}
             </div>
           </div>
         </div>
@@ -233,7 +246,7 @@ export default function OrgOverview({ apiBase, onSiteSelect, onMacSiteSelect, re
       )}
 
       {activeView === "findings" && (
-        <OrgFindingsFeed apiBase={apiBase} onMacSiteSelect={onMacSiteSelect} refreshToken={refreshToken} wlan={wlan} />
+        <OrgFindingsFeed apiBase={apiBase} onMacSiteSelect={onMacSiteSelect} refreshToken={refreshToken} wlan={wlan} detectionInProgress={detectionInProgress} />
       )}
     </div>
   );

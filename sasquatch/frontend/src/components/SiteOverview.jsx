@@ -10,6 +10,14 @@ const CATEGORIES = [
 ];
 
 const SEVERITY_COLOR = { significant: "#e05555", moderate: "#e0a835", minimal: "#4ea8c4" };
+const SEVERITY_RANK  = { significant: 3, moderate: 2, minimal: 1 };
+const SA_COLOR = "#d4a06a";
+const SA_BG    = "#2a1f15";
+
+function SortIndicator({ active, dir }) {
+  if (!active) return <span style={{ color: "#333", marginLeft: "3px", fontSize: "9px" }}>⇅</span>;
+  return <span style={{ color: "#7ec8e3", marginLeft: "3px", fontSize: "9px" }}>{dir === "asc" ? "▲" : "▼"}</span>;
+}
 
 function ratioColor(ratio) {
   // green (#2d7a4f) → yellow (#c8a820) → red (#c83232)
@@ -46,6 +54,42 @@ function healthBarColor(score) {
   return "#e05555";
 }
 
+// Family-level service alarm cards. The list comes from the per-family health
+// record (/sites/{site_id}/health) — already filtered to services where >50%
+// of active MACs are individually unhealthy.
+function ServiceAlarmCards({ alarms, serviceHealth }) {
+  if (!alarms || alarms.length === 0) {
+    return <span style={{ color: "#333", fontSize: "10px" }}>—</span>;
+  }
+  return (
+    <span style={{ display: "flex", flexWrap: "wrap", gap: "3px" }}>
+      {alarms.map((svc) => {
+        const sh = serviceHealth?.[svc];
+        const pct = sh != null ? `${Math.round(sh * 100)}%` : "";
+        return (
+          <span
+            key={svc}
+            title={pct ? `${svc.toUpperCase()} avg health ${pct}` : svc.toUpperCase()}
+            style={{
+              background: "#e0555522",
+              color: "#e05555",
+              border: "1px solid #e0555544",
+              borderRadius: "3px",
+              padding: "1px 5px",
+              fontSize: "10px",
+              textTransform: "uppercase",
+              letterSpacing: "0.04em",
+              fontWeight: 600,
+            }}
+          >
+            {svc}
+          </span>
+        );
+      })}
+    </span>
+  );
+}
+
 export default function SiteOverview({ siteId, apiBase, onMacSelect, onFamilySelect, refreshToken, wlan, onLoaded }) {
   const [summary, setSummary] = useState(null);
   const [findings, setFindings] = useState([]);
@@ -53,6 +97,8 @@ export default function SiteOverview({ siteId, apiBase, onMacSelect, onFamilySel
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [lastRefresh, setLastRefresh] = useState(null);
+  const [sortKey, setSortKey] = useState("anomaly");
+  const [sortDir, setSortDir] = useState("desc");
 
   useEffect(() => {
     setSummary(null);
@@ -87,8 +133,8 @@ export default function SiteOverview({ siteId, apiBase, onMacSelect, onFamilySel
   }, [load]);
 
   if (loading && !summary) {
-    // Skeleton: 5 fixed cols (Family, IF, DB, Markov, Health) + 15 CATEGORIES = 20 columns
-    const skeletonColWidths = [110, 44, 62, 62, 80, ...Array(15).fill(18)];
+    // Skeleton: 6 fixed cols (Family, IF, DB, Markov, Health, Service Alarm) + 15 CATEGORIES = 21 columns
+    const skeletonColWidths = [110, 44, 62, 62, 80, 100, ...Array(15).fill(18)];
     const shimmer = "sq-site-shimmer 1.5s ease-in-out infinite";
     return (
       <div>
@@ -137,8 +183,7 @@ export default function SiteOverview({ siteId, apiBase, onMacSelect, onFamilySel
   const MIN_DISPLAY_CLIENTS = 1;
   const allFamilies = Object.keys(summary.families || {}).filter((f) => !HIDDEN_FAMILIES.has(f));
   const families = allFamilies
-    .filter((f) => (summary.family_client_counts?.[f] ?? 0) >= MIN_DISPLAY_CLIENTS)
-    .sort();
+    .filter((f) => (summary.family_client_counts?.[f] ?? 0) >= MIN_DISPLAY_CLIENTS);
   const otherFamilies = allFamilies.filter((f) => (summary.family_client_counts?.[f] ?? 0) < MIN_DISPLAY_CLIENTS);
 
   // Aggregate "All Other Devices" row — sum event counts across all small families
@@ -160,6 +205,53 @@ export default function SiteOverview({ siteId, apiBase, onMacSelect, onFamilySel
     findingsByFamily[f.device_family] = f;
   }
 
+  const handleSort = (key) => {
+    setSortKey(prev => {
+      if (prev === key) { setSortDir(d => d === "asc" ? "desc" : "asc"); return key; }
+      setSortDir(key === "family" ? "asc" : "desc");
+      return key;
+    });
+  };
+
+  // Anomaly sort rank combines IF + DBSCAN + Markov for the default sort
+  const anomalyRank = (f) => {
+    const finding = findingsByFamily[f];
+    if (finding?.is_family_outlier) return 10;
+    const dbRank = SEVERITY_RANK[finding?.dbscan_severity] ?? 0;
+    const markovOutlier = summary.family_markov?.[f]?.is_family_markov_outlier
+      ?? finding?.is_family_markov_outlier ?? false;
+    const mRank = markovOutlier ? 1 : 0;
+    return dbRank * 2 + mRank;
+  };
+
+  const sortedFamilies = [...families].sort((a, b) => {
+    let va, vb;
+    if (sortKey === "family") {
+      va = a.toLowerCase(); vb = b.toLowerCase();
+    } else if (sortKey === "anomaly") {
+      va = anomalyRank(a); vb = anomalyRank(b);
+    } else if (sortKey === "dbscan") {
+      va = SEVERITY_RANK[findingsByFamily[a]?.dbscan_severity] ?? 0;
+      vb = SEVERITY_RANK[findingsByFamily[b]?.dbscan_severity] ?? 0;
+    } else if (sortKey === "markov") {
+      va = summary.family_markov?.[a]?.markov_family_anomaly_ratio
+        ?? findingsByFamily[a]?.markov_family_anomaly_ratio ?? 0;
+      vb = summary.family_markov?.[b]?.markov_family_anomaly_ratio
+        ?? findingsByFamily[b]?.markov_family_anomaly_ratio ?? 0;
+    } else if (sortKey === "health") {
+      va = health[a]?.health_score ?? -1;
+      vb = health[b]?.health_score ?? -1;
+    } else {
+      // category column — sort by ratio (matches cell color coding)
+      va = summary.families[a]?.[sortKey]?.ratio ?? 0;
+      vb = summary.families[b]?.[sortKey]?.ratio ?? 0;
+    }
+    if (va < vb) return sortDir === "asc" ? -1 : 1;
+    if (va > vb) return sortDir === "asc" ? 1 : -1;
+    // tiebreak: client count desc
+    return (summary.family_client_counts?.[b] ?? 0) - (summary.family_client_counts?.[a] ?? 0);
+  });
+
   return (
     <div>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "12px" }}>
@@ -176,28 +268,68 @@ export default function SiteOverview({ siteId, apiBase, onMacSelect, onFamilySel
         <table style={{ borderCollapse: "collapse", fontSize: "12px" }}>
           <thead>
             <tr>
-              <th style={thStyle}>Device Family</th>
-              <th style={{ ...thStyle, whiteSpace: "nowrap" }} title="Isolation Forest centroid detection — flags the whole family as behaving differently from all other families at this site.">
-                IF
+              <th
+                style={{ ...thStyle, cursor: "pointer", userSelect: "none" }}
+                onClick={() => handleSort("family")}
+              >
+                Device Family<SortIndicator active={sortKey === "family"} dir={sortDir} />
               </th>
-              <th style={{ ...thStyle, whiteSpace: "nowrap" }} title="DBSCAN — fraction of individual MACs in this family flagged as site-wide behavioral outliers.">
-                DB
+              <th
+                style={{ ...thStyle, whiteSpace: "nowrap", cursor: "pointer", userSelect: "none" }}
+                title="Isolation Forest centroid detection — flags the whole family as behaving differently from all other families at this site."
+                onClick={() => handleSort("anomaly")}
+              >
+                IF<SortIndicator active={sortKey === "anomaly"} dir={sortDir} />
               </th>
-              <th style={{ ...thStyle, whiteSpace: "nowrap" }} title="Markov Chain episode analysis — flags families where clients show anomalous event chain patterns or repeated connection failures.">
-                Markov
+              <th
+                style={{ ...thStyle, whiteSpace: "nowrap", cursor: "pointer", userSelect: "none" }}
+                title="DBSCAN — fraction of individual MACs in this family flagged as site-wide behavioral outliers."
+                onClick={() => handleSort("dbscan")}
+              >
+                DB<SortIndicator active={sortKey === "dbscan"} dir={sortDir} />
               </th>
-              <th style={{ ...thStyle, whiteSpace: "nowrap", minWidth: "90px" }} title="Family health score — weighted failure rate across AUTH, ROAM, DHCP, DNS, ARP. 1.0 = no failures.">
-                Health
+              <th
+                style={{ ...thStyle, whiteSpace: "nowrap", cursor: "pointer", userSelect: "none" }}
+                title="Markov Chain episode analysis — flags families where clients show anomalous event chain patterns or repeated connection failures."
+                onClick={() => handleSort("markov")}
+              >
+                Markov<SortIndicator active={sortKey === "markov"} dir={sortDir} />
+              </th>
+              <th
+                style={{ ...thStyle, whiteSpace: "nowrap", minWidth: "90px", cursor: "pointer", userSelect: "none" }}
+                title="Family health score — weighted failure rate across AUTH, ROAM, DHCP, DNS, ARP. 1.0 = no failures."
+                onClick={() => handleSort("health")}
+              >
+                Health<SortIndicator active={sortKey === "health"} dir={sortDir} />
+              </th>
+              <th
+                style={{ ...thStyle, whiteSpace: "nowrap", minWidth: "100px" }}
+                title="Service Alarm — services where >50% of active MACs in this family are individually below 50% health."
+              >
+                Service Alarm
               </th>
               {CATEGORIES.map((c) => (
-                <th key={c} style={{ ...thStyle, writingMode: "vertical-rl", transform: "rotate(180deg)", padding: "4px 2px", fontSize: "10px" }}>
+                <th
+                  key={c}
+                  style={{
+                    ...thStyle,
+                    writingMode: "vertical-rl",
+                    transform: "rotate(180deg)",
+                    padding: "4px 2px",
+                    fontSize: "10px",
+                    cursor: "pointer",
+                    userSelect: "none",
+                    color: sortKey === c ? "#7ec8e3" : undefined,
+                  }}
+                  onClick={() => handleSort(c)}
+                >
                   {c}
                 </th>
               ))}
             </tr>
           </thead>
           <tbody>
-            {families.map((family) => {
+            {sortedFamilies.map((family) => {
               const familyData = summary.families[family] || {};
               const clientCount = summary.family_client_counts?.[family] ?? 0;
               const finding = findingsByFamily[family];
@@ -214,6 +346,7 @@ export default function SiteOverview({ siteId, apiBase, onMacSelect, onFamilySel
               const markovRatio = familyMarkov.markov_family_anomaly_ratio ?? finding?.markov_family_anomaly_ratio ?? null;
               const markovAnomalousCount = familyMarkov.markov_family_anomalous_count ?? finding?.markov_family_anomalous_count ?? 0;
               const markovEvaluatableCount = familyMarkov.markov_evaluatable_count ?? finding?.markov_evaluatable_count ?? 0;
+              const markovFamilyReason = familyMarkov.markov_family_reason ?? finding?.markov_family_reason ?? null;
               const color = familyColor(family);
               const familyHealth = health[family];
               const healthScore = familyHealth?.health_score ?? null;
@@ -224,26 +357,41 @@ export default function SiteOverview({ siteId, apiBase, onMacSelect, onFamilySel
                     .map(([k, v]) => `  ${k}: ${(v * 100).toFixed(1)}% failure`)
                     .join("\n")
                 : "Health score not yet computed";
+              const familyMeta = summary.family_metadata?.[family] || {};
+              const isSaFamily = familyMeta.family_kind === "service_account";
+              const displayName = isSaFamily ? familyMeta.service_account_label : family;
+              const saMembers = familyMeta.service_account_member_families || [];
+              const rowBg = isSaFamily ? SA_BG : undefined;
               return (
-                <tr key={family}>
+                <tr key={family} style={rowBg ? { background: rowBg } : undefined}>
                   <td style={{ ...tdStyle, whiteSpace: "nowrap" }}>
                     <span style={{
                       display: "inline-block", width: 8, height: 8,
-                      borderRadius: "50%", background: color,
+                      borderRadius: "50%", background: isSaFamily ? SA_COLOR : color,
                       marginRight: "6px", verticalAlign: "middle", flexShrink: 0,
                     }} />
                     <span
                       onClick={() => onFamilySelect(family)}
                       style={{
-                        color: hasIfOutliers ? "#7ec8e3" : "#ccc",
+                        color: isSaFamily ? SA_COLOR : (hasIfOutliers ? "#7ec8e3" : "#ccc"),
                         cursor: "pointer",
-                        textDecoration: hasIfOutliers ? "underline" : "none",
+                        textDecoration: hasIfOutliers || isSaFamily ? "underline" : "none",
                         textUnderlineOffset: "2px",
                       }}
-                      title={hasIfOutliers ? `View ${finding.if_outlier_count} Isolation Forest deviation(s) in ${family}` : family}
+                      title={isSaFamily
+                        ? `Service account spanning: ${saMembers.join(", ") || "(unknown)"}`
+                        : (hasIfOutliers ? `View ${finding.if_outlier_count} Isolation Forest deviation(s) in ${family}` : family)}
                     >
-                      {family}
+                      {displayName}
                     </span>
+                    {isSaFamily && (
+                      <span
+                        style={{ background: "transparent", color: SA_COLOR, border: `1px solid ${SA_COLOR}55`, borderRadius: "3px", padding: "0 4px", fontSize: "9px", fontWeight: "bold", letterSpacing: "0.05em", marginLeft: "6px", verticalAlign: "middle" }}
+                        title={saMembers.length ? `Spans ${saMembers.length} device families: ${saMembers.join(", ")}` : "Service account"}
+                      >
+                        SVC ACCT
+                      </span>
+                    )}
                     {clientCount > 0 && (
                       <span style={{ color: "#aaa", fontSize: "11px", marginLeft: "6px" }}>
                         ({clientCount})
@@ -292,7 +440,7 @@ export default function SiteOverview({ siteId, apiBase, onMacSelect, onFamilySel
                     style={{ ...tdStyle, textAlign: "center" }}
                     title={
                       isFamilyMarkovOutlier
-                        ? `Markov anomaly: ${markovAnomalousCount}/${markovEvaluatableCount} clients have anomalous event chain patterns (${markovRatio != null ? (markovRatio * 100).toFixed(0) + "%" : ""})`
+                        ? `Markov ${markovFamilyReason || "anomaly"}: ${markovAnomalousCount}/${markovEvaluatableCount} clients flagged${markovRatio != null ? ` (${(markovRatio * 100).toFixed(0)}%)` : ""}`
                         : markovEvaluatableCount > 0
                           ? `Markov: ${markovAnomalousCount}/${markovEvaluatableCount} clients evaluated — no family-level anomaly`
                           : "Markov baseline not yet available or no scoreable episodes"
@@ -309,7 +457,7 @@ export default function SiteOverview({ siteId, apiBase, onMacSelect, onFamilySel
                         fontWeight: "bold",
                         whiteSpace: "nowrap",
                       }}>
-                        {markovRatio != null ? `${(markovRatio * 100).toFixed(0)}%` : "chain"}
+                        {markovFamilyReason || "chain"}
                       </span>
                     ) : markovEvaluatableCount > 0 ? (
                       <span style={{ color: "#2d7a4f", fontSize: "10px" }}>OK</span>
@@ -332,6 +480,14 @@ export default function SiteOverview({ siteId, apiBase, onMacSelect, onFamilySel
                     ) : (
                       <span style={{ color: "#333", fontSize: "10px" }}>—</span>
                     )}
+                  </td>
+
+                  {/* Service Alarm — family-level cards from the health record */}
+                  <td style={{ ...tdStyle, minWidth: "100px" }}>
+                    <ServiceAlarmCards
+                      alarms={familyHealth?.service_alarms || []}
+                      serviceHealth={familyHealth?.service_health || {}}
+                    />
                   </td>
 
                   {CATEGORIES.map((cat) => {
@@ -389,6 +545,7 @@ export default function SiteOverview({ siteId, apiBase, onMacSelect, onFamilySel
                 <td style={{ ...tdStyle, textAlign: "center" }}>
                   <span style={{ color: "#888", fontSize: "10px" }}>—</span>
                 </td>
+                <td style={tdStyle} />
                 <td style={tdStyle} />
                 {CATEGORIES.map((cat) => {
                   const count = otherCounts[cat] ?? 0;

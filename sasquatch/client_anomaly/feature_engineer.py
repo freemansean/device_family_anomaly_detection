@@ -36,8 +36,49 @@ from .event_collector import (
 )
 
 from . import config
+from . import db as _db
 
 log = logging.getLogger(__name__)
+
+# ─────────────────────────────────────────────────────────────────────
+# Service-account dual-family identifiers.
+#
+# A MAC that belongs to a qualifying service-account username is emitted into
+# the feature dict TWICE: once under its real MAC (primary record, real device
+# family like "MacBook"), and once under a composite key built by `sa_record_key`
+# with `device_family = "{label}.service_account"`. The two records share the
+# same vector but are scored under different family groups so the device-family
+# detection passes treat them independently.
+#
+# Downstream code identifies sa records by:
+#   - is_sa_record_key(key)         — composite key form, used in features dict
+#   - is_service_account_family(name) — family-name suffix check
+#   - underlying_mac(key)            — strip the suffix to recover the real MAC
+# ─────────────────────────────────────────────────────────────────────
+SERVICE_ACCOUNT_SUFFIX = ".service_account"
+_SA_KEY_SUFFIX = "#sa"
+
+
+def sa_record_key(mac: str) -> str:
+    """Composite features-dict key for a MAC's service-account record."""
+    return f"{mac}{_SA_KEY_SUFFIX}"
+
+
+def is_sa_record_key(key: str) -> bool:
+    """True if a features-dict key is the service-account variant of a MAC."""
+    return key.endswith(_SA_KEY_SUFFIX)
+
+
+def underlying_mac(key: str) -> str:
+    """Strip the sa suffix from a composite key to recover the real MAC."""
+    if is_sa_record_key(key):
+        return key[: -len(_SA_KEY_SUFFIX)]
+    return key
+
+
+def is_service_account_family(name: str | None) -> bool:
+    """True if a device-family name is a virtual service-account family."""
+    return bool(name) and name.endswith(SERVICE_ACCOUNT_SUFFIX)
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 FEATURES_TTL = 24 * 3600
@@ -249,8 +290,58 @@ async def build_features(site_id: str, wlan: str) -> int:
                 "Run event_collector.collect() first."
             )
 
+        # Group events by MAC up-front — every downstream pass uses this map.
+        mac_events: dict[str, list[dict]] = defaultdict(list)
+        for event in events:
+            mac = (event.get("mac") or "").replace(":", "").lower()
+            if mac:
+                mac_events[mac].append(event)
+
+        # ── Service-account family lookup (org-wide, evaluated once per build) ──
+        # Pulls normalized usernames that ≥ N distinct client rows share across
+        # the entire org. Each qualifying entry maps to a display label that
+        # becomes the virtual family name "{label}.service_account". Empty when
+        # SERVICE_ACCOUNT_MIN_MACS is 0 or when no clusters cross the threshold.
+        sa_min = config.get("service_account", "service_account_min_macs")
+        sa_lookup: dict[str, dict] = {}
+        org_id = os.getenv("MIST_ORG_ID", "")
+        if sa_min > 0 and org_id:
+            try:
+                sa_lookup = await _db.get_service_account_usernames(org_id, int(sa_min))
+            except Exception:
+                log.exception(
+                    "service-account lookup failed; skipping virtual family emission"
+                )
+                sa_lookup = {}
+
+        # Per-MAC pre-pass: compute majority-vote last_username and resolve the
+        # service-account virtual family. Done before the family-event-counts
+        # aggregator below so events for sa-bound MACs get binned into BOTH
+        # their primary family and the virtual sa family in one walk.
+        mac_to_username: dict[str, str] = {}
+        mac_to_sa_family: dict[str, str] = {}
+        for mac, evts in mac_events.items():
+            uname_counts: dict[str, int] = {}
+            for e in evts:
+                u = (e.get("last_username") or "").strip()
+                if u:
+                    uname_counts[u] = uname_counts.get(u, 0) + 1
+            if not uname_counts:
+                continue
+            last_username = max(uname_counts, key=uname_counts.__getitem__)
+            mac_to_username[mac] = last_username
+            if not sa_lookup:
+                continue
+            uname_norm = _db.normalize_username(last_username)
+            sa_entry = sa_lookup.get(uname_norm) if uname_norm else None
+            if sa_entry:
+                mac_to_sa_family[mac] = f"{sa_entry['label']}{SERVICE_ACCOUNT_SUFFIX}"
+
         # Pre-compute per-family event category counts for the org/family-insights
-        # endpoint so it can aggregate across sites without loading raw events per request.
+        # endpoint so it can aggregate across sites without loading raw events per
+        # request. Each event contributes to its primary device family and — when
+        # the MAC belongs to a qualifying service-account cluster — also to the
+        # virtual sa family, so the heatmap surfaces sa families as first-class rows.
         _fam_cat: dict[str, Counter] = defaultdict(Counter)
         _fam_macs: dict[str, set] = defaultdict(set)
         for _evt in events:
@@ -260,6 +351,10 @@ async def build_features(site_id: str, wlan: str) -> int:
             _mac = (_evt.get("mac") or "").replace(":", "").lower()
             if _mac:
                 _fam_macs[_fam].add(_mac)
+                _sa_fam = mac_to_sa_family.get(_mac)
+                if _sa_fam:
+                    _fam_cat[_sa_fam][_cat] += 1
+                    _fam_macs[_sa_fam].add(_mac)
         family_counts = {
             fam: {
                 "total_events": sum(cats.values()),
@@ -274,16 +369,10 @@ async def build_features(site_id: str, wlan: str) -> int:
             ex=FEATURES_TTL,
         )
 
-        # Group events by MAC
-        mac_events: dict[str, list[dict]] = defaultdict(list)
-        for event in events:
-            mac = (event.get("mac") or "").replace(":", "").lower()
-            if mac:
-                mac_events[mac].append(event)
-
         # Build feature vector for each MAC
         features: dict[str, dict] = {}
         skipped = 0
+        sa_emitted = 0
         min_mac_events = config.get("general", "anomaly_min_mac_events")
         for mac, evts in mac_events.items():
             if len(evts) < min_mac_events:
@@ -293,15 +382,19 @@ async def build_features(site_id: str, wlan: str) -> int:
             # Majority-vote device_family across all events for this MAC.
             # Any non-Unknown label beats Unknown — handles MACs whose events span
             # a cache refresh boundary (early events labeled Unknown, later ones correct).
-            family_counts: dict[str, int] = {}
+            family_counts_local: dict[str, int] = {}
             for e in evts:
                 f = e.get("device_family") or "Unknown"
-                family_counts[f] = family_counts.get(f, 0) + 1
-            non_unknown = {f: c for f, c in family_counts.items() if not f.startswith("Unknown")}
+                family_counts_local[f] = family_counts_local.get(f, 0) + 1
+            non_unknown = {f: c for f, c in family_counts_local.items() if not f.startswith("Unknown")}
             if non_unknown:
                 device_family = max(non_unknown, key=non_unknown.__getitem__)
             else:
-                device_family = max(family_counts, key=family_counts.__getitem__)
+                device_family = max(family_counts_local, key=family_counts_local.__getitem__)
+
+            last_username = mac_to_username.get(mac, "")
+            sa_family_name = mac_to_sa_family.get(mac, "")
+
             volume_concentration_weight = math.log1p(len(evts)) * vec["top_category_fraction"]
             features[mac] = {
                 "vector": vec,
@@ -309,12 +402,36 @@ async def build_features(site_id: str, wlan: str) -> int:
                 "event_count": len(evts),
                 "random_mac": evts[0].get("random_mac", False) if evts else False,
                 "volume_concentration_weight": volume_concentration_weight,
+                "last_username": last_username,
+                "service_account_family": sa_family_name,
             }
+
+            # ── Dual-family emission ──
+            # Same vector under a composite key with device_family overridden to
+            # the virtual service-account label. The two records share weight,
+            # event count, and random_mac flag — they are the SAME device viewed
+            # under two grouping schemes. anomaly_detector groups by device_family,
+            # so the sa record naturally lands in its own family bucket and is
+            # scored independently of its physical-device-family peers.
+            if sa_family_name:
+                features[sa_record_key(mac)] = {
+                    "vector": dict(vec),
+                    "device_family": sa_family_name,
+                    "event_count": len(evts),
+                    "random_mac": evts[0].get("random_mac", False) if evts else False,
+                    "volume_concentration_weight": volume_concentration_weight,
+                    "last_username": last_username,
+                    "primary_device_family": device_family,
+                    "primary_mac": mac,
+                    "is_service_account_record": True,
+                }
+                sa_emitted += 1
 
         key = _features_redis_key(site_id, wlan)
         await redis_client.set(key, json.dumps(features), ex=FEATURES_TTL)
         log.info(
-            f"Built features for {len(features)} MACs → {key} "
+            f"Built features for {len(features)} records "
+            f"({sa_emitted} service-account dual records) → {key} "
             f"({skipped} skipped with < {min_mac_events} events) [wlan={wlan}]"
         )
         return len(features)

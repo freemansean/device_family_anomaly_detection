@@ -9,14 +9,17 @@ of Project Sasquatch. Read this entirely before writing any code.
 ## What This Module Does
 
 Detects anomalous client behavior at a Juniper Mist site by:
-1. Building a 24-hour client device database (MAC → device metadata)
-2. Pulling all client events for the site over the last 24 hours
+1. Building an org-wide client device database (MAC → device metadata), refreshed daily.
+   The cache is org-scoped: MAC addresses uniquely identify clients across the entire
+   organization, so a single lookup table serves every site.
+2. Pulling client events for the site over a rolling window — manual full collects fetch
+   the last 12 hours, hourly polls top up the trailing 1 hour
 3. Engineering per-MAC behavioral feature vectors
 4. Running a four-stage ML detection pipeline (see `anomaly_detector.py`):
    - **Stage 1 — DBSCAN** (site-wide): flags MACs that don't cluster with any site peer group
    - **Stage 1b — Family Centroid IF**: flags entire device families behaving differently from all other families
    - **Stage 2 — Isolation Forest** (per device family): flags individual MACs anomalous within their family
-   - **Stage 4 — Markov Chain** (see `markov_analyzer.py`): scores event-transition sequences within episodes against a 24hr site baseline; flags families where ≥ `MARKOV_FAMILY_OUTLIER_RATIO` of clients have anomalous connection patterns, repeated short (failed) episodes, or stuck failure loops (baseline-independent)
+   - **Stage 4 — Markov Chain** (see `markov_analyzer.py`): scores event-transition sequences within episodes against a 24hr site baseline and runs a baseline-independent stuck-loop detector. Per-MAC `markov_reason` collapses to two states: `anomaly` (anomalous connection-chain transitions) or `repeated` (stuck failure loop). Families are flagged when ≥ `MARKOV_FAMILY_OUTLIER_RATIO` of clients carry either reason; the dominant reason is rolled up as `markov_family_reason`.
 5. Computing a separate per-family **Health Score** (see `health_scorer.py`): mean of per-MAC
    failure rates across AUTH, ROAM, DHCP, DNS, and ARP — independent of the anomaly pipeline
 6. Rolling up MAC-level anomalies to device type findings
@@ -79,8 +82,8 @@ Update it when you identify new problems or resolve existing ones.
 sasquatch/
 ├── client_anomaly/
 │   ├── __init__.py
-│   ├── client_cache.py          # Daily client list refresh → Redis
-│   ├── event_collector.py       # 24hr event pull + MAC enrichment → Redis
+│   ├── client_cache.py          # Daily org-wide client list refresh → SQLite
+│   ├── event_collector.py       # Streaming event pull (12hr full / 1hr poll) + MAC enrichment → SQLite (batched flushes)
 │   ├── feature_engineer.py      # Per-MAC feature vector construction
 │   ├── anomaly_detector.py      # Four-stage ML pipeline (DBSCAN/IF/Markov) + finding rollup
 │   ├── markov_analyzer.py       # Markov Chain episode analysis (Stage 4)
@@ -112,13 +115,13 @@ sasquatch/
 
 | Key | TTL | Contents |
 |---|---|---|
-| `sasquatch:clients:{site_id}` | 7 days | JSON dict: MAC → {model, os, manufacturer, family} |
-| `sasquatch:events:{site_id}` | 7 days | Sorted set: enriched event objects scored by Unix timestamp |
-| `sasquatch:wlans:{site_id}` | 7 days | Set: unique SSID names seen for this site |
+| _(client cache moved to SQLite — see SQLite Schema below)_ | — | Stored in the `clients` table, org-scoped, MAC PRIMARY KEY |
+| _(events moved to SQLite — see SQLite Schema below)_ | — | Stored in the `events` table, 7-day retention purged by `db.purge_old_events` |
+| _(wlans derived from SQLite events table on demand)_ | — | `db.get_wlans(site_id)` issues `SELECT DISTINCT wlan` against the events table |
 | `sasquatch:event_type_index` | 7 days | JSON array: ordered list of known Mist client event type strings |
 | `sasquatch:features:{site_id}:{wlan_key}` | 24hr | JSON dict: MAC → feature vector dict |
 | `sasquatch:anomalies:{site_id}:{wlan_key}` | 24hr | JSON dict: MAC → {if_score, dbscan_label, is_outlier, is_family_outlier, is_markov_outlier, markov_episode_anomaly_ratio, …} |
-| `sasquatch:markov_baseline:{site_id}:{wlan_key}` | 48hr | JSON dict: {transition_counts, episode_transition_counts, event_type_index, computed_at} |
+| `sasquatch:markov_baseline:{site_id}:{wlan_key}` | 48hr | JSON dict: {transition_counts, event_type_index, computed_at} |
 | `sasquatch:health:{site_id}:{wlan_key}` | 24hr | JSON dict: family → {health_score, components, total_events, mac_count} |
 | `sasquatch:findings:{site_id}:{wlan_key}` | 24hr | JSON array: rolled-up findings for GUI + webhook |
 | `sasquatch:org_anomalies:{site_id}:{wlan_key}` | 24hr | JSON dict: per-MAC org-wide scores (written by `score_org_wide`) |
@@ -127,13 +130,26 @@ sasquatch/
 | `sasquatch:alert_sessions` | none (pruned on write) | Sorted set: session keys scored by `first_seen` unix timestamp; entries older than 8 days are pruned each cycle |
 | `sasquatch:alert_session:{session_key}` | 8 days | JSON: `{site_id, family, wlan, first_seen, last_seen, resolved_at, status}` for one alert session |
 
-**TTL note:** Client cache and events are both 7 days — the cache survives across the full
-event retention window, so a cache miss on a historical event is not possible due to TTL
-expiry. Detection/scoring output keys (features, anomalies, health, findings) are 24hr.
+**TTL note:** Events are 7 days in SQLite (purged by `db.purge_old_events`). The
+client cache has no TTL — it lives in SQLite under the `clients` table and is
+overwritten in place by each daily refresh. Detection/scoring output keys
+(features, anomalies, health, findings) remain 24hr in Redis.
 
-**Startup behavior:** If `sasquatch:clients:{site_id}` is missing at startup, the event
-collector must fail fast with a clear error — do NOT silently make a redundant client
-list API call from the event collector. The daily job owns that responsibility.
+**Client cache (SQLite, org-scoped):** Stored in the `clients` table keyed by
+`mac TEXT PRIMARY KEY` with `org_id`, `family`, `model`, `os`, `manufacturer`,
+`random_mac`, `last_ssid`, `last_ap`, `last_site_id`, and `updated_at` columns.
+A single row per MAC across the entire org — the same MAC seen tomorrow at a
+different site overwrites `last_site_id` on the next refresh. Use
+`db.get_org_client_cache(org_id)` (one row per MAC) for the full org map, or
+filter by `last_site_id` for a per-site view. The `client_refresh_log` table
+records refresh timestamps keyed by `org_id`.
+
+**Startup behavior:** If the org client cache is missing at startup, the event
+collector must fail fast with a clear error — `_collect_org_streaming()` checks
+`get_client_cache() is None` and raises. Do NOT silently make a redundant client
+list API call from the event collector — the "Build Cache" path
+(`_org_collect_background_task` Phase 1) and the daily `client_refresh_job` own
+that responsibility.
 
 ---
 
@@ -141,11 +157,14 @@ list API call from the event collector. The daily job owns that responsibility.
 
 ### `client_cache.py`
 
-**Purpose:** Once-daily refresh of the client device lookup table.
+**Purpose:** Once-daily refresh of the org-wide client device lookup table. The
+cache is org-scoped — MACs uniquely identify clients across the entire
+organization, so a single API call populates the entire lookup table that every
+site reads from.
 
 **Mist API call:**
 ```
-GET https://{MIST_CLOUD_HOST}/api/v1/sites/{site_id}/clients/search?limit=1000
+GET https://{MIST_CLOUD_HOST}/api/v1/orgs/{org_id}/clients/search?limit=1000
 ```
 
 **Pagination — CRITICAL:** This endpoint uses cursor-based pagination, NOT page/offset.
@@ -154,8 +173,8 @@ it contains a full relative URL. Prepend `https://{MIST_CLOUD_HOST}` and call it
 — do NOT attempt to reconstruct or modify the URL. Loop until `next` is absent.
 
 ```python
-async def fetch_all_clients(site_id: str) -> list[dict]:
-    url = f"https://{MIST_CLOUD_HOST}/api/v1/sites/{site_id}/clients/search?limit=1000"
+async def fetch_all_clients_org(org_id: str, on_page=None) -> list[dict]:
+    url = f"https://{MIST_CLOUD_HOST}/api/v1/orgs/{org_id}/clients/search?limit=1000"
     all_clients = []
     while url:
         resp = await httpx_client.get(url, headers=auth_headers)
@@ -165,6 +184,16 @@ async def fetch_all_clients(site_id: str) -> list[dict]:
         url = f"https://{MIST_CLOUD_HOST}{next_path}" if next_path else None
     return all_clients
 ```
+
+**Public API:**
+- `refresh_client_cache_org(org_id, on_page=None) -> int` — fetches every client
+  org-wide, classifies, and writes the entire org cache to SQLite. Returns the
+  total client count. Always writes (even when the API returns zero clients) so
+  callers can distinguish "cache populated but empty" from "cache never written".
+- `get_client_cache() -> dict[str, dict] | None` — loads the entire org cache
+  (one entry per MAC). Returns `None` if `refresh_client_cache_org()` has never
+  run, `{}` if it ran but the org has zero clients, or the populated map.
+  Reads `MIST_ORG_ID` from the environment — no per-site variant exists.
 
 **Device family classification:** The client record fields `model`, `device`, and `os`
 are ALL arrays (can be empty lists). Use this fallback hierarchy to determine family:
@@ -193,7 +222,8 @@ def classify_family(client: dict) -> str:
     return "Unknown"
 ```
 
-**Output:** Redis key `sasquatch:clients:{site_id}`, value:
+**Output:** SQLite `clients` table, one row per MAC across the org. The shape
+returned by `get_client_cache()` is:
 ```json
 {
   "d67e8486da0b": {
@@ -203,10 +233,13 @@ def classify_family(client: dict) -> str:
     "manufacturer": "Apple",
     "random_mac": true,
     "last_ssid": "Public",
-    "last_ap": "a8f7d9818ea2"
+    "last_ap": "a8f7d9818ea2",
+    "last_site_id": "04edb3ac-542a-4d1d-ad90-b1e2fd682a67"
   }
 }
 ```
+`last_site_id` is the most recent site Mist saw the client at — used by
+`/api/v1/sites/{site_id}/clients` to filter the org cache to a per-site view.
 
 **Note on `model` field:** The `model` array is frequently empty even for known devices
 (confirmed in real payload — Apple client with `model: []`). Do not depend on model
@@ -218,47 +251,126 @@ for family classification. `device` + `mfg` is more reliable.
 
 ### `event_collector.py`
 
-**Purpose:** Pull all client events for the last 24hr, enrich with device metadata,
-store in Redis.
+**Purpose:** Pull client events from Mist over a rolling time window, enrich with
+device metadata, store in SQLite (not Redis — events moved off Redis for capacity/
+persistence).
 
 **Mist API call:**
 ```
-GET https://{MIST_CLOUD_HOST}/api/v1/sites/{site_id}/clients/events?limit=1000
+GET https://{MIST_CLOUD_HOST}/api/v1/orgs/{org_id}/clients/events?limit=1000
 ```
 
-**Pagination — GUARANTEED REQUIRED:** This endpoint will always require multiple pages
-for any active site. Use the same cursor pattern as the client search endpoint — check
-for a `next` field in each response and loop until absent.
+The org-level endpoint returns events across every site in one paginated stream;
+each event carries its own `site_id`. Per-site collection has been retired —
+all event ingest goes through this single org endpoint.
 
-```python
-async def fetch_all_events(site_id: str) -> list[dict]:
-    url = f"https://{MIST_CLOUD_HOST}/api/v1/sites/{site_id}/clients/events?limit=1000"
-    all_events = []
-    page = 0
-    while url:
-        resp = await httpx_client.get(url, headers=auth_headers)
-        data = resp.json()
-        batch = data.get("results", [])
-        all_events.extend(batch)
-        page += 1
-        log.info(f"Events page {page}: {len(batch)} events, total so far: {len(all_events)}")
-        next_path = data.get("next")
-        url = f"https://{MIST_CLOUD_HOST}{next_path}" if next_path else None
-    log.info(f"Event collection complete: {len(all_events)} total events")
-    return all_events
-```
+**Time window — explicit Unix timestamps:** Org collects pass `start` and `end` Unix
+timestamps in the query string instead of a relative `duration=...`. The window is
+anchored at the moment the collect was triggered, so retries and pagination latency
+do not shift it. The relative `duration` parameter is still supported by `iter_events_org`
+as a fallback when both timestamps are absent.
+
+- `collect_org_full()` (manual "Collect Events" button → POST `/api/v1/org/collect-full`):
+  fetches the **last 12 hours** (`end = now`, `start = now - 12*3600`).
+- `collect_org()` (hourly poll job): fetches the **last 1 hour** (`end = now`,
+  `start = now - 3600`).
+
+**Pagination — GUARANTEED REQUIRED:** These endpoints will always require multiple pages
+for any active org. Use cursor pagination: each response carries a `next` field with a
+relative URL that must be used verbatim — the `search_after` parameter is a composite
+cursor that cannot be reconstructed manually.
 
 The `next` cursor format confirmed from real API response:
 ```
-/api/v1/sites/{site_id}/clients/search?end=...&limit=1000&search_after=[timestamp,+record_id]&start=...
+/api/v1/orgs/{org_id}/clients/events?end=...&limit=1000&search_after=[timestamp,+record_id,+seq]&start=...
 ```
-Always use the `next` URL verbatim — the `search_after` parameter is a composite
-cursor that cannot be reconstructed manually.
 
-**Enrichment:** For each event, look up `mac` in the Redis client cache. Add fields:
+**Streaming org paginator — `iter_events_org()`:** Implemented as an async generator
+that yields raw event batches once the buffer reaches `batch_size` events. The caller
+enriches and writes each batch to SQLite before the next batch is fetched. This bounds
+memory usage regardless of total event count (9M+ seen in real deployments) and
+preserves partial progress if the fetch fails mid-stream.
+
+Two flush thresholds are defined and selected by the caller:
+- `_ORG_FLUSH_BATCH_SIZE = 100_000` — used by `collect_org_full()` (12hr collect, multi-million-event runs)
+- `_ORG_HOURLY_FLUSH_BATCH_SIZE = 25_000` — used by `collect_org()` (hourly poll); a typical hourly run is well under 100k events, so the default threshold would only flush once at the very end. The lower hourly threshold ensures even modest hourly volumes flush mid-stream and retain the partial-progress / memory-bounding benefits.
+
+```python
+async def iter_events_org(
+    org_id: str,
+    duration: str = "1h",
+    batch_size: int = _ORG_FLUSH_BATCH_SIZE,
+    on_page=None,
+    start: int | None = None,
+    end: int | None = None,
+):
+    if start is not None and end is not None:
+        window_qs = f"start={int(start)}&end={int(end)}"
+    else:
+        window_qs = f"duration={duration}"
+    url = f"https://{MIST_CLOUD_HOST}/api/v1/orgs/{org_id}/clients/events?limit=1000&{window_qs}"
+    buffer: list[dict] = []
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        while url:
+            resp = await client.get(url, headers=auth_headers)
+            resp.raise_for_status()
+            data = resp.json()
+            buffer.extend(data.get("results", []))
+            await _check_rate_limit(resp, page, "org")
+            next_path = data.get("next")
+            url = f"https://{MIST_CLOUD_HOST}{next_path}" if next_path else None
+            if len(buffer) >= batch_size:
+                yield buffer
+                buffer = []
+    if buffer:
+        yield buffer
+```
+
+`collect_org_full()` and `collect_org()` both delegate to `_collect_org_streaming()`,
+which wraps the generator in a try/except: on failure it logs the row count already
+persisted to SQLite, flushes unknown event types to Redis, and re-raises. The caller
+always receives a `{site_id: rows_written}` dict reflecting actual DB state, never
+a full in-memory buffer. `_collect_org_streaming()` accepts a `batch_size` parameter
+that the hourly path overrides to `_ORG_HOURLY_FLUSH_BATCH_SIZE`.
+
+`fetch_all_events_org()` is retained as a non-streaming wrapper around the generator
+for any code path that genuinely needs the full list — avoid using it for org-wide
+multi-hour collects.
+
+**Auto-enable hourly polling on successful full collect:** When `collect_org_full()`
+completes successfully, `_org_collect_background_task` (in `api/routes.py`) sets the
+Redis key `sasquatch:event_polling_enabled = "1"`. The hourly `org_event_poll_job`
+in `scheduler.py` gates on this key, so a successful manual full collect transparently
+arms the hourly top-up loop without requiring the operator to flip the UI toggle.
+
+**Rate limit handling — `_check_rate_limit()`:** After every paginated response, the
+helper checks `X-RateLimit-Remaining` / `X-RateLimit-Reset` headers and sleeps until
+the reset window if remaining calls drop below `_RATE_LIMIT_RESERVE` (default 200).
+
+**CRITICAL:** Mist does not reliably return rate limit headers on every endpoint. When
+headers are absent, `_check_rate_limit()` falls back to a per-request throttle of 0.8s
+(≈ 4500 req/hr, comfortably under the documented 5000/hr limit). On page 1 of every
+paginated run the helper logs whichever `*ratelimit*`/`*retry*` headers the API is
+sending, so any future header-name drift is immediately visible in the log.
+
+The 0.8s fallback is intentional — a previous deployment hit a 429 after 8.2M events
+fetched in ~90 minutes because headers were missing and no throttle was applied. Do
+not remove the fallback without confirming Mist reliably returns `X-RateLimit-*` on
+the org events endpoint.
+
+**Enrichment:** For each event, look up `mac` in the org-wide client cache. Add fields:
 - `device_family`
 - `device_model`
 - `device_manufacturer`
+
+The cache is loaded **once** at the start of every collect via
+`get_client_cache()` and threaded through every batch — `_collect_org_streaming`
+loads it before pagination begins and passes the same map down through
+`_flush_org_batch` → `_enrich_and_write_org_batch`. There is no per-site cache
+fetch in the enrichment path. If `get_client_cache()` returns `None` the
+collector raises immediately rather than silently triggering a refresh
+mid-collect (a previous bug caused stuck-loops where every collect ran a
+multi-thousand-page client search and then refetched events).
 
 If MAC is not in client cache, attempt OUI lookup from the first 3 octets of the MAC
 to get manufacturer. Set `device_family = "Unknown"`, `device_model = "Unknown"`.
@@ -367,7 +479,7 @@ by Mist are picked up automatically and expand the feature vector.
 | `OTHER` | `RADIUS_DAS_NOTIFY`, any unrecognized types |
 
 Log any event types not in the known list to Redis set
-`sasquatch:unknown_event_types:{site_id}` for review and future vector expansion.
+`sasquatch:unknown_event_types:org` for review and future vector expansion.
 
 ---
 
@@ -375,8 +487,8 @@ Log any event types not in the known list to Redis set
 
 **Purpose:** Build per-MAC feature vectors from the event stream.
 
-**Input:** Redis `sasquatch:events:{site_id}`
-**Output:** Redis `sasquatch:features:{site_id}`
+**Input:** SQLite events table (read via `db.get_events(site_id, wlan)`)
+**Output:** Redis `sasquatch:features:{site_id}:{wlan_key}`
 
 ---
 
@@ -591,27 +703,39 @@ passes raw normalized frequencies to StandardScaler without any column weighting
 signals are captured by the separate Health Score — mixing them into the anomaly feature
 space conflates "behaves differently" with "is failing", which are distinct signals.
 
-**Stage 4 — Markov Chain stuck-loop detection (baseline-independent):**
+**Stage 4 — Markov Chain (two signals, single reason):**
 
-In addition to the existing Markov episode analysis (event-level transition scoring,
-episode-type sequence scoring, repeated-short-episode detection — all baseline-relative),
-`markov_analyzer.py` includes a **stuck-loop detector** (`detect_stuck_loop()`) that runs
-independently of the Markov baseline.
+`markov_analyzer.py` runs two complementary checks against each MAC's event stream:
 
-The stuck-loop detector counts all consecutive `(A→B)` event-type transition pairs across
-a MAC's full event stream. If the single most common pair accounts for ≥
-`MARKOV_STUCK_LOOP_THRESHOLD` (default 0.4) of all transitions AND at least one of the
-two event types is a failure/disassoc type, the MAC is flagged `is_stuck_loop=True` →
-`is_markov_outlier=True`.
+1. **Event-level transition scoring (baseline-relative):** scores each normal-length
+   episode's consecutive event transitions against the 24hr site transition matrix
+   (Laplace-smoothed). An episode is anomalous when its mean log-prob falls below
+   threshold; a MAC is flagged when ≥ `MARKOV_OUTLIER_EPISODE_RATIO` of its scoreable
+   episodes are anomalous. This catches clients whose connection chains drift from the
+   site norm.
+2. **Stuck-loop detector (baseline-independent, `detect_stuck_loop()`):** counts all
+   consecutive `(A→B)` event-type transition pairs across a MAC's full event stream.
+   If the single most common pair accounts for ≥ `MARKOV_STUCK_LOOP_THRESHOLD`
+   (default 0.4) of all transitions AND at least one of the two event types is a
+   failure/disassoc type, the MAC is flagged `is_stuck_loop=True`. This is critical
+   for catching devices that contaminate their own baseline (e.g. a device cycling
+   `AUTH_FAILURE → DISASSOC` at 149k events would dominate the site transition matrix
+   and look "normal" to the baseline-relative scorer) — the stuck-loop detector
+   ignores the baseline entirely.
 
-This is critical for catching devices that contaminate their own Markov baseline: a device
-cycling through `AUTH_FAILURE → DISASSOC` at 149k events will dominate the site-level
-transition matrix, making that pattern appear "normal" to the baseline-relative scorer.
-The stuck-loop detector ignores the baseline entirely — it flags based on absolute
-transition concentration, so the contamination problem is bypassed.
+Both signals roll up into a single `is_markov_outlier` boolean plus a single
+`markov_reason` field that collapses to one of two states:
 
-New fields on anomaly records: `is_stuck_loop`, `stuck_loop_pair` (e.g.
-`"MARVIS_EVENT_CLIENT_AUTH_FAILURE→CLIENT_DEAUTHENTICATION"`), `stuck_loop_fraction`.
+- `"anomaly"` — event-level transition scoring flagged the MAC
+- `"repeated"` — stuck-loop detector flagged the MAC (wins ties with `"anomaly"`)
+
+Per-MAC anomaly records still carry the detail fields needed to explain the flag:
+`markov_scoreable_episodes`, `markov_anomalous_episodes`, `markov_episode_anomaly_ratio`,
+`is_stuck_loop`, `stuck_loop_pair` (e.g. `"MARVIS_EVENT_CLIENT_AUTH_FAILURE→CLIENT_DEAUTHENTICATION"`),
+and `stuck_loop_fraction`. Findings carry `markov_family_reason` — the dominant
+per-MAC reason across flagged clients in the family. Repeated-short-episode (Layer 2)
+and episode-sequence scoring paths were removed; the baseline persists only
+`transition_counts` + `event_type_index`.
 
 **Finding rollup logic:**
 
@@ -698,6 +822,78 @@ immediately after, or health data will be stale/expired (24hr TTL) while anomaly
 remain fresh. The `POST /org/detect` route must call `score_health(sid, wlan)` inside
 its Phase 1 feature-build loop — omitting it leaves health null for families that only
 appear at a small number of sites.
+
+---
+
+### Service-Account Virtual Families
+
+**Why this exists:** A device labelled `MacBook` can also be authenticating under a
+shared service-account username such as `srv_Apple_EP`. Looking at MacBooks alone
+would miss "all devices logging in as `srv_Apple_EP` are failing auth" — the username
+is the more meaningful grouping for that signal. Service-account families let the
+detector see the same MAC twice: once under its hardware family (`MacBook`) and once
+under its username family (`srv_Apple_EP.service_account`). Anomalies can surface from
+either view and the operator sees both.
+
+**Source field:** `last_username` from the Mist org clients endpoint. Captured by
+`client_cache.py`, persisted on the `clients` SQLite row (column added via migration),
+and threaded through event enrichment in `event_collector.py` so every event row
+inherits `last_username` alongside `device_family` / `device_model` / `device_manufacturer`.
+
+**Family naming convention:** Service-account family names use the suffix
+`.service_account`. A username `srv_Apple_EP` produces the family
+`srv_Apple_EP.service_account`. The suffix is the only flag downstream code uses to
+distinguish service-account families from hardware families — do not use it for any
+other purpose.
+
+**≥50 MAC threshold:** A username only becomes a virtual family once at least 50
+distinct MACs in the org cache share it. Below that, the username is treated as
+identifying / decorative metadata only and does not generate a family. Threshold lives
+in `feature_engineer.py`; rebuilding the threshold list happens at feature-build time
+so it tracks current cache state (not stale snapshots).
+
+**Dual-family model — composite keys:** Feature records for service-account families
+use composite keys `{mac}#sa` so a single MAC can carry two parallel feature rows:
+
+| Key | family_field | is_service_account_record |
+|---|---|---|
+| `aabbccddee01` | `MacBook` | False |
+| `aabbccddee01#sa` | `srv_Apple_EP.service_account` | True |
+
+Both rows are emitted by `feature_engineer.py` and both flow through every stage of
+`anomaly_detector.py` — DBSCAN, per-family Isolation Forest, Markov stuck-loop, and
+inter-family centroid detection. The composite key ensures dict-based state never
+collides between the two perspectives.
+
+**Roll-up behavior:** Service-account families are scored as first-class families.
+They generate findings, contribute to `org_findings`, and pass through the dual
+alert gate exactly like hardware families. The `service_account` summary block on
+each primary anomaly record (set in `score()`) carries `family`, `last_username`,
+`is_family_outlier`, `is_if_outlier`, `if_score`, `centroid_if_score`, and
+`centroid_dist_score` so the per-MAC drilldown can show "this device is also part
+of `srv_Apple_EP.service_account`, which scored X".
+
+**Webhook gating:** Same dual gate as hardware families. A service-account family
+fires the webhook when `is_family_outlier == True` AND `health_score < threshold`.
+
+**Frontend surfacing:** Service-account families are visible in:
+- **SiteOverview / OrgFamilyInsights heatmap rows** — rendered with the SA color
+  scheme (`SA_COLOR = "#d4a06a"`, `SA_BG = "#2a1f15"`), labelled with the username
+  (suffix stripped), and tagged with a `SVC ACCT` badge that lists the underlying
+  device families on hover.
+- **OrgAlerts / FindingsFeed cards** — `family_kind === "service_account"` triggers
+  the SVC ACCT badge and replaces `device_family` with `service_account_label`.
+- **FamilyDrilldown / OrgFamilyDrilldown** — header shows the SA badge, a banner
+  block lists the underlying device families the username spans, and an extra
+  "Primary Family" column appears showing each member MAC's hardware family.
+- **MacDrilldown** — when `scores.service_account` is present, an SA info card
+  appears between the metadata grid and the Domain Health Axes, showing the SA
+  family label, username, and the SA-specific anomaly + centroid scores.
+
+**API metadata:** `get_events_summary` (powering the heatmap) returns a
+`family_metadata` map keyed by family name with `family_kind`,
+`service_account_label`, and `service_account_member_families` so the frontend can
+render each row correctly without re-deriving the suffix logic.
 
 ---
 
@@ -852,47 +1048,86 @@ detection cycle. Must not raise — failures are logged and swallowed.
 **APScheduler jobs:**
 
 ```python
-# Daily at midnight — refresh client cache
+# Daily at 00:00 — refresh the org-wide client cache
 scheduler.add_job(client_refresh_job, 'cron', hour=0, minute=0)
 
-# Every N minutes — collect events and run detection
-scheduler.add_job(event_and_detect_job, 'interval',
-                  minutes=int(os.getenv("SITE_FOCUS_DETECTION_INTERVAL", "15")))
+# Daily at 00:30 + once at startup — rebuild the Markov baseline
+scheduler.add_job(markov_baseline_job, 'cron', hour=0, minute=30,
+                  next_run_time=datetime.now(timezone.utc))
+
+# Daily at 03:00 — purge SQLite events older than the 7-day retention window
+scheduler.add_job(sqlite_retention_job, 'cron', hour=3, minute=0)
+
+# Hourly — top-up org event collection (gated by Redis flag, see below)
+scheduler.add_job(org_event_poll_job, 'interval', hours=1)
 ```
 
-`event_and_detect_job` runs these in sequence per WLAN scope (`__all__` + each unique SSID):
-1. `event_collector.collect(site_id)`
-2. `feature_engineer.build_features(site_id, wlan)`
-3. `health_scorer.score_health(site_id, wlan)`   ← must run before webhook dispatch
-4. `anomaly_detector.score(site_id, wlan)`
-5. `webhook_dispatcher.evaluate_and_dispatch(site_id)`
+**ARCH-4: Anomaly detection is no longer scheduled.** Detection runs only on
+manual trigger via `POST /api/v1/org/detect`, which schedules
+`_org_detect_background_task` → `run_org_pipeline()` (defined in
+`scheduler.py`).
 
-The same sequence runs in `_run_wlan_detection_bg()` in `routes.py` (triggered by the
-"Re-detect Anomalies" button). Any code path that calls `build_features` + `score` must
-also call `score_health` in between, so health data is never stale relative to anomaly data.
+`run_org_pipeline()` walks each site and each WLAN scope (`__all__` + each
+unique SSID per site) through this sequence:
+1. `feature_engineer.build_features(site_id, wlan)`
+2. `health_scorer.score_health(site_id, wlan)`   ← must run before webhook dispatch
+3. `anomaly_detector.score_org_wide(...)` once per WLAN over the org-wide
+   feature pool, then `anomaly_detector.score(site_id, wlan)` per site
+4. `webhook_dispatcher.evaluate_and_dispatch(...)` for org scope, then per site
+
+Any code path that calls `build_features` + `score` must also call `score_health`
+in between, so health data is never stale relative to anomaly data.
+
+**`org_event_poll_job` — hourly event-only top-up:**
+- Gated by the Redis key `sasquatch:event_polling_enabled` (set to `"1"` to enable).
+- `_org_collect_background_task` sets that key to `"1"` automatically when a manual
+  full collect (`POST /api/v1/org/collect-full` → `collect_org_full`) succeeds, so
+  the operator does not have to flip the toggle separately.
+- The job calls `collect_org(MIST_ORG_ID)`, which streams the trailing 1 hour by
+  Unix timestamp and flushes to SQLite every `_ORG_HOURLY_FLUSH_BATCH_SIZE` (25k)
+  events. It does NOT run detection — anomaly scoring stays manual.
+- The job acquires the global mutex (`_acquire_global_lock("collecting")`) so it
+  cannot overlap with a manual collect or detection run.
 
 If any step raises, log the error and skip remaining steps for that cycle. Do not
 let one bad cycle corrupt Redis state from the previous good cycle.
+
+**`client_refresh_job` — daily org-wide client cache refresh:**
+- Calls `refresh_client_cache_org(MIST_ORG_ID)` once. The cache is org-scoped
+  (MAC unique across the org), so a single API run populates the entire table.
+- After the refresh, loads the cache via `get_client_cache()` and re-enriches
+  stored events for every site that has data in the retention window
+  (`db.get_site_ids_with_events()`), passing the same shared cache to
+  `reenrich_stale_events(site_id, cache)`. This catches MACs that previously
+  resolved to "Unknown" but now have a manufacturer/family.
+- Skips entirely if `MIST_ORG_ID` is not configured.
 
 ---
 
 ### FastAPI Routes (`api/routes.py`)
 
 ```
-GET  /api/v1/sites                                   → list configured sites from .env
 GET  /api/v1/sites/{site_id}/findings                → current findings from Redis
 GET  /api/v1/sites/{site_id}/health                  → per-family health scores from Redis
-GET  /api/v1/sites/{site_id}/clients                 → client list with device type breakdown
+GET  /api/v1/sites/{site_id}/clients                 → client list filtered from the org cache by last_site_id
 GET  /api/v1/sites/{site_id}/events/summary          → event category counts for GUI charts
 GET  /api/v1/sites/{site_id}/anomalies/{mac}         → full event timeline + scores for one MAC
 GET  /api/v1/sites/{site_id}/families/{family}/if-outliers → per-family IF deviation list
-POST /api/v1/sites/{site_id}/refresh                 → manually trigger client cache refresh
+POST /api/v1/org/refresh                             → trigger an org-wide client cache refresh
 GET  /api/v1/sites/{site_id}/status                  → last run timestamp, event count, finding count
 
 GET  /api/v1/org/summary                             → per-site event counts, finding counts, alert_count,
                                                        plus org-wide finding counts (org_significant_count,
                                                        org_moderate_count, org_minimal_count, org_alert_count,
                                                        org_finding_count) read from sasquatch:org_findings:{wlan}
+POST /api/v1/org/collect-full                        → trigger a full org-wide event collection over the
+                                                       trailing 12 hours (start/end Unix timestamps); runs in
+                                                       a background task; on success sets
+                                                       sasquatch:event_polling_enabled = "1" so the hourly
+                                                       org_event_poll_job starts topping up automatically
+GET  /api/v1/org/collect-progress                    → phase/page/event counters for an in-flight collect
+GET  /api/v1/org/polling                             → {enabled: bool} — current state of the hourly poll flag
+POST /api/v1/org/polling                             → {enabled: bool} — manually toggle the hourly poll flag
 POST /api/v1/org/detect                              → re-runs build_features + score_health + score (per-site) for all
                                                        sites, then score_org_wide; updates both per-site findings
                                                        (sasquatch:findings:{site_id}:{wlan}) and org findings
@@ -1025,14 +1260,12 @@ MIST_API_TOKEN=your_token_here
 # Cloud host varies by region: api.mist.com, api.gc1.mist.com, api.gc2.mist.com,
 # api.gc4.mist.com, api.eu.mist.com. Do NOT include /api/v1 — that is path, not host.
 MIST_CLOUD_HOST=api.gc4.mist.com
-MIST_SITE_ID=04edb3ac-542a-4d1d-ad90-b1e2fd682a67
+# REQUIRED: org-wide collection and detection are the only supported modes.
+# Per-site MIST_SITE_ID is retired.
 MIST_ORG_ID=3549f835-42c3-40d1-90cc-5e70ccc537ee
 
 # Redis
 REDIS_URL=redis://localhost:6379
-
-# Scheduling
-SITE_FOCUS_DETECTION_INTERVAL=15
 
 # ML Tuning — Isolation Forest + DBSCAN
 ANOMALY_IF_CONTAMINATION=0.05
@@ -1069,17 +1302,29 @@ VITE_API_BASE_URL=http://localhost:8000
 
 ## Org-Level Scope
 
-Org-wide cross-site detection is fully implemented. When `MIST_ORG_ID` is configured,
-`org_cross_site_detect_job` runs every `ORG_DETECTION_INTERVAL_HOURS` (default: 6h) and:
-1. Collects events for every site in the org
-2. Builds features + health scores for every site
-3. Pools all MACs org-wide and runs DBSCAN, Centroid IF, and per-family IF against the
-   combined population — each MAC is scored relative to all org peers, not just its own site
-4. Stores results under `sasquatch:org_anomalies:{site_id}:{wlan_key}` and `sasquatch:org_findings:{wlan_key}`
-5. Dispatches a single org-wide webhook from the combined findings
+Project Sasquatch is org-only. `MIST_ORG_ID` is required; per-site detection
+modes have been retired (ARCH-1 through ARCH-7).
 
-The org-level pipeline uses the same `score_org_wide()` function in `anomaly_detector.py`
-and the same dual alert gate in `webhook_dispatcher.py`.
+Detection runs only on manual trigger via `POST /api/v1/org/detect`, which
+invokes `run_org_pipeline()` in `scheduler.py`:
+1. Acquires the global mutex (`sasquatch:lock:global_operation`)
+2. Builds features + health scores for every site/WLAN that has events in SQLite
+3. Runs `score_org_wide()` over the combined org-wide MAC population — each MAC
+   is scored relative to all org peers, not just its own site — and writes
+   `sasquatch:org_anomalies:{site_id}:{wlan_key}` and
+   `sasquatch:org_findings:{wlan_key}`
+4. Dispatches the org-wide webhook
+5. Runs per-site `score()` for each site/WLAN and dispatches per-site webhooks
+6. Releases the mutex
+
+Event collection is decoupled from detection. The hourly `org_event_poll_job`
+streams 1-hour windows from the org events endpoint into SQLite when
+`sasquatch:event_polling_enabled = "1"` (set automatically after the first
+successful manual `POST /api/v1/org/collect-full`). Both jobs use the same
+global mutex so a poll cannot overlap with a manual collect or detect run.
+
+The org-level pipeline uses the same `score_org_wide()` function in
+`anomaly_detector.py` and the same dual alert gate in `webhook_dispatcher.py`.
 
 ---
 
@@ -1161,8 +1406,9 @@ field in the webhook payload.
 
 Build in this order to enable incremental testing:
 
-1. **`client_cache.py`** — Get the MAC → device metadata lookup working and verify
-   Redis writes. Test against the live Mist API manually before wiring the scheduler.
+1. **`client_cache.py`** — Get the org-wide MAC → device metadata lookup working and
+   verify SQLite writes via `db.upsert_clients_org`. Test against the live Mist API
+   manually before wiring the scheduler.
 
 2. **`event_collector.py`** — Pull events, paginate fully, enrich with client cache.
    Verify event counts look right. Check that category binning covers the event types

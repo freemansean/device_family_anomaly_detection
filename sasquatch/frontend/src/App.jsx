@@ -51,37 +51,137 @@ function WlanLoadingOverlay() {
   );
 }
 
-function ProgressBar({ progress }) {
+function OrgCollectProgress({ progress }) {
   if (!progress || progress.phase === "idle") return null;
-  const { phase, events_fetched, total_estimated, pages, macs_scored, message } = progress;
+  const {
+    phase,
+    events_fetched,
+    clients_fetched,
+    total_estimated,
+    total_clients_estimated,
+    total_events_estimated,
+    expected_client_pages,
+    expected_event_pages,
+    pages,
+    pages_fetched,
+    sites_complete,
+    total_sites,
+    sites_with_events,
+    current_site,
+    message,
+  } = progress;
 
   let pct = 0;
   let label = "";
   let color = "#7ec8e3";
 
+  // Phase allocations: clients = 0-30%, events = 30-90%.
+  const CLIENTS_START = 0;
+  const CLIENTS_SPAN = 30;
+  const EVENTS_START = 30;
+  const EVENTS_SPAN = 60;
+
   if (phase === "starting") {
     pct = 2;
-    label = "Initializing…";
-  } else if (phase === "collecting") {
-    if (total_estimated) {
-      pct = Math.min((events_fetched / total_estimated) * 65 + 5, 68);
-      const pagesLeft = Math.max(0, Math.ceil((total_estimated - events_fetched) / 1000));
-      label = `Collecting events… ${(events_fetched || 0).toLocaleString()} / ${total_estimated.toLocaleString()} (page ${pages}${pagesLeft > 0 ? `, ~${pagesLeft} more` : ""})`;
+    label = "Initializing org-wide collection…";
+  } else if (phase === "collecting_clients") {
+    // Drive the bar off pages_fetched / expected_pages (where expected_pages
+    // is derived from the Mist API's `total` field, ceil(total/1000)). Falls
+    // back to a gentle page-count heuristic until the first response lands.
+    const pg = pages_fetched || 0;
+    if (expected_client_pages && expected_client_pages > 0) {
+      const frac = Math.min(pg / expected_client_pages, 1);
+      pct = CLIENTS_START + frac * CLIENTS_SPAN;
+      label =
+        `Gathering clients… page ${pg}/${expected_client_pages} — ` +
+        `${(clients_fetched || 0).toLocaleString()}/${(total_clients_estimated || 0).toLocaleString()} clients`;
     } else {
-      pct = Math.min(5 + (pages || 0) * 5, 65);
-      label = `Collecting events… ${(events_fetched || 0).toLocaleString()} events (page ${pages || 1})`;
+      pct = Math.min(CLIENTS_START + 3 + pg * 2, CLIENTS_START + CLIENTS_SPAN - 2);
+      label = `Gathering clients… ${(clients_fetched || 0).toLocaleString()} clients (page ${pg || 1})`;
     }
-  } else if (phase === "scoring") {
-    pct = 75;
-    label = `Running anomaly detection… ${(events_fetched || 0).toLocaleString()} events`;
+  } else if (phase === "collecting_events" || phase === "collecting") {
+    // Drive the bar off pages_fetched / expected_pages for events too.
+    // `total_estimated` (from the site-level path) is retained as a fallback
+    // so per-site detection still works.
+    const pg = pages_fetched || pages || 0;
+    const eventsTotal = total_events_estimated ?? total_estimated ?? null;
+    if (expected_event_pages && expected_event_pages > 0) {
+      const frac = Math.min(pg / expected_event_pages, 1);
+      pct = EVENTS_START + frac * EVENTS_SPAN;
+    } else if (eventsTotal) {
+      pct = Math.min(EVENTS_START + (events_fetched / eventsTotal) * EVENTS_SPAN, EVENTS_START + EVENTS_SPAN);
+    } else {
+      pct = Math.min(EVENTS_START + pg * 2, EVENTS_START + EVENTS_SPAN - 2);
+    }
+    const pageSuffix = expected_event_pages
+      ? `page ${pg}/${expected_event_pages}`
+      : `page ${pg || 1}`;
+    const countSuffix = eventsTotal
+      ? `${(events_fetched || 0).toLocaleString()}/${eventsTotal.toLocaleString()} events`
+      : `${(events_fetched || 0).toLocaleString()} events`;
+    const clientsSuffix = clients_fetched
+      ? ` (${clients_fetched.toLocaleString()} clients cached)`
+      : "";
+    label = `Gathering client events… ${countSuffix} — ${pageSuffix}${clientsSuffix}`;
+    if (current_site) label += ` — ${current_site}`;
+    if (sites_complete != null && total_sites) label += ` [${sites_complete}/${total_sites} sites]`;
   } else if (phase === "complete") {
     pct = 100;
     color = "#2d7a4f";
-    label = `Done — ${(events_fetched || 0).toLocaleString()} events, ${macs_scored || 0} MACs scored`;
+    const parts = [];
+    if (clients_fetched) parts.push(`${clients_fetched.toLocaleString()} clients`);
+    parts.push(`${(events_fetched || 0).toLocaleString()} events`);
+    label = `Done — ${parts.join(", ")}`;
+    const siteTotal = sites_with_events || total_sites;
+    if (siteTotal) label += ` across ${siteTotal} sites`;
   } else if (phase === "error") {
     pct = 100;
     color = "#e05555";
-    label = `Error: ${message || "Unknown error"}`;
+    label = `Error: ${message || "Collection failed"}`;
+  }
+
+  return (
+    <div style={{ marginTop: "8px" }}>
+      <div style={{ background: "#1a1a1a", border: "1px solid #2a2a2a", borderRadius: "4px", overflow: "hidden", height: "5px" }}>
+        <div style={{ width: `${pct}%`, height: "100%", background: color, transition: "width 0.6s ease" }} />
+      </div>
+      <div style={{ fontSize: "11px", color: color === "#e05555" ? "#e05555" : "#555", marginTop: "3px" }}>{label}</div>
+    </div>
+  );
+}
+
+function OrgDetectProgress({ progress }) {
+  if (!progress || progress.phase === "idle") return null;
+  const { phase, current_site, sites_complete, total_sites, org_complete, message } = progress;
+
+  let pct = 0;
+  let label = "";
+  let color = "#7ec8e3";
+
+  if (phase === "building_features") {
+    // Feature build: 0-30% of the bar
+    pct = total_sites > 0 ? Math.min(2 + (sites_complete / total_sites) * 28, 30) : 5;
+    label = current_site
+      ? `Building features… ${sites_complete}/${total_sites} sites (${current_site})`
+      : `Building features… ${sites_complete}/${total_sites} sites`;
+  } else if (phase === "org_scoring") {
+    // Org-wide scoring: 30-55%
+    pct = 40;
+    label = "Running org-wide anomaly detection…";
+  } else if (phase === "site_scoring") {
+    // Per-site scoring: 55-95%
+    pct = total_sites > 0 ? Math.min(55 + (sites_complete / total_sites) * 40, 95) : 60;
+    label = current_site
+      ? `Site scoring… ${sites_complete}/${total_sites} (${current_site})${org_complete ? " — org findings ready" : ""}`
+      : `Site scoring… ${sites_complete}/${total_sites}${org_complete ? " — org findings ready" : ""}`;
+  } else if (phase === "complete") {
+    pct = 100;
+    color = "#2d7a4f";
+    label = `Done — ${total_sites} sites scored`;
+  } else if (phase === "error") {
+    pct = 100;
+    color = "#e05555";
+    label = `Error: ${message || "Pipeline failed"}`;
   }
 
   return (
@@ -134,18 +234,18 @@ export default function App() {
   const [configTab, setConfigTab] = useState("general"); // "general" | "anomaly" | "webhook"
 
   // Action bar state
-  const [focusSite, setFocusSite] = useState(null); // {site_id, source}
-  const [orgDetectionEnabled, setOrgDetectionEnabled] = useState(true);
-  const [progress, setProgress] = useState(null);
-  const [progressPolling, setProgressPolling] = useState(false);
+  const [eventPollingEnabled, setEventPollingEnabled] = useState(false);
+  const [orgCollectProgress, setOrgCollectProgress] = useState(null);
+  const [orgCollectPolling, setOrgCollectPolling] = useState(false);
+  const [orgDetectProgress, setOrgDetectProgress] = useState(null);
+  const [orgDetectPolling, setOrgDetectPolling] = useState(false);
+  const [activeOperation, setActiveOperation] = useState(null); // null or operation string from /org/job-status
   const [actionState, setActionState] = useState({
     clientRefresh: "idle", // idle | loading | ok | error
     flush: "idle",         // idle | confirm | loading | ok | error
-    detect: "idle",
-    discover: "idle",      // idle | running | ok | error
-    collect: "idle",       // idle | loading | ok | error
-    swapFocus: "idle",
-    orgDetection: "idle",  // idle | loading | ok | error
+    detect: "idle",        // idle | loading | ok | error
+    collect: "idle",       // idle | confirm | loading | ok | error
+    eventPolling: "idle",  // idle | loading | ok | error
   });
 
   function setAS(key, val) {
@@ -165,18 +265,15 @@ export default function App() {
     if (!token) return;
     apiFetch(`${API_BASE}/api/v1/org/sites`)
       .then((r) => r.json())
-      .then((data) => { setSites(data.sites || []); })
-      .catch(console.error);
-    apiFetch(`${API_BASE}/api/v1/focus`)
-      .then((r) => r.json())
       .then((data) => {
-        setFocusSite(data);
-        if (data?.site_id) setSelectedSite((prev) => prev ?? data.site_id);
+        setSites(data.sites || []);
+        // Default to org view
+        setSelectedSite((prev) => prev ?? ORG_FOCUS_VALUE);
       })
       .catch(console.error);
-    apiFetch(`${API_BASE}/api/v1/org/detection-enabled`)
+    apiFetch(`${API_BASE}/api/v1/org/polling`)
       .then((r) => r.json())
-      .then((data) => setOrgDetectionEnabled(data.enabled !== false))
+      .then((data) => setEventPollingEnabled(data.enabled === true))
       .catch(console.error);
     apiFetch(`${API_BASE}/api/v1/webhook-config`)
       .then((r) => r.json())
@@ -190,6 +287,22 @@ export default function App() {
       .then((r) => r.json())
       .then((data) => setAnomalyConfig(data))
       .catch(console.error);
+  }, [token]);
+
+  // Poll /org/job-status to keep activeOperation in sync (disables buttons when busy)
+  useEffect(() => {
+    if (!token) return;
+    let cancelled = false;
+    async function check() {
+      try {
+        const r = await apiFetch(`${API_BASE}/api/v1/org/job-status`);
+        const data = await r.json();
+        if (!cancelled) setActiveOperation(data.active_operation || null);
+      } catch { /* ignore */ }
+    }
+    check();
+    const iv = setInterval(check, 3000);
+    return () => { cancelled = true; clearInterval(iv); };
   }, [token]);
 
   // Fetch available WLANs whenever the selected site changes.
@@ -217,38 +330,62 @@ export default function App() {
       .catch(console.error);
   }, [token, selectedSite]);
 
-  // Poll progress while Full Discovery is running
+  // Poll progress while org-wide event collection is running
   useEffect(() => {
-    if (!progressPolling || !selectedSite) return;
+    if (!orgCollectPolling) return;
     const poll = setInterval(async () => {
       try {
-        const progressUrl = selectedSite === ORG_FOCUS_VALUE
-          ? `${API_BASE}/api/v1/org/progress`
-          : `${API_BASE}/api/v1/sites/${selectedSite}/progress`;
-        const r = await apiFetch(progressUrl);
+        const r = await apiFetch(`${API_BASE}/api/v1/org/collect-progress`);
         const data = await r.json();
-        setProgress(data);
+        setOrgCollectProgress(data);
         if (data.phase === "complete" || data.phase === "error" || data.phase === "idle") {
-          setProgressPolling(false);
-          setAS("discover", data.phase === "complete" ? "ok" : data.phase === "error" ? "error" : "idle");
+          setOrgCollectPolling(false);
+          setAS("collect", data.phase === "complete" ? "ok" : data.phase === "error" ? "error" : "idle");
           if (data.phase === "complete") {
             setDiscoveryRefreshToken((t) => t + 1);
-            setTimeout(() => { setAS("discover", "idle"); setProgress(null); }, 5000);
+            // Backend auto-enables hourly event polling on a successful full
+            // collect — re-fetch the toggle state so the UI reflects it.
+            apiFetch(`${API_BASE}/api/v1/org/polling`)
+              .then((r) => r.json())
+              .then((d) => setEventPollingEnabled(d.enabled === true))
+              .catch(console.error);
+            setTimeout(() => { setAS("collect", "idle"); setOrgCollectProgress(null); }, 5000);
+          } else {
+            setTimeout(() => { setAS("collect", "idle"); setOrgCollectProgress(null); }, 4000);
           }
         }
       } catch (e) { console.error(e); }
     }, 750);
     return () => clearInterval(poll);
-  }, [progressPolling, selectedSite]);
+  }, [orgCollectPolling]);
+
+  // Poll progress while org-wide detection is running
+  useEffect(() => {
+    if (!orgDetectPolling) return;
+    const poll = setInterval(async () => {
+      try {
+        const r = await apiFetch(`${API_BASE}/api/v1/org/detect-progress`);
+        const data = await r.json();
+        setOrgDetectProgress(data);
+        if (data.phase === "complete" || data.phase === "error" || data.phase === "idle") {
+          setOrgDetectPolling(false);
+          setAS("detect", data.phase === "complete" ? "ok" : data.phase === "error" ? "error" : "idle");
+          if (data.phase === "complete") {
+            setDiscoveryRefreshToken((t) => t + 1);
+            setTimeout(() => { setAS("detect", "idle"); setOrgDetectProgress(null); }, 5000);
+          } else {
+            setTimeout(() => { setAS("detect", "idle"); setOrgDetectProgress(null); }, 4000);
+          }
+        }
+      } catch (e) { console.error(e); }
+    }, 750);
+    return () => clearInterval(poll);
+  }, [orgDetectPolling]);
 
   async function handleClientRefresh() {
-    if (!selectedSite) return;
     setAS("clientRefresh", "loading");
     try {
-      const endpoint = selectedSite === ORG_FOCUS_VALUE
-        ? `${API_BASE}/api/v1/org/refresh`
-        : `${API_BASE}/api/v1/sites/${selectedSite}/refresh`;
-      const r = await apiFetch(endpoint, { method: "POST" });
+      const r = await apiFetch(`${API_BASE}/api/v1/org/refresh`, { method: "POST" });
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       setAS("clientRefresh", "ok");
       setTimeout(() => setAS("clientRefresh", "idle"), 2000);
@@ -258,35 +395,12 @@ export default function App() {
     }
   }
 
-  async function handleFullDiscovery() {
-    if (!selectedSite || actionState.discover === "running") return;
-    setProgress({ phase: "starting" });
-    setAS("discover", "running");
-    setProgressPolling(true);
-    try {
-      const endpoint = selectedSite === ORG_FOCUS_VALUE
-        ? `${API_BASE}/api/v1/org/run`
-        : `${API_BASE}/api/v1/sites/${selectedSite}/run`;
-      const r = await apiFetch(endpoint, { method: "POST" });
-      if (!r.ok && r.status !== 409) throw new Error(`HTTP ${r.status}`);
-    } catch (e) {
-      setProgress({ phase: "error", message: e.message });
-      setProgressPolling(false);
-      setAS("discover", "error");
-      setTimeout(() => { setAS("discover", "idle"); setProgress(null); }, 4000);
-    }
-  }
-
   async function handleFlush() {
-    if (!selectedSite) return;
     if (actionState.flush === "idle") { setAS("flush", "confirm"); setTimeout(() => setActionState(prev => prev.flush === "confirm" ? { ...prev, flush: "idle" } : prev), 4000); return; }
     if (actionState.flush !== "confirm") return;
     setAS("flush", "loading");
     try {
-      const endpoint = selectedSite === ORG_FOCUS_VALUE
-        ? `${API_BASE}/api/v1/org/flush`
-        : `${API_BASE}/api/v1/sites/${selectedSite}/flush`;
-      await apiFetch(endpoint, { method: "POST" });
+      await apiFetch(`${API_BASE}/api/v1/org/flush`, { method: "POST" });
       setAS("flush", "ok");
       setTimeout(() => setAS("flush", "idle"), 2000);
     } catch {
@@ -295,74 +409,56 @@ export default function App() {
     }
   }
 
+  // Org-wide collect events → POST /org/collect-full, then poll progress
+  async function handleCollectEvents() {
+    if (activeOperation) return;
+    if (actionState.collect === "idle") { setAS("collect", "confirm"); setTimeout(() => setActionState(prev => prev.collect === "confirm" ? { ...prev, collect: "idle" } : prev), 4000); return; }
+    if (actionState.collect !== "confirm") return;
+    setAS("collect", "loading");
+    setOrgCollectProgress({ phase: "starting" });
+    setOrgCollectPolling(true);
+    try {
+      const r = await apiFetch(`${API_BASE}/api/v1/org/collect-full`, { method: "POST" });
+      if (!r.ok && r.status !== 409) throw new Error(`HTTP ${r.status}`);
+    } catch (e) {
+      setOrgCollectProgress({ phase: "error", message: e.message });
+      setOrgCollectPolling(false);
+      setAS("collect", "error");
+      setTimeout(() => { setAS("collect", "idle"); setOrgCollectProgress(null); }, 4000);
+    }
+  }
+
+  // Org-wide detection → POST /org/detect, then poll progress
   async function handleDetect() {
-    if (!selectedSite) return;
+    if (activeOperation) return;
     setAS("detect", "loading");
     try {
-      const endpoint = selectedSite === ORG_FOCUS_VALUE
-        ? `${API_BASE}/api/v1/org/detect`
-        : `${API_BASE}/api/v1/sites/${selectedSite}/detect`;
-      await apiFetch(endpoint, { method: "POST" });
-      setAS("detect", "ok");
-      setDiscoveryRefreshToken((t) => t + 1);
-      setTimeout(() => setAS("detect", "idle"), 2000);
+      const r = await apiFetch(`${API_BASE}/api/v1/org/detect`, { method: "POST" });
+      if (!r.ok && r.status !== 409) throw new Error(`HTTP ${r.status}`);
+      setOrgDetectProgress({ phase: "building_features", sites_complete: 0, total_sites: 0, org_complete: false });
+      setOrgDetectPolling(true);
     } catch {
       setAS("detect", "error");
       setTimeout(() => setAS("detect", "idle"), 3000);
     }
   }
 
-  async function handleCollectEvents() {
-    if (!selectedSite) return;
-    setAS("collect", "loading");
+  // Toggle hourly org-wide event polling
+  async function handleToggleEventPolling() {
+    const newVal = !eventPollingEnabled;
+    setAS("eventPolling", "loading");
     try {
-      const endpoint = selectedSite === ORG_FOCUS_VALUE
-        ? `${API_BASE}/api/v1/org/collect`
-        : `${API_BASE}/api/v1/sites/${selectedSite}/collect`;
-      const r = await apiFetch(endpoint, { method: "POST" });
-      if (!r.ok && r.status !== 409) throw new Error(`HTTP ${r.status}`);
-      setAS("collect", "ok");
-      setTimeout(() => setAS("collect", "idle"), 2000);
-    } catch {
-      setAS("collect", "error");
-      setTimeout(() => setAS("collect", "idle"), 3000);
-    }
-  }
-
-  async function handleSwapFocus() {
-    if (!selectedSite) return;
-    setAS("swapFocus", "loading");
-    try {
-      await apiFetch(`${API_BASE}/api/v1/focus`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ site_id: selectedSite }),
-      });
-      const r = await apiFetch(`${API_BASE}/api/v1/focus`);
-      setFocusSite(await r.json());
-      setAS("swapFocus", "ok");
-      setTimeout(() => setAS("swapFocus", "idle"), 2000);
-    } catch {
-      setAS("swapFocus", "error");
-      setTimeout(() => setAS("swapFocus", "idle"), 3000);
-    }
-  }
-
-  async function handleToggleOrgDetection() {
-    const newVal = !orgDetectionEnabled;
-    setAS("orgDetection", "loading");
-    try {
-      await apiFetch(`${API_BASE}/api/v1/org/detection-enabled`, {
+      await apiFetch(`${API_BASE}/api/v1/org/polling`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ enabled: newVal }),
       });
-      setOrgDetectionEnabled(newVal);
-      setAS("orgDetection", "ok");
-      setTimeout(() => setAS("orgDetection", "idle"), 2000);
+      setEventPollingEnabled(newVal);
+      setAS("eventPolling", "ok");
+      setTimeout(() => setAS("eventPolling", "idle"), 2000);
     } catch {
-      setAS("orgDetection", "error");
-      setTimeout(() => setAS("orgDetection", "idle"), 3000);
+      setAS("eventPolling", "error");
+      setTimeout(() => setAS("eventPolling", "idle"), 3000);
     }
   }
 
@@ -399,7 +495,6 @@ export default function App() {
     setGeneralConfigDraft(generalConfig ? { ...generalConfig } : {
       site_focus_detection_interval: 60,
       org_detection_interval_hours: 1,
-      cache_miss_refresh_threshold: 10,
       anomaly_min_mac_events: 5,
     });
     setGeneralConfigSaveState("idle");
@@ -441,7 +536,6 @@ export default function App() {
       markov_stuck_loop_min_events: 20,
       markov_min_episode_length: 3,
       markov_outlier_episode_ratio: 0.5,
-      markov_short_episode_min_count: 3,
       markov_min_scoreable_episodes: 2,
     });
     setAnomalyConfigSaveState("idle");
@@ -528,7 +622,7 @@ export default function App() {
                     onMouseLeave={e => e.currentTarget.style.background = selectedSite === ORG_FOCUS_VALUE ? "#2a4a5e" : "transparent"}
                   >
                     <div style={{ color: "#7ec8e3", fontSize: "13px" }}>Organization</div>
-                    <div style={{ color: "#555", fontSize: "11px" }}>All sites — org-wide polling</div>
+                    <div style={{ color: "#555", fontSize: "11px" }}>All sites — org-wide view</div>
                   </div>
                 ) : null}
                 {sites
@@ -609,42 +703,37 @@ export default function App() {
           )}
 
           {/* Utilities Dropdown */}
-          {selectedSite && (
-            <div style={{ position: "relative" }}>
-              <button
-                onClick={() => setUtilDropdownOpen(o => !o)}
-                onBlur={() => setTimeout(() => setUtilDropdownOpen(false), 150)}
-                style={{ background: "#222", color: "#888", border: "1px solid #444", padding: "4px 8px", borderRadius: "4px", cursor: "pointer", fontSize: "13px", fontFamily: "monospace" }}
-              >
-                Utilities ▾
-              </button>
-              {utilDropdownOpen && (
-                <div style={{ position: "absolute", top: "100%", left: 0, zIndex: 100, background: "#1a1a1a", border: "1px solid #444", borderRadius: "4px", marginTop: "2px", minWidth: "180px", boxShadow: "0 4px 12px rgba(0,0,0,0.5)" }}>
-                  {[
-                    { key: "clientRefresh", label: "Client Refresh", handler: handleClientRefresh, loadLabel: "Refreshing…", okLabel: "Refreshed ✓" },
-                    { key: "discover", label: "Full Discovery", handler: handleFullDiscovery, loadLabel: "Discovering…", okLabel: "Done ✓", loadKey: "running" },
-                    { key: "collect", label: "Full Events", handler: handleCollectEvents, loadLabel: "Collecting…", okLabel: "Collected ✓" },
-                    { key: "detect", label: "Re-detect Anomalies", handler: handleDetect, loadLabel: "Detecting…", okLabel: "Done ✓" },
-                  ].map(item => {
-                    const s = actionState[item.key];
-                    const busy = s === "loading" || s === "running";
-                    const label = busy ? item.loadLabel : s === "ok" ? item.okLabel : s === "error" ? "Error ✗" : item.label;
-                    return (
-                      <div
-                        key={item.key}
-                        onMouseDown={() => { if (!busy) { item.handler(); setUtilDropdownOpen(false); } }}
-                        onMouseEnter={e => { if (!busy) e.currentTarget.style.background = "#252525"; }}
-                        onMouseLeave={e => e.currentTarget.style.background = "transparent"}
-                        style={{ padding: "7px 12px", cursor: busy ? "default" : "pointer", fontSize: "12px", fontFamily: "monospace", color: s === "ok" ? "#2d7a4f" : s === "error" ? "#e05555" : busy ? "#555" : "#ccc", borderBottom: "1px solid #2a2a2a" }}
-                      >
-                        {label}
-                      </div>
-                    );
-                  })}
-                </div>
-              )}
-            </div>
-          )}
+          <div style={{ position: "relative" }}>
+            <button
+              onClick={() => setUtilDropdownOpen(o => !o)}
+              onBlur={() => setTimeout(() => setUtilDropdownOpen(false), 150)}
+              style={{ background: "#222", color: "#888", border: "1px solid #444", padding: "4px 8px", borderRadius: "4px", cursor: "pointer", fontSize: "13px", fontFamily: "monospace" }}
+            >
+              Utilities ▾
+            </button>
+            {utilDropdownOpen && (
+              <div style={{ position: "absolute", top: "100%", left: 0, zIndex: 100, background: "#1a1a1a", border: "1px solid #444", borderRadius: "4px", marginTop: "2px", minWidth: "180px", boxShadow: "0 4px 12px rgba(0,0,0,0.5)" }}>
+                {[
+                  { key: "clientRefresh", label: "Client Refresh", handler: handleClientRefresh, loadLabel: "Refreshing…", okLabel: "Refreshed ✓" },
+                ].map(item => {
+                  const s = actionState[item.key];
+                  const busy = s === "loading";
+                  const label = busy ? item.loadLabel : s === "ok" ? item.okLabel : s === "error" ? "Error ✗" : item.label;
+                  return (
+                    <div
+                      key={item.key}
+                      onMouseDown={() => { if (!busy) { item.handler(); setUtilDropdownOpen(false); } }}
+                      onMouseEnter={e => { if (!busy) e.currentTarget.style.background = "#252525"; }}
+                      onMouseLeave={e => e.currentTarget.style.background = "transparent"}
+                      style={{ padding: "7px 12px", cursor: busy ? "default" : "pointer", fontSize: "12px", fontFamily: "monospace", color: s === "ok" ? "#2d7a4f" : s === "error" ? "#e05555" : busy ? "#555" : "#ccc", borderBottom: "1px solid #2a2a2a" }}
+                    >
+                      {label}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
 
           <div style={{ marginLeft: "auto", display: "flex", gap: "8px", alignItems: "center" }}>
             <button
@@ -682,47 +771,49 @@ export default function App() {
         {/* Action bar */}
         <div style={{ marginTop: "10px", display: "flex", gap: "8px", alignItems: "center", flexWrap: "wrap" }}>
 
-          {/* Site Focus */}
+          {/* Build Cache — org-wide (refresh clients, then collect events) */}
           {(() => {
-            const focusName = focusSite
-              ? (focusSite.site_id === ORG_FOCUS_VALUE ? "Organization" : (sites.find(s => s.id === focusSite.site_id)?.name || focusSite.site_id))
-              : "—";
-            const isAlreadyFocus = focusSite?.site_id === selectedSite;
-            const s = actionState.swapFocus;
+            const s = actionState.collect;
+            const busy = s === "loading" || !!activeOperation;
             return (
-              <div style={{ display: "flex", alignItems: "center", gap: "6px", background: "#161616", border: "1px solid #2a2a2a", borderRadius: "4px", padding: "4px 10px" }}>
-                <span style={{ color: "#555", fontSize: "11px" }}>Focus:</span>
-                <span style={{ color: "#7ec8e3", fontSize: "12px", maxWidth: "160px", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={focusSite?.site_id}>
-                  {focusName}
-                </span>
-                {focusSite?.source === "override" && (
-                  <span style={{ color: "#555", fontSize: "10px", fontStyle: "italic" }}>override</span>
-                )}
-                {selectedSite && !isAlreadyFocus && (
-                  <button
-                    onClick={handleSwapFocus}
-                    disabled={s === "loading"}
-                    style={{ background: s === "ok" ? "#1a3a1a" : "#1a2a1a", color: s === "ok" ? "#2d7a4f" : s === "error" ? "#e05555" : "#888", border: `1px solid ${s === "ok" ? "#2d7a4f" : "#2a3a2a"}`, borderRadius: "3px", padding: "2px 8px", cursor: s === "loading" ? "default" : "pointer", fontSize: "11px" }}
-                  >
-                    {s === "loading" ? "…" : s === "ok" ? "Swapped" : s === "error" ? "Error" : "Swap Focus"}
-                  </button>
-                )}
-                {isAlreadyFocus && <span style={{ color: "#2d7a4f", fontSize: "10px" }}>● active</span>}
-              </div>
+              <button
+                onClick={handleCollectEvents}
+                disabled={busy}
+                title={activeOperation ? `Blocked: ${activeOperation} in progress` : "Refresh client cache, then collect events from all org sites"}
+                style={actionBtnStyle(s === "confirm" ? "warn" : s)}
+              >
+                {s === "loading" ? "Building…" : s === "confirm" ? "Are you sure?" : s === "ok" ? "Built ✓" : s === "error" ? "Error ✗" : "Build Cache"}
+              </button>
+            );
+          })()}
+
+          {/* Run Detection — org-wide */}
+          {(() => {
+            const s = actionState.detect;
+            const busy = s === "loading" || !!activeOperation;
+            return (
+              <button
+                onClick={handleDetect}
+                disabled={busy}
+                title={activeOperation ? `Blocked: ${activeOperation} in progress` : "Run org-wide anomaly detection pipeline"}
+                style={actionBtnStyle(s)}
+              >
+                {s === "loading" ? "Detecting…" : s === "ok" ? "Done ✓" : s === "error" ? "Error ✗" : "Run Detection"}
+              </button>
             );
           })()}
 
           <div style={{ width: "1px", height: "24px", background: "#2a2a2a" }} />
 
-          {/* Org Detection Toggle */}
+          {/* Event Polling Toggle */}
           {(() => {
-            const s = actionState.orgDetection;
-            const on = orgDetectionEnabled;
+            const s = actionState.eventPolling;
+            const on = eventPollingEnabled;
             return (
               <button
-                onClick={handleToggleOrgDetection}
+                onClick={handleToggleEventPolling}
                 disabled={s === "loading"}
-                title={on ? "Org-wide scheduled detection is active — click to disable" : "Org-wide scheduled detection is disabled — click to enable"}
+                title={on ? "Hourly org-wide event polling is active — click to disable" : "Hourly org-wide event polling is disabled — click to enable"}
                 style={{
                   background: s === "error" ? "#3a1a1a" : on ? "#1a2a1a" : "#2a1a1a",
                   color: s === "error" ? "#e05555" : s === "ok" ? "#7ec8e3" : on ? "#2d7a4f" : "#c08030",
@@ -734,7 +825,7 @@ export default function App() {
                   fontFamily: "monospace",
                 }}
               >
-                {s === "loading" ? "…" : s === "error" ? "Error ✗" : on ? "Org Detection: On" : "Org Detection: Off"}
+                {s === "loading" ? "…" : s === "error" ? "Error ✗" : on ? "Event Polling: On" : "Event Polling: Off"}
               </button>
             );
           })()}
@@ -747,7 +838,7 @@ export default function App() {
             return (
               <button
                 onClick={handleFlush}
-                disabled={!selectedSite || s === "loading"}
+                disabled={s === "loading"}
                 style={actionBtnStyle(s === "confirm" ? "warn" : s)}
               >
                 {s === "loading" ? "Flushing…" : s === "confirm" ? "Confirm Flush?" : s === "ok" ? "Flushed ✓" : s === "error" ? "Error ✗" : "Flush Events"}
@@ -755,10 +846,18 @@ export default function App() {
             );
           })()}
 
+          {/* Active operation indicator */}
+          {activeOperation && (
+            <span style={{ color: "#7ec8e3", fontSize: "11px", animation: "sq-btn-pulse 1.2s ease-in-out infinite" }}>
+              {activeOperation.replace(/_/g, " ")}…
+            </span>
+          )}
+
         </div>
 
-        {/* Progress bar for Full Discovery */}
-        <ProgressBar progress={progress} />
+        {/* Progress bars */}
+        <OrgCollectProgress progress={orgCollectProgress} />
+        <OrgDetectProgress progress={orgDetectProgress} />
       </header>
 
       {selectedSite && selectedSite !== ORG_FOCUS_VALUE && (view === "overview" || view === "findings") && (
@@ -790,14 +889,14 @@ export default function App() {
       <div style={{ position: "relative" }}>
         {wlanLoading && <WlanLoadingOverlay />}
         {selectedSite === ORG_FOCUS_VALUE && view === "overview" && selectedWlan && (
-          <OrgOverview apiBase={API_BASE} onSiteSelect={handleSiteSelect} onMacSiteSelect={handleOrgMacSelect} refreshToken={discoveryRefreshToken} wlan={selectedWlan} onLoaded={() => setWlanLoading(false)} />
+          <OrgOverview apiBase={API_BASE} onSiteSelect={handleSiteSelect} onMacSiteSelect={handleOrgMacSelect} refreshToken={discoveryRefreshToken} wlan={selectedWlan} onLoaded={() => setWlanLoading(false)} detectionInProgress={orgDetectPolling} />
         )}
         {selectedSite && selectedSite !== ORG_FOCUS_VALUE && view === "overview" && selectedWlan && (
           <SiteOverview siteId={selectedSite} apiBase={API_BASE} onMacSelect={handleMacSelect} onFamilySelect={handleFamilySelect} refreshToken={discoveryRefreshToken} wlan={selectedWlan} onLoaded={() => setWlanLoading(false)} />
         )}
       </div>
       {selectedSite && selectedSite !== ORG_FOCUS_VALUE && view === "findings" && selectedWlan && (
-        <FindingsFeed siteId={selectedSite} apiBase={API_BASE} onMacSelect={handleMacSelect} refreshToken={discoveryRefreshToken} wlan={selectedWlan} />
+        <FindingsFeed siteId={selectedSite} apiBase={API_BASE} onMacSelect={handleMacSelect} refreshToken={discoveryRefreshToken} wlan={selectedWlan} detectionInProgress={orgDetectPolling} />
       )}
       {selectedSite && selectedSite !== ORG_FOCUS_VALUE && view === "family" && selectedFamily && selectedWlan && (
         <FamilyDrilldown
@@ -878,7 +977,7 @@ export default function App() {
                   <div style={{ color: "#7ec8e3", fontSize: "13px", fontWeight: "bold" }}>{generalConfigDraft.site_focus_detection_interval} min</div>
                 </div>
                 <input type="range" min={1} max={120} value={generalConfigDraft.site_focus_detection_interval} onChange={(e) => setGeneralConfigDraft(d => ({ ...d, site_focus_detection_interval: Number(e.target.value) }))} style={{ width: "100%", accentColor: "#7ec8e3", cursor: "pointer" }} />
-                <div style={{ color: "#555", fontSize: "11px", marginTop: "4px" }}>How often the detection pipeline runs for the focused site. Lower values = more frequent detection but more Mist API calls.</div>
+                <div style={{ color: "#555", fontSize: "11px", marginTop: "4px" }}>How often the scheduled detection pipeline runs. Lower values = more frequent detection but more Mist API calls.</div>
               </div>
 
               <div style={{ marginBottom: "18px" }}>
@@ -888,15 +987,6 @@ export default function App() {
                 </div>
                 <input type="range" min={1} max={24} value={generalConfigDraft.org_detection_interval_hours} onChange={(e) => setGeneralConfigDraft(d => ({ ...d, org_detection_interval_hours: Number(e.target.value) }))} style={{ width: "100%", accentColor: "#7ec8e3", cursor: "pointer" }} />
                 <div style={{ color: "#555", fontSize: "11px", marginTop: "4px" }}>How often the org-wide cross-site detection job runs. Each run collects events from all org sites and scores them together.</div>
-              </div>
-
-              <div style={{ marginBottom: "18px" }}>
-                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: "5px" }}>
-                  <div style={{ color: "#888", fontSize: "11px" }}>CACHE MISS REFRESH THRESHOLD</div>
-                  <div style={{ color: "#7ec8e3", fontSize: "13px", fontWeight: "bold" }}>{generalConfigDraft.cache_miss_refresh_threshold} misses</div>
-                </div>
-                <input type="range" min={1} max={100} value={generalConfigDraft.cache_miss_refresh_threshold} onChange={(e) => setGeneralConfigDraft(d => ({ ...d, cache_miss_refresh_threshold: Number(e.target.value) }))} style={{ width: "100%", accentColor: "#7ec8e3", cursor: "pointer" }} />
-                <div style={{ color: "#555", fontSize: "11px", marginTop: "4px" }}>Number of MAC cache misses per batch that trigger an early client cache refresh. Prevents stale device family labels mid-cycle.</div>
               </div>
 
               <div style={{ marginBottom: "24px", paddingBottom: "20px", borderBottom: "1px solid #222" }}>
@@ -923,7 +1013,7 @@ export default function App() {
             {/* ═══════ Anomaly Config Tab ═══════ */}
             {configTab === "anomaly" && anomalyConfigDraft && (<>
               <div style={{ color: "#c08030", fontSize: "11px", marginBottom: "20px", background: "#2a1f10", border: "1px solid #3a2a10", borderRadius: "4px", padding: "7px 10px" }}>
-                Changes take effect on the next detection run. Use <strong>Utilities → Re-detect Anomalies</strong> to apply immediately.
+                Changes take effect on the next detection run. Use <strong>Run Detection</strong> to apply immediately.
               </div>
 
               {/* ── Isolation Forest ── */}
@@ -1091,22 +1181,13 @@ export default function App() {
                 <div style={{ color: "#555", fontSize: "11px", marginTop: "4px" }}>Fraction of a MAC's scoreable normal episodes that must be anomalous to flag the MAC as a Markov outlier.</div>
               </div>
 
-              <div style={{ marginBottom: "18px" }}>
-                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: "5px" }}>
-                  <div style={{ color: "#888", fontSize: "11px" }}>SHORT EPISODE MIN COUNT</div>
-                  <div style={{ color: "#7ec8e3", fontSize: "13px", fontWeight: "bold" }}>{anomalyConfigDraft.markov_short_episode_min_count}</div>
-                </div>
-                <input type="range" min={1} max={20} value={anomalyConfigDraft.markov_short_episode_min_count} onChange={(e) => setAnomalyConfigDraft(d => ({ ...d, markov_short_episode_min_count: Number(e.target.value) }))} style={{ width: "100%", accentColor: "#7ec8e3", cursor: "pointer" }} />
-                <div style={{ color: "#555", fontSize: "11px", marginTop: "4px" }}>Minimum number of short episodes before the repeated-short-episode flag can trigger.</div>
-              </div>
-
               <div style={{ marginBottom: "24px", paddingBottom: "20px", borderBottom: "1px solid #222" }}>
                 <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: "5px" }}>
                   <div style={{ color: "#888", fontSize: "11px" }}>MIN SCOREABLE EPISODES</div>
                   <div style={{ color: "#7ec8e3", fontSize: "13px", fontWeight: "bold" }}>{anomalyConfigDraft.markov_min_scoreable_episodes}</div>
                 </div>
                 <input type="range" min={1} max={20} value={anomalyConfigDraft.markov_min_scoreable_episodes} onChange={(e) => setAnomalyConfigDraft(d => ({ ...d, markov_min_scoreable_episodes: Number(e.target.value) }))} style={{ width: "100%", accentColor: "#7ec8e3", cursor: "pointer" }} />
-                <div style={{ color: "#555", fontSize: "11px", marginTop: "4px" }}>Minimum scoreable normal episodes required before event-level ratio is computed. MACs with fewer are evaluated only via short-episode and sequence rules.</div>
+                <div style={{ color: "#555", fontSize: "11px", marginTop: "4px" }}>Minimum scoreable normal episodes required before event-level ratio is computed. MACs with fewer skip event-level scoring and are evaluated only by the stuck-loop detector.</div>
               </div>
 
               <div style={{ display: "flex", gap: "10px", justifyContent: "flex-end" }}>

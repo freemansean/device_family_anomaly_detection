@@ -1,0 +1,556 @@
+"""
+db.py -- SQLite event store and client cache.
+
+Replaces Redis sorted sets for events and Redis JSON blobs for client cache.
+SQLite handles millions of rows with near-zero memory overhead, persists to disk,
+and supports SQL queries for aggregation and filtering.
+
+Connection management: a single module-level connection is lazily initialised on
+first use and reused across all callers.  WAL mode is enabled for concurrent
+reads during writes.
+
+Tables:
+  events  -- enriched client events, deduplicated by (mac, event_type, timestamp, bssid)
+  clients -- MAC -> device metadata lookup, one row per MAC, scoped to the org.
+             MACs are unique across the org, so client records are stored once
+             per MAC and shared by every site that sees that MAC in events.
+"""
+
+import json
+import logging
+import os
+import pathlib
+import time
+from typing import Optional
+
+import aiosqlite
+
+log = logging.getLogger(__name__)
+
+# Default DB path: data/sasquatch.db next to this file.  Overridable via env var.
+_DEFAULT_DB_DIR = pathlib.Path(__file__).parent / "data"
+DB_PATH = os.getenv(
+    "SASQUATCH_SQLITE_PATH",
+    str(_DEFAULT_DB_DIR / "sasquatch.db"),
+)
+
+# Retention: events older than this are pruned on each write cycle.
+EVENTS_RETENTION_SECONDS = 7 * 24 * 3600  # 7 days
+
+# Module-level connection -- lazily initialised.
+_conn: Optional[aiosqlite.Connection] = None
+
+
+async def get_connection() -> aiosqlite.Connection:
+    """Return the shared async SQLite connection, creating it on first call."""
+    global _conn
+    if _conn is None:
+        # Ensure the directory exists
+        db_dir = pathlib.Path(DB_PATH).parent
+        db_dir.mkdir(parents=True, exist_ok=True)
+
+        _conn = await aiosqlite.connect(DB_PATH)
+        _conn.row_factory = aiosqlite.Row
+        await _conn.execute("PRAGMA journal_mode=WAL")
+        await _conn.execute("PRAGMA synchronous=NORMAL")
+        await _conn.execute("PRAGMA busy_timeout=5000")
+        await _init_schema(_conn)
+        log.info(f"SQLite connection opened: {DB_PATH}")
+    return _conn
+
+
+async def close():
+    """Close the shared connection.  Safe to call multiple times."""
+    global _conn
+    if _conn is not None:
+        await _conn.close()
+        _conn = None
+        log.info("SQLite connection closed")
+
+
+# ---------------------------------------------------------------------------
+# Schema
+# ---------------------------------------------------------------------------
+
+_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    org_id TEXT NOT NULL DEFAULT '',
+    site_id TEXT NOT NULL,
+    mac TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    timestamp REAL NOT NULL,
+    bssid TEXT NOT NULL DEFAULT '',
+    device_family TEXT,
+    device_model TEXT,
+    device_manufacturer TEXT,
+    wlan TEXT,
+    event_category TEXT,
+    raw_json TEXT NOT NULL,
+    UNIQUE(mac, event_type, timestamp, bssid)
+);
+
+CREATE INDEX IF NOT EXISTS idx_events_site_ts ON events(site_id, timestamp);
+CREATE INDEX IF NOT EXISTS idx_events_mac ON events(mac, timestamp);
+CREATE INDEX IF NOT EXISTS idx_events_org_ts ON events(org_id, timestamp);
+CREATE INDEX IF NOT EXISTS idx_events_wlan ON events(site_id, wlan);
+
+CREATE TABLE IF NOT EXISTS clients (
+    mac TEXT PRIMARY KEY,
+    org_id TEXT NOT NULL DEFAULT '',
+    family TEXT NOT NULL,
+    model TEXT,
+    os TEXT,
+    manufacturer TEXT,
+    random_mac BOOLEAN DEFAULT FALSE,
+    last_ssid TEXT,
+    last_ap TEXT,
+    last_site_id TEXT,
+    last_username TEXT,
+    last_username_norm TEXT,
+    updated_at REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_clients_org ON clients(org_id);
+CREATE INDEX IF NOT EXISTS idx_clients_family ON clients(family);
+CREATE INDEX IF NOT EXISTS idx_clients_last_site ON clients(last_site_id);
+CREATE INDEX IF NOT EXISTS idx_clients_username_norm ON clients(org_id, last_username_norm);
+
+CREATE TABLE IF NOT EXISTS client_refresh_log (
+    org_id TEXT PRIMARY KEY,
+    refreshed_at REAL NOT NULL,
+    client_count INTEGER NOT NULL DEFAULT 0
+);
+"""
+
+
+async def _migrate_clients_to_org_scope(conn: aiosqlite.Connection) -> None:
+    """
+    Detect the legacy per-site clients schema and rebuild it as a per-org table.
+
+    Legacy schema had a composite PRIMARY KEY (mac, site_id) and a `site_id`
+    column. The new schema is keyed on `mac` alone. Since the clients cache is
+    refreshed daily from the Mist API, dropping and recreating the table is
+    safe -- the next refresh repopulates it. Same for client_refresh_log, which
+    used to be keyed by site_id and is now keyed by org_id.
+    """
+    # Inspect current clients schema
+    cursor = await conn.execute("PRAGMA table_info(clients)")
+    cols = await cursor.fetchall()
+    col_names = {row[1] for row in cols}
+    if cols and ("site_id" in col_names and "last_site_id" not in col_names):
+        log.info("Migrating clients table from per-site to per-org schema (drop+recreate)")
+        await conn.execute("DROP TABLE IF EXISTS clients")
+        await conn.execute("DROP TABLE IF EXISTS client_refresh_log")
+        await conn.commit()
+
+
+async def _migrate_clients_add_last_username(conn: aiosqlite.Connection) -> None:
+    """
+    Add `last_username` and `last_username_norm` columns to an existing clients
+    table if they are missing. The daily client refresh re-populates both from
+    the Mist API, so no backfill is needed — a NULL column is acceptable until
+    the next refresh runs.
+    """
+    cursor = await conn.execute("PRAGMA table_info(clients)")
+    cols = await cursor.fetchall()
+    if not cols:
+        return  # table will be created fresh by the main schema script
+    col_names = {row[1] for row in cols}
+    if "last_username" not in col_names:
+        log.info("Adding last_username column to clients table")
+        await conn.execute("ALTER TABLE clients ADD COLUMN last_username TEXT")
+    if "last_username_norm" not in col_names:
+        log.info("Adding last_username_norm column to clients table")
+        await conn.execute("ALTER TABLE clients ADD COLUMN last_username_norm TEXT")
+    await conn.commit()
+
+
+async def _init_schema(conn: aiosqlite.Connection):
+    """Create tables and indexes if they don't exist."""
+    await _migrate_clients_to_org_scope(conn)
+    await conn.executescript(_SCHEMA_SQL)
+    await _migrate_clients_add_last_username(conn)
+    await conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Events CRUD
+# ---------------------------------------------------------------------------
+
+async def insert_events(events: list[dict], site_id: str) -> int:
+    """
+    Insert enriched events into SQLite.  Duplicates (same mac, event_type,
+    timestamp, bssid) are silently ignored via INSERT OR IGNORE.
+
+    Returns the number of rows actually inserted (excluding duplicates).
+    """
+    if not events:
+        return 0
+
+    conn = await get_connection()
+    rows = []
+    for event in events:
+        mac = (event.get("mac") or "").replace(":", "").lower()
+        rows.append((
+            event.get("org_id", ""),
+            site_id,
+            mac,
+            event.get("type", ""),
+            float(event.get("timestamp") or 0),
+            event.get("bssid", ""),
+            event.get("device_family"),
+            event.get("device_model"),
+            event.get("device_manufacturer"),
+            event.get("wlan"),
+            event.get("event_category"),
+            json.dumps(event, sort_keys=True),
+        ))
+
+    cursor = await conn.executemany(
+        """INSERT OR IGNORE INTO events
+           (org_id, site_id, mac, event_type, timestamp, bssid,
+            device_family, device_model, device_manufacturer, wlan,
+            event_category, raw_json)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        rows,
+    )
+    await conn.commit()
+    return cursor.rowcount
+
+
+async def get_events(
+    site_id: Optional[str] = None,
+    wlan: Optional[str] = None,
+    since: Optional[float] = None,
+) -> list[dict]:
+    """
+    Load events from SQLite, optionally filtered by site and/or WLAN.
+
+    By default returns events from the last EVENTS_RETENTION_SECONDS (7 days).
+    Pass `since` to override the cutoff timestamp.
+    """
+    conn = await get_connection()
+    cutoff = since if since is not None else (time.time() - EVENTS_RETENTION_SECONDS)
+
+    conditions = ["timestamp >= ?"]
+    params: list = [cutoff]
+
+    if site_id:
+        conditions.append("site_id = ?")
+        params.append(site_id)
+    if wlan:
+        conditions.append("wlan = ?")
+        params.append(wlan)
+
+    where = " AND ".join(conditions)
+    query = f"SELECT raw_json FROM events WHERE {where} ORDER BY timestamp"
+
+    rows = await conn.execute_fetchall(query, params)
+    return [json.loads(row[0]) for row in rows]
+
+
+async def get_event_count(
+    site_id: Optional[str] = None,
+    wlan: Optional[str] = None,
+) -> int:
+    """Return event count without loading full JSON blobs."""
+    conn = await get_connection()
+    cutoff = time.time() - EVENTS_RETENTION_SECONDS
+
+    conditions = ["timestamp >= ?"]
+    params: list = [cutoff]
+    if site_id:
+        conditions.append("site_id = ?")
+        params.append(site_id)
+    if wlan:
+        conditions.append("wlan = ?")
+        params.append(wlan)
+
+    where = " AND ".join(conditions)
+    query = f"SELECT COUNT(*) FROM events WHERE {where}"
+    rows = await conn.execute_fetchall(query, params)
+    return rows[0][0] if rows else 0
+
+
+async def get_wlans(site_id: Optional[str] = None) -> list[str]:
+    """Return sorted list of unique WLAN (SSID) names."""
+    conn = await get_connection()
+    cutoff = time.time() - EVENTS_RETENTION_SECONDS
+
+    if site_id:
+        rows = await conn.execute_fetchall(
+            "SELECT DISTINCT wlan FROM events WHERE site_id = ? AND timestamp >= ? AND wlan IS NOT NULL AND wlan != ''",
+            (site_id, cutoff),
+        )
+    else:
+        rows = await conn.execute_fetchall(
+            "SELECT DISTINCT wlan FROM events WHERE timestamp >= ? AND wlan IS NOT NULL AND wlan != ''",
+            (cutoff,),
+        )
+    return sorted(row[0] for row in rows)
+
+
+async def get_site_ids_with_events() -> list[str]:
+    """Return list of site_ids that have events in the retention window."""
+    conn = await get_connection()
+    cutoff = time.time() - EVENTS_RETENTION_SECONDS
+    rows = await conn.execute_fetchall(
+        "SELECT DISTINCT site_id FROM events WHERE timestamp >= ?",
+        (cutoff,),
+    )
+    return [row[0] for row in rows]
+
+
+async def reenrich_events(
+    site_id: str,
+    enricher: callable,
+    client_cache: dict[str, dict],
+) -> int:
+    """
+    Re-enrich stored events whose device_family starts with 'Unknown'.
+
+    enricher: a function(event_dict, client_cache) -> enriched_event_dict
+    Returns count of events updated.
+    """
+    conn = await get_connection()
+    cutoff = time.time() - EVENTS_RETENTION_SECONDS
+
+    rows = await conn.execute_fetchall(
+        """SELECT id, raw_json FROM events
+           WHERE site_id = ? AND timestamp >= ?
+           AND (device_family LIKE 'Unknown%' OR device_family IS NULL)""",
+        (site_id, cutoff),
+    )
+
+    updates = []
+    for row in rows:
+        event = json.loads(row[1])
+        new_event = enricher(event, client_cache)
+        new_json = json.dumps(new_event, sort_keys=True)
+        if new_json == row[1]:
+            continue
+        updates.append((
+            new_event.get("device_family"),
+            new_event.get("device_model"),
+            new_event.get("device_manufacturer"),
+            new_event.get("event_category"),
+            new_json,
+            row[0],  # id
+        ))
+
+    if not updates:
+        return 0
+
+    await conn.executemany(
+        """UPDATE events SET device_family=?, device_model=?, device_manufacturer=?,
+           event_category=?, raw_json=? WHERE id=?""",
+        updates,
+    )
+    await conn.commit()
+    log.info(f"Re-enriched {len(updates)} stale events for site {site_id}")
+    return len(updates)
+
+
+async def delete_events_for_site(site_id: str) -> int:
+    """Delete all events for a given site.  Returns row count deleted."""
+    conn = await get_connection()
+    cursor = await conn.execute("DELETE FROM events WHERE site_id = ?", (site_id,))
+    await conn.commit()
+    return cursor.rowcount
+
+
+async def purge_old_events() -> int:
+    """Delete events older than the retention window.  Returns row count deleted."""
+    conn = await get_connection()
+    cutoff = time.time() - EVENTS_RETENTION_SECONDS
+    cursor = await conn.execute("DELETE FROM events WHERE timestamp < ?", (cutoff,))
+    await conn.commit()
+    deleted = cursor.rowcount
+    if deleted:
+        log.info(f"Purged {deleted} expired events (older than 7 days)")
+    return deleted
+
+
+# ---------------------------------------------------------------------------
+# Clients CRUD (org-scoped — MACs are unique across the org)
+# ---------------------------------------------------------------------------
+
+def normalize_username(raw: str | None) -> str:
+    """
+    Canonical normalization used when grouping usernames into service-account
+    families. Case-insensitive, whitespace-stripped. Returns an empty string
+    for missing/blank values so call sites can test falsy.
+    """
+    if not raw:
+        return ""
+    return raw.strip().lower()
+
+
+async def upsert_clients_org(org_id: str, client_map: dict[str, dict]) -> int:
+    """
+    Upsert client records for the org. ``client_map`` is MAC -> metadata dict
+    (shape: {family, model, os, manufacturer, random_mac, last_ssid, last_ap,
+    last_site_id, last_username}).
+
+    The clients table is fully replaced for this org on every refresh — MACs
+    seen at any site in the org live in the same row, since MACs are unique
+    org-wide. Returns count of rows upserted.
+    """
+    conn = await get_connection()
+    now = time.time()
+
+    # Wipe the org's existing rows then bulk insert -- fastest for full refresh.
+    await conn.execute("DELETE FROM clients WHERE org_id = ?", (org_id,))
+
+    if client_map:
+        rows = []
+        for mac, meta in client_map.items():
+            username = meta.get("last_username", "") or ""
+            rows.append((
+                mac,
+                org_id,
+                meta.get("family", "Unknown"),
+                meta.get("model", ""),
+                meta.get("os", ""),
+                meta.get("manufacturer", ""),
+                meta.get("random_mac", False),
+                meta.get("last_ssid", ""),
+                meta.get("last_ap", ""),
+                meta.get("last_site_id", ""),
+                username,
+                normalize_username(username),
+                now,
+            ))
+        await conn.executemany(
+            """INSERT OR REPLACE INTO clients
+               (mac, org_id, family, model, os, manufacturer,
+                random_mac, last_ssid, last_ap, last_site_id,
+                last_username, last_username_norm, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            rows,
+        )
+
+    # Record that this org has been refreshed (even if zero clients).
+    await conn.execute(
+        """INSERT OR REPLACE INTO client_refresh_log (org_id, refreshed_at, client_count)
+           VALUES (?, ?, ?)""",
+        (org_id, now, len(client_map)),
+    )
+    await conn.commit()
+    return len(client_map)
+
+
+async def get_org_client_cache(org_id: str) -> dict[str, dict] | None:
+    """
+    Load the org-wide client cache from SQLite.
+
+    Returns:
+      None  -- no rows for this org (refresh has never run).
+      {}    -- org exists in DB but has no clients.
+      {...} -- normal populated cache: MAC -> {family, model, os, manufacturer,
+               random_mac, last_ssid, last_ap, last_site_id}.
+
+    To distinguish 'never refreshed' from 'refreshed but empty', we check the
+    refresh log: ``upsert_clients_org`` always writes a refresh-log row even
+    when client_map is empty.
+    """
+    conn = await get_connection()
+
+    rows = await conn.execute_fetchall(
+        """SELECT mac, family, model, os, manufacturer, random_mac,
+                  last_ssid, last_ap, last_site_id, last_username,
+                  last_username_norm
+           FROM clients WHERE org_id = ?""",
+        (org_id,),
+    )
+
+    if not rows:
+        refresh_row = await conn.execute_fetchall(
+            "SELECT 1 FROM client_refresh_log WHERE org_id = ? LIMIT 1",
+            (org_id,),
+        )
+        if refresh_row:
+            return {}
+        return None
+
+    result = {}
+    for row in rows:
+        result[row[0]] = {
+            "family": row[1],
+            "model": row[2] or "",
+            "os": row[3] or "",
+            "manufacturer": row[4] or "",
+            "random_mac": bool(row[5]),
+            "last_ssid": row[6] or "",
+            "last_ap": row[7] or "",
+            "last_site_id": row[8] or "",
+            "last_username": row[9] or "",
+            "last_username_norm": row[10] or "",
+        }
+    return result
+
+
+async def get_service_account_usernames(
+    org_id: str, min_count: int
+) -> dict[str, dict]:
+    """
+    Return normalized usernames that qualify as service accounts based on the
+    clients table (MACs are unique org-wide so grouping by normalized username
+    is an org-wide count).
+
+    A username qualifies when ``min_count`` or more distinct client rows in the
+    org share the same case-insensitive / whitespace-stripped value.
+
+    Return shape: {normalized_username: {"label": display_label, "mac_count": N}}
+    The display_label is the most common original-case variant seen among the
+    rows — used when building the family name ``{label}.service_account``.
+    """
+    if not org_id or min_count <= 0:
+        return {}
+    conn = await get_connection()
+    rows = await conn.execute_fetchall(
+        """SELECT last_username_norm, last_username, COUNT(*) AS cnt
+           FROM clients
+           WHERE org_id = ?
+             AND last_username_norm IS NOT NULL
+             AND last_username_norm != ''
+           GROUP BY last_username_norm, last_username""",
+        (org_id,),
+    )
+    # Collapse variants per normalized key and pick the most common original.
+    grouped: dict[str, dict[str, int]] = {}
+    for norm, original, cnt in rows:
+        key = norm or ""
+        if not key:
+            continue
+        bucket = grouped.setdefault(key, {})
+        bucket[original or key] = bucket.get(original or key, 0) + int(cnt)
+
+    result: dict[str, dict] = {}
+    for norm, variants in grouped.items():
+        total = sum(variants.values())
+        if total < min_count:
+            continue
+        label = max(variants.items(), key=lambda kv: kv[1])[0]
+        result[norm] = {"label": label, "mac_count": total}
+    return result
+
+
+async def delete_clients_for_org(org_id: str) -> int:
+    """Delete all client records for an org. Returns row count deleted."""
+    conn = await get_connection()
+    cursor = await conn.execute("DELETE FROM clients WHERE org_id = ?", (org_id,))
+    await conn.execute("DELETE FROM client_refresh_log WHERE org_id = ?", (org_id,))
+    await conn.commit()
+    return cursor.rowcount
+
+
+async def has_org_client_cache(org_id: str) -> bool:
+    """Check if a client cache has been written for an org (even if empty)."""
+    conn = await get_connection()
+    rows = await conn.execute_fetchall(
+        "SELECT 1 FROM client_refresh_log WHERE org_id = ? LIMIT 1",
+        (org_id,),
+    )
+    return len(rows) > 0

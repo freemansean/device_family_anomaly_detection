@@ -12,6 +12,8 @@ const CATEGORIES = [
 
 const SEVERITY_COLOR = { significant: "#e05555", moderate: "#e0a835", minimal: "#4ea8c4" };
 const SEVERITY_RANK  = { significant: 3, moderate: 2, minimal: 1 };
+const SA_COLOR = "#d4a06a";
+const SA_BG    = "#2a1f15";
 
 function healthScoreColor(score) {
   if (score == null) return "#444";
@@ -27,6 +29,42 @@ function healthBarColor(score) {
   if (score >= 0.75) return "#e0a835";
   if (score >= 0.55) return "#c87832";
   return "#e05555";
+}
+
+// Org-level family service alarm cards. The list is computed by /org/family-insights
+// from summed active/unhealthy MAC counts across all sites — already filtered to
+// services where >50% of clients in the total device family scope are unhealthy.
+function ServiceAlarmCards({ alarms, serviceHealth }) {
+  if (!alarms || alarms.length === 0) {
+    return <span style={{ color: "#333", fontSize: "10px" }}>—</span>;
+  }
+  return (
+    <span style={{ display: "flex", flexWrap: "wrap", gap: "3px" }}>
+      {alarms.map((svc) => {
+        const sh = serviceHealth?.[svc];
+        const pct = sh != null ? `${Math.round(sh * 100)}%` : "";
+        return (
+          <span
+            key={svc}
+            title={pct ? `${svc.toUpperCase()} avg health ${pct} org-wide` : svc.toUpperCase()}
+            style={{
+              background: "#e0555522",
+              color: "#e05555",
+              border: "1px solid #e0555544",
+              borderRadius: "3px",
+              padding: "1px 5px",
+              fontSize: "10px",
+              textTransform: "uppercase",
+              letterSpacing: "0.04em",
+              fontWeight: 600,
+            }}
+          >
+            {svc}
+          </span>
+        );
+      })}
+    </span>
+  );
 }
 
 function ratioColor(ratio) {
@@ -148,9 +186,9 @@ export default function OrgFamilyInsights({ apiBase, refreshToken, onMacSiteSele
     } else if (sortKey === "sites") {
       va = families[a].site_count ?? 0; vb = families[b].site_count ?? 0;
     } else {
-      // category column — sort by raw event count
-      va = families[a].categories?.[sortKey]?.count ?? 0;
-      vb = families[b].categories?.[sortKey]?.count ?? 0;
+      // category column — sort by ratio (matches cell color coding)
+      va = families[a].categories?.[sortKey]?.ratio ?? 0;
+      vb = families[b].categories?.[sortKey]?.ratio ?? 0;
     }
     if (va < vb) return sortDir === "asc" ? -1 : 1;
     if (va > vb) return sortDir === "asc" ? 1 : -1;
@@ -226,6 +264,12 @@ export default function OrgFamilyInsights({ apiBase, refreshToken, onMacSiteSele
                 Health<SortIndicator active={sortKey === "health"} dir={sortDir} />
               </th>
               <th
+                style={{ ...thStyle, whiteSpace: "nowrap", minWidth: "100px" }}
+                title="Service Alarm — services where >50% of clients in this family are individually unhealthy across the entire org-wide device-family scope."
+              >
+                Service Alarm
+              </th>
+              <th
                 style={{ ...thStyle, whiteSpace: "nowrap", color: "#444", cursor: "pointer", userSelect: "none" }}
                 onClick={() => handleSort("events")}
               >
@@ -271,8 +315,12 @@ export default function OrgFamilyInsights({ apiBase, refreshToken, onMacSiteSele
                 ? `Anomalous at: ${[...new Set(outlierSites)].join(", ")}`
                 : isFamOut ? "Flagged as family outlier at one or more sites" : "";
 
+              const isSaFamily = fdata.family_kind === "service_account";
+              const displayName = isSaFamily ? fdata.service_account_label : family;
+              const saMembers = fdata.service_account_member_families || [];
+              const rowBg = isSaFamily ? SA_BG : undefined;
               return (
-                <tr key={family}>
+                <tr key={family} style={rowBg ? { background: rowBg } : undefined}>
                   {/* Family name — clickable to drill down */}
                   <td
                     style={{ ...tdStyle, whiteSpace: "nowrap", cursor: "pointer" }}
@@ -280,10 +328,18 @@ export default function OrgFamilyInsights({ apiBase, refreshToken, onMacSiteSele
                   >
                     <span style={{
                       display: "inline-block", width: 8, height: 8,
-                      borderRadius: "50%", background: color,
+                      borderRadius: "50%", background: isSaFamily ? SA_COLOR : color,
                       marginRight: "6px", verticalAlign: "middle",
                     }} />
-                    <span style={{ color: (fdata.worst_dbscan_severity || isFamOut || fdata.is_family_markov_outlier_any_site) ? "#e0e0e0" : "#ccc", textDecoration: "underline", textDecorationColor: "#444" }}>{family}</span>
+                    <span style={{ color: isSaFamily ? SA_COLOR : ((fdata.worst_dbscan_severity || isFamOut || fdata.is_family_markov_outlier_any_site) ? "#e0e0e0" : "#ccc"), textDecoration: "underline", textDecorationColor: isSaFamily ? `${SA_COLOR}55` : "#444" }}>{displayName}</span>
+                    {isSaFamily && (
+                      <span
+                        style={{ background: "transparent", color: SA_COLOR, border: `1px solid ${SA_COLOR}55`, borderRadius: "3px", padding: "0 4px", fontSize: "9px", fontWeight: "bold", letterSpacing: "0.05em", marginLeft: "6px", verticalAlign: "middle" }}
+                        title={saMembers.length ? `Spans ${saMembers.length} device families: ${saMembers.join(", ")}` : "Service account"}
+                      >
+                        SVC ACCT
+                      </span>
+                    )}
                     {fdata.client_count > 0 && (
                       <span style={{ color: "#444", fontSize: "11px", marginLeft: "6px" }}>
                         ({fdata.client_count})
@@ -343,15 +399,19 @@ export default function OrgFamilyInsights({ apiBase, refreshToken, onMacSiteSele
                   {(() => {
                     const isMarkov = fdata.is_family_markov_outlier_any_site;
                     const mRatio   = fdata.worst_markov_ratio;
+                    const mReason  = fdata.markov_family_reason;
+                    const tip = isMarkov
+                      ? `Markov ${mReason || "anomaly"}${mRatio != null ? ` — ${(mRatio * 100).toFixed(0)}% of clients flagged` : ""}`
+                      : "No family-level Markov anomaly across any site";
                     return (
-                      <td style={{ ...tdStyle, textAlign: "center" }}>
+                      <td style={{ ...tdStyle, textAlign: "center" }} title={tip}>
                         {isMarkov ? (
                           <span style={{
                             background: "#1a2a3a", color: "#4ab0e8",
                             border: "1px solid #2a6a8a", borderRadius: "3px",
                             padding: "1px 6px", fontSize: "10px", fontWeight: "bold", whiteSpace: "nowrap",
                           }}>
-                            {mRatio != null ? `${(mRatio * 100).toFixed(0)}%` : "chain"}
+                            {mReason || "chain"}
                           </span>
                         ) : (
                           <span style={{ color: "#2d7a4f", fontSize: "10px" }}>OK</span>
@@ -387,6 +447,14 @@ export default function OrgFamilyInsights({ apiBase, refreshToken, onMacSiteSele
                       </td>
                     );
                   })()}
+
+                  {/* Service Alarm — per-family service cards (org-wide rollup) */}
+                  <td style={{ ...tdStyle, minWidth: "100px" }}>
+                    <ServiceAlarmCards
+                      alarms={fdata.service_alarms || []}
+                      serviceHealth={fdata.service_health || {}}
+                    />
+                  </td>
 
                   {/* Event count */}
                   <td style={{ ...tdStyle, textAlign: "right", color: "#555", fontSize: "11px", fontVariantNumeric: "tabular-nums" }}>
@@ -455,6 +523,7 @@ export default function OrgFamilyInsights({ apiBase, refreshToken, onMacSiteSele
                   <span style={{ color: "#333", fontSize: "10px" }}>—</span>
                 </td>
                 <td style={tdStyle} />
+                <td style={tdStyle} />
                 <td style={{ ...tdStyle, textAlign: "right", color: "#444", fontSize: "11px" }}>
                   {otherTotal > 999 ? `${(otherTotal / 1000).toFixed(1)}k` : otherTotal}
                 </td>
@@ -495,7 +564,7 @@ export default function OrgFamilyInsights({ apiBase, refreshToken, onMacSiteSele
         Cell ratios are % of that family's org-wide event pool.
         {" "}<span style={{ color: "#b06ad4" }}>IF: family</span> = device class flagged as a centroid outlier org-wide (cross-site population).
         {" "}<span style={{ fontWeight: "bold", color: "#666" }}>DB:</span> <span style={{ color: "#e0a835" }}>moderate</span> / <span style={{ color: "#e05555" }}>significant</span> = org-wide DBSCAN severity (badge = sites with outlier MACs).
-        {" "}<span style={{ color: "#4ab0e8" }}>Markov %</span> = org-wide ratio of clients with anomalous chain patterns.
+        {" "}<span style={{ color: "#4ab0e8" }}>Markov</span> = anomaly (anomalous connection-chain transitions) or repeated (failed loops). Hover for ratio.
         {" "}Health = volume-weighted failure rate org-wide (hover for per-category breakdown).
         {" "}Hover cells for exact counts.
       </div>

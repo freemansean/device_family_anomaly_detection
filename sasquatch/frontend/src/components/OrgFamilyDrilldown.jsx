@@ -2,6 +2,8 @@ import { useState, useEffect } from "react";
 import { apiFetch } from "../api";
 
 const SEVERITY_COLOR = { significant: "#e05555", moderate: "#e0a835", minimal: "#4ea8c4" };
+const SA_COLOR = "#d4a06a";
+const SA_BG    = "#2a1f15";
 
 function shapleyScoreFromIfScore(ifScore) {
   if (ifScore == null) return null;
@@ -127,6 +129,59 @@ function computeMacHealth(cats) {
   return 1.0 - (failure / total);
 }
 
+const SERVICE_BUCKETS = [
+  { svc: "auth", success: "AUTH_SUCCESS", failure: "AUTH_FAILURE" },
+  { svc: "roam", success: "ROAM_SUCCESS", failure: "ROAM_FAILURE" },
+  { svc: "dhcp", success: "DHCP_SUCCESS", failure: "DHCP_FAILURE" },
+  { svc: "dns",  success: "DNS_SUCCESS",  failure: "DNS_FAILURE" },
+  { svc: "arp",  success: "ARP_SUCCESS",  failure: "ARP_FAILURE" },
+];
+const SERVICE_HEALTH_THRESHOLD = 0.50;
+
+function computeMacServiceAlarms(cats) {
+  const out = [];
+  for (const b of SERVICE_BUCKETS) {
+    const s = cats[b.success] || 0;
+    const f = cats[b.failure] || 0;
+    const total = s + f;
+    if (total === 0) continue;
+    const health = s / total;
+    if (health < SERVICE_HEALTH_THRESHOLD) {
+      out.push({ svc: b.svc, health });
+    }
+  }
+  return out;
+}
+
+function ServiceAlarmCards({ alarms }) {
+  if (!alarms || alarms.length === 0) {
+    return <span style={{ color: "#444", fontSize: "11px" }}>—</span>;
+  }
+  return (
+    <span style={{ display: "flex", flexWrap: "wrap", gap: "3px" }}>
+      {alarms.map((a) => (
+        <span
+          key={a.svc}
+          title={`${a.svc.toUpperCase()} health ${Math.round(a.health * 100)}%`}
+          style={{
+            background: "#e0555522",
+            color: "#e05555",
+            border: "1px solid #e0555544",
+            borderRadius: "3px",
+            padding: "1px 5px",
+            fontSize: "10px",
+            textTransform: "uppercase",
+            letterSpacing: "0.04em",
+            fontWeight: 600,
+          }}
+        >
+          {a.svc}
+        </span>
+      ))}
+    </span>
+  );
+}
+
 function healthColor(score) {
   if (score >= 0.85) return "#4caf7d";
   if (score >= 0.75) return "#e0a835";
@@ -224,9 +279,44 @@ export default function OrgFamilyDrilldown({ family, apiBase, onMacSiteSelect, o
         >
           ← Org Family Insights
         </button>
-        <h2 style={{ margin: 0, fontSize: "15px", color: "#aaa" }}>{family}</h2>
+        <h2 style={{ margin: 0, fontSize: "15px", color: "#aaa" }}>
+          {data?.family_kind === "service_account" && data?.service_account_label
+            ? data.service_account_label
+            : family}
+        </h2>
+        {data?.family_kind === "service_account" && (
+          <span
+            style={{ background: SA_BG, color: SA_COLOR, border: `1px solid ${SA_COLOR}55`, borderRadius: "3px", padding: "2px 7px", fontSize: "10px", fontWeight: "bold", letterSpacing: "0.05em" }}
+            title="Service account: same username shared across multiple devices"
+          >
+            SVC ACCT
+          </span>
+        )}
         <span style={{ color: "#555", fontSize: "12px" }}>org-wide</span>
       </div>
+
+      {data?.family_kind === "service_account" && data?.service_account_member_families?.length > 0 && (
+        <div
+          style={{
+            background: SA_BG,
+            border: `1px solid ${SA_COLOR}44`,
+            borderLeft: `3px solid ${SA_COLOR}`,
+            borderRadius: "4px",
+            padding: "10px 12px",
+            marginBottom: "14px",
+            fontSize: "12px",
+            color: "#bbb",
+          }}
+        >
+          <div style={{ color: SA_COLOR, fontSize: "11px", fontWeight: "bold", letterSpacing: "0.06em", textTransform: "uppercase", marginBottom: "4px" }}>
+            Service account · spans {data.service_account_member_families.length} device {data.service_account_member_families.length === 1 ? "family" : "families"}
+          </div>
+          <div style={{ color: "#999" }}>
+            Username <span style={{ color: SA_COLOR, fontFamily: "monospace" }}>{data.service_account_label}</span>{" "}
+            shared across: {data.service_account_member_families.join(", ")}
+          </div>
+        </div>
+      )}
 
       {loading && <div style={{ color: "#888", fontSize: "13px" }}>Loading…</div>}
       {error && <div style={{ color: "#e05555", fontSize: "13px" }}>Error: {error}</div>}
@@ -260,7 +350,11 @@ export default function OrgFamilyDrilldown({ family, apiBase, onMacSiteSelect, o
                   <tr>
                     <SortTh col="site_name">Site</SortTh>
                     <SortTh col="mac">MAC</SortTh>
+                    {data.family_kind === "service_account" && (
+                      <th style={thStyle}>Primary Family</th>
+                    )}
                     <SortTh col="health" style={{ minWidth: "90px" }}>Health</SortTh>
+                    <th style={{ ...thStyle, minWidth: "100px" }}>Service Alarm</th>
                     <SortTh col="if_score" style={{ minWidth: "120px" }}>IF Score</SortTh>
                     <th style={thStyle}>▲IF</th>
                     <th style={thStyle}>DBSCAN</th>
@@ -291,7 +385,18 @@ export default function OrgFamilyDrilldown({ family, apiBase, onMacSiteSelect, o
                           {row.random_mac && (
                             <span style={{ color: "#555", fontSize: "10px", marginLeft: "6px" }}>rnd</span>
                           )}
+                          {row.last_username && (
+                            <span style={{ color: SA_COLOR, fontSize: "10px", marginLeft: "6px", fontFamily: "monospace" }}
+                              title={`username: ${row.last_username}`}>
+                              {row.last_username}
+                            </span>
+                          )}
                         </td>
+                        {data.family_kind === "service_account" && (
+                          <td style={{ ...tdStyle, color: "#888", fontSize: "11px", whiteSpace: "nowrap" }}>
+                            {row.primary_device_family || "—"}
+                          </td>
+                        )}
                         <td style={{ ...tdStyle, minWidth: "90px" }}>
                           {(() => {
                             const h = computeMacHealth(row.categories);
@@ -307,6 +412,9 @@ export default function OrgFamilyDrilldown({ family, apiBase, onMacSiteSelect, o
                               </div>
                             );
                           })()}
+                        </td>
+                        <td style={{ ...tdStyle, minWidth: "100px" }}>
+                          <ServiceAlarmCards alarms={computeMacServiceAlarms(row.categories)} />
                         </td>
                         <td style={{ ...tdStyle, minWidth: "120px" }}>
                           {bar ? (
@@ -345,7 +453,7 @@ export default function OrgFamilyDrilldown({ family, apiBase, onMacSiteSelect, o
                         <td style={{ ...tdStyle, textAlign: "center", minWidth: "80px" }}>
                           {row.is_markov_outlier ? (
                             <span
-                              title={`${row.markov_anomalous_episodes}/${row.markov_scoreable_episodes} episodes anomalous`}
+                              title={`Markov ${row.markov_reason || "anomaly"}: ${row.markov_anomalous_episodes}/${row.markov_scoreable_episodes} episodes anomalous`}
                               style={{
                                 color: "#4ab0e8", fontSize: "10px",
                                 background: "#0d2535", padding: "1px 5px",
@@ -353,9 +461,7 @@ export default function OrgFamilyDrilldown({ family, apiBase, onMacSiteSelect, o
                                 whiteSpace: "nowrap",
                               }}
                             >
-                              {row.markov_scoreable_episodes > 0
-                                ? `${Math.round(row.markov_episode_anomaly_ratio * 100)}%`
-                                : "▲"}
+                              {row.markov_reason || "chain"}
                             </span>
                           ) : row.markov_scoreable_episodes > 0 ? (
                             <span
@@ -383,7 +489,7 @@ export default function OrgFamilyDrilldown({ family, apiBase, onMacSiteSelect, o
           )}
 
           <div style={{ marginTop: "8px", fontSize: "11px", color: "#444" }}>
-            ▲IF = Isolation Forest outlier within site peer group. DBSCAN = flagged site-wide. Markov = % of connection episodes with anomalous event sequences (hover for episode counts). Click a row to open MAC timeline.
+            ▲IF = Isolation Forest outlier within site peer group. DBSCAN = flagged site-wide. Markov = anomaly (anomalous connection-chain transitions) or repeated (stuck failure loop) — hover for episode counts. Click a row to open MAC timeline.
           </div>
         </>
       )}
