@@ -84,7 +84,7 @@ function successColor(ratio) {
 }
 
 const thStyle = {
-  padding: "6px 8px",
+  padding: "5px 5px",
   borderBottom: "1px solid #333",
   color: "#666",
   textAlign: "left",
@@ -93,7 +93,7 @@ const thStyle = {
 };
 
 const tdStyle = {
-  padding: "5px 8px",
+  padding: "4px 5px",
   borderBottom: "1px solid #1e1e1e",
 };
 
@@ -181,6 +181,11 @@ export default function OrgFamilyInsights({ apiBase, refreshToken, onMacSiteSele
       vb = families[b].worst_markov_ratio ?? 0;
     } else if (sortKey === "health") {
       va = families[a].health_score ?? -1; vb = families[b].health_score ?? -1;
+    } else if (sortKey === "service_alarm") {
+      va = (families[a].service_alarms ?? []).length;
+      vb = (families[b].service_alarms ?? []).length;
+    } else if (sortKey === "count") {
+      va = families[a].client_count ?? 0; vb = families[b].client_count ?? 0;
     } else if (sortKey === "events") {
       va = families[a].total_events ?? 0; vb = families[b].total_events ?? 0;
     } else if (sortKey === "sites") {
@@ -192,6 +197,12 @@ export default function OrgFamilyInsights({ apiBase, refreshToken, onMacSiteSele
     }
     if (va < vb) return sortDir === "asc" ? -1 : 1;
     if (va > vb) return sortDir === "asc" ? 1 : -1;
+    // Tiebreak for service_alarm: worse health first (ascending health score)
+    if (sortKey === "service_alarm") {
+      const ha = families[a].health_score ?? 1;
+      const hb = families[b].health_score ?? 1;
+      if (ha !== hb) return ha - hb;
+    }
     // tiebreak: total_events desc
     return (families[b].total_events ?? 0) - (families[a].total_events ?? 0);
   });
@@ -199,11 +210,13 @@ export default function OrgFamilyInsights({ apiBase, refreshToken, onMacSiteSele
   // Aggregate "All Other" row
   const otherCounts = {};
   let otherTotal = 0;
+  let otherClientCount = 0;
   for (const f of other) {
     for (const cat of CATEGORIES) {
       otherCounts[cat] = (otherCounts[cat] ?? 0) + (families[f].categories?.[cat]?.count ?? 0);
     }
     otherTotal += families[f].total_events ?? 0;
+    otherClientCount += families[f].client_count ?? 0;
   }
 
   if (display.length === 0 && other.length === 0) {
@@ -224,11 +237,30 @@ export default function OrgFamilyInsights({ apiBase, refreshToken, onMacSiteSele
         </span>
       </div>
 
-      <div style={{ display: "flex", gap: "28px", alignItems: "flex-start" }}>
+      <div style={{ display: "flex", gap: "16px", alignItems: "flex-start" }}>
       <div style={{ overflowX: "auto", flex: "1 1 auto", minWidth: 0 }}>
         <table style={{ borderCollapse: "collapse", fontSize: "12px" }}>
           <thead>
             <tr>
+              <th
+                style={{ ...thStyle, whiteSpace: "nowrap", cursor: "pointer", userSelect: "none" }}
+                title="Count — total MACs in this device family across all sites."
+                onClick={() => handleSort("count")}
+              >
+                Count<SortIndicator active={sortKey === "count"} dir={sortDir} />
+              </th>
+              <th
+                style={{ ...thStyle, whiteSpace: "nowrap", color: "#444", cursor: "pointer", userSelect: "none" }}
+                onClick={() => handleSort("events")}
+              >
+                Events<SortIndicator active={sortKey === "events"} dir={sortDir} />
+              </th>
+              <th
+                style={{ ...thStyle, whiteSpace: "nowrap", color: "#444", cursor: "pointer", userSelect: "none" }}
+                onClick={() => handleSort("sites")}
+              >
+                Sites<SortIndicator active={sortKey === "sites"} dir={sortDir} />
+              </th>
               <th
                 style={{ ...thStyle, cursor: "pointer", userSelect: "none" }}
                 onClick={() => handleSort("family")}
@@ -257,29 +289,18 @@ export default function OrgFamilyInsights({ apiBase, refreshToken, onMacSiteSele
                 Markov<SortIndicator active={sortKey === "markov"} dir={sortDir} />
               </th>
               <th
-                style={{ ...thStyle, whiteSpace: "nowrap", minWidth: "90px", cursor: "pointer", userSelect: "none" }}
+                style={{ ...thStyle, whiteSpace: "nowrap", minWidth: "70px", cursor: "pointer", userSelect: "none" }}
                 title="Family health score — volume-weighted failure rate across AUTH, ROAM, DHCP, DNS, ARP org-wide. 1.0 = no failures."
                 onClick={() => handleSort("health")}
               >
                 Health<SortIndicator active={sortKey === "health"} dir={sortDir} />
               </th>
               <th
-                style={{ ...thStyle, whiteSpace: "nowrap", minWidth: "100px" }}
-                title="Service Alarm — services where >50% of clients in this family are individually unhealthy across the entire org-wide device-family scope."
+                style={{ ...thStyle, whiteSpace: "nowrap", minWidth: "80px", cursor: "pointer", userSelect: "none" }}
+                title="Service Alarm — services where >50% of clients in this family are individually unhealthy across the entire org-wide device-family scope. Sort by alarm count (ties broken by worst health)."
+                onClick={() => handleSort("service_alarm")}
               >
-                Service Alarm
-              </th>
-              <th
-                style={{ ...thStyle, whiteSpace: "nowrap", color: "#444", cursor: "pointer", userSelect: "none" }}
-                onClick={() => handleSort("events")}
-              >
-                Events<SortIndicator active={sortKey === "events"} dir={sortDir} />
-              </th>
-              <th
-                style={{ ...thStyle, whiteSpace: "nowrap", color: "#444", cursor: "pointer", userSelect: "none" }}
-                onClick={() => handleSort("sites")}
-              >
-                Sites<SortIndicator active={sortKey === "sites"} dir={sortDir} />
+                Service Alarm<SortIndicator active={sortKey === "service_alarm"} dir={sortDir} />
               </th>
               {CATEGORIES.map(c => (
                 <th
@@ -321,6 +342,26 @@ export default function OrgFamilyInsights({ apiBase, refreshToken, onMacSiteSele
               const rowBg = isSaFamily ? SA_BG : undefined;
               return (
                 <tr key={family} style={rowBg ? { background: rowBg } : undefined}>
+                  {/* Count — device family size (MACs across all sites) */}
+                  <td
+                    style={{ ...tdStyle, textAlign: "right", color: "#aaa", fontSize: "11px", fontVariantNumeric: "tabular-nums" }}
+                    title={`${fdata.client_count ?? 0} MACs in ${family} across all sites`}
+                  >
+                    {fdata.client_count ?? 0}
+                  </td>
+
+                  {/* Event count */}
+                  <td style={{ ...tdStyle, textAlign: "right", color: "#555", fontSize: "11px", fontVariantNumeric: "tabular-nums" }}>
+                    {fdata.total_events > 999
+                      ? `${(fdata.total_events / 1000).toFixed(1)}k`
+                      : fdata.total_events}
+                  </td>
+
+                  {/* Site count */}
+                  <td style={{ ...tdStyle, textAlign: "center", color: "#555", fontSize: "11px" }}>
+                    {siteCount}/{sitesTotal}
+                  </td>
+
                   {/* Family name — clickable to drill down */}
                   <td
                     style={{ ...tdStyle, whiteSpace: "nowrap", cursor: "pointer" }}
@@ -338,11 +379,6 @@ export default function OrgFamilyInsights({ apiBase, refreshToken, onMacSiteSele
                         title={saMembers.length ? `Spans ${saMembers.length} device families: ${saMembers.join(", ")}` : "Service account"}
                       >
                         SVC ACCT
-                      </span>
-                    )}
-                    {fdata.client_count > 0 && (
-                      <span style={{ color: "#444", fontSize: "11px", marginLeft: "6px" }}>
-                        ({fdata.client_count})
                       </span>
                     )}
                   </td>
@@ -431,7 +467,7 @@ export default function OrgFamilyInsights({ apiBase, refreshToken, onMacSiteSele
                           .join("\n")
                       : "Health score not yet computed";
                     return (
-                      <td style={{ ...tdStyle, minWidth: "90px" }} title={tip}>
+                      <td style={{ ...tdStyle, minWidth: "70px" }} title={tip}>
                         {score != null ? (
                           <div style={{ display: "flex", alignItems: "center", gap: "5px" }}>
                             <div style={{ flex: 1, height: "5px", background: "#1a1a1a", borderRadius: "3px", overflow: "hidden" }}>
@@ -449,23 +485,11 @@ export default function OrgFamilyInsights({ apiBase, refreshToken, onMacSiteSele
                   })()}
 
                   {/* Service Alarm — per-family service cards (org-wide rollup) */}
-                  <td style={{ ...tdStyle, minWidth: "100px" }}>
+                  <td style={{ ...tdStyle, minWidth: "80px" }}>
                     <ServiceAlarmCards
                       alarms={fdata.service_alarms || []}
                       serviceHealth={fdata.service_health || {}}
                     />
-                  </td>
-
-                  {/* Event count */}
-                  <td style={{ ...tdStyle, textAlign: "right", color: "#555", fontSize: "11px", fontVariantNumeric: "tabular-nums" }}>
-                    {fdata.total_events > 999
-                      ? `${(fdata.total_events / 1000).toFixed(1)}k`
-                      : fdata.total_events}
-                  </td>
-
-                  {/* Site count */}
-                  <td style={{ ...tdStyle, textAlign: "center", color: "#555", fontSize: "11px" }}>
-                    {siteCount}/{sitesTotal}
                   </td>
 
                   {/* Category cells */}
@@ -485,7 +509,7 @@ export default function OrgFamilyInsights({ apiBase, refreshToken, onMacSiteSele
                       <td
                         key={cat}
                         title={`${family} / ${cat}: ${count.toLocaleString()} events (${(ratio * 100).toFixed(1)}% of family events org-wide)`}
-                        style={{ ...tdStyle, background: bg, textAlign: "center", minWidth: "28px" }}
+                        style={{ ...tdStyle, background: bg, textAlign: "center", minWidth: "22px" }}
                       >
                         {count > 0 && (
                           <span style={{ fontSize: "10px", color: textCol }}>
@@ -502,6 +526,13 @@ export default function OrgFamilyInsights({ apiBase, refreshToken, onMacSiteSele
             {/* All Other Devices row */}
             {other.length > 0 && (
               <tr style={{ borderTop: "1px solid #2a2a2a" }}>
+                <td style={{ ...tdStyle, textAlign: "right", color: "#555", fontSize: "11px", fontVariantNumeric: "tabular-nums" }}>
+                  {otherClientCount}
+                </td>
+                <td style={{ ...tdStyle, textAlign: "right", color: "#444", fontSize: "11px" }}>
+                  {otherTotal > 999 ? `${(otherTotal / 1000).toFixed(1)}k` : otherTotal}
+                </td>
+                <td style={{ ...tdStyle }} />
                 <td style={{ ...tdStyle, whiteSpace: "nowrap", color: "#555", fontStyle: "italic" }}>
                   <span style={{
                     display: "inline-block", width: 8, height: 8,
@@ -524,10 +555,6 @@ export default function OrgFamilyInsights({ apiBase, refreshToken, onMacSiteSele
                 </td>
                 <td style={tdStyle} />
                 <td style={tdStyle} />
-                <td style={{ ...tdStyle, textAlign: "right", color: "#444", fontSize: "11px" }}>
-                  {otherTotal > 999 ? `${(otherTotal / 1000).toFixed(1)}k` : otherTotal}
-                </td>
-                <td style={{ ...tdStyle }} />
                 {CATEGORIES.map(cat => {
                   const count = otherCounts[cat] ?? 0;
                   const ratio = otherTotal > 0 ? count / otherTotal : 0;
@@ -539,7 +566,7 @@ export default function OrgFamilyInsights({ apiBase, refreshToken, onMacSiteSele
                     <td
                       key={cat}
                       title={`All Other / ${cat}: ${count.toLocaleString()} events`}
-                      style={{ ...tdStyle, background: bg, textAlign: "center", minWidth: "28px" }}
+                      style={{ ...tdStyle, background: bg, textAlign: "center", minWidth: "22px" }}
                     >
                       {count > 0 && (
                         <span style={{ fontSize: "10px", color: textCol }}>

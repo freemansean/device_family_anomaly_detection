@@ -20,9 +20,12 @@ const SA_BG    = "#2a1f15";
 // Default — overridden at runtime by anomaly-config endpoint
 const HEALTH_THRESHOLD_DEFAULT = 0.75;
 
-function shapleyScoreFromIfScore(ifScore) {
-  if (ifScore == null) return null;
-  return Math.max(0, Math.min(100, Math.round((0.5 - ifScore) / 1.0 * 100)));
+function shapleyScoreFromCentroidDist(dist) {
+  // Cosine distance on L2-normalized unit vectors ranges 0 (identical) to 2 (opposite).
+  // In practice healthy families sit near 0 and flagged families exceed ~0.35.
+  // Map linearly to 0–100 with 0 dist → 0 and 1.0 dist → 100.
+  if (dist == null) return null;
+  return Math.max(0, Math.min(100, Math.round(dist * 100)));
 }
 
 function shapleyColor(score) {
@@ -262,13 +265,13 @@ function AnomalyFindingCard({ finding, healthData, isAlert, expanded, onToggle, 
       <div style={{ marginTop: "10px" }}>
         <ShapleyBlock
           label="Device Family Behavior Explanation"
-          score={shapleyScoreFromIfScore(finding.centroid_if_score)}
+          score={shapleyScoreFromCentroidDist(finding.centroid_dist_score)}
           features={finding.top_features}
           description={
-            finding.centroid_if_score != null
-              ? `Family centroid IF score ${finding.centroid_if_score.toFixed(4)} — measures how distinctly this family's collective behavior differs from all other families at this site.`
+            finding.centroid_dist_score != null
+              ? `Cosine distance from healthy reference ${finding.centroid_dist_score.toFixed(4)} — measures how far this family's collective behavior sits from the healthy-family centroid.`
               : finding.is_family_outlier
-                ? "This family's collective behavior is flagged as anomalous relative to other families."
+                ? "This family's collective behavior is flagged as anomalous relative to the healthy-family reference."
                 : "Anomaly driven by individual device deviations within the family."
           }
         />

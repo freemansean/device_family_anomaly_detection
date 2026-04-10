@@ -67,28 +67,40 @@ Mist API
 
 ---
 
-## Quick Start
+## Quick Start (for hackathon evaluators)
 
 ```bash
 cd unsupervised_anomaly
 
-# One-time setup: installs venv, npm deps, builds frontend
+# 1. One-time setup — creates .venv, installs Python + npm deps, builds the
+#    frontend, and bootstraps a .env file from .env.example if one does not
+#    already exist.
 ./setup.sh
 
-# Copy and fill in your credentials
-cp .env.example .env
-$EDITOR .env
+# 2. Fill in your Mist credentials. Without these, the dashboard loads but
+#    "Collect Events" will fail — there is no sample-data / demo mode.
+$EDITOR .env        # set MIST_API_TOKEN, MIST_ORG_ID, MIST_CLOUD_HOST
 
-# Start everything (Redis, backend on :8000, frontend on :3000)
+# 3. Start everything (Redis, backend on :8000, frontend on :3000).
 ./start.sh
 ```
 
-Open [http://localhost:3000](http://localhost:3000).
+Open [http://localhost:3000](http://localhost:3000) and log in with the
+credentials in `.env` (default: `admin` / `changeme`).
 
 To stop all services:
 
 ```bash
 ./stop.sh
+```
+
+**LAN access:** the committed frontend build points at `http://localhost:8000`.
+To build the frontend against a backend reachable on your LAN instead, drop an
+override into the gitignored `sasquatch/frontend/.env.production.local`:
+
+```bash
+echo 'VITE_API_BASE_URL=http://192.0.2.10:8000' > sasquatch/frontend/.env.production.local
+./setup.sh    # rebuild the frontend with the override
 ```
 
 ---

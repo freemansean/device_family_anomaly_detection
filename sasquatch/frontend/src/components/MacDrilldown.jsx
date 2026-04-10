@@ -4,77 +4,6 @@ import { apiFetch } from "../api";
 const SA_COLOR = "#d4a06a";
 const SA_BG = "#2a1f15";
 
-function shapleyScoreFromIfScore(ifScore) {
-  if (ifScore == null) return null;
-  return Math.max(0, Math.min(100, Math.round((0.5 - ifScore) / 1.0 * 100)));
-}
-
-function shapleyColor(score) {
-  if (score >= 60) return "#e05555";
-  if (score >= 35) return "#e0a835";
-  return "#4ea8c4";
-}
-
-function ShapleyBlock({ label, score, features, description }) {
-  const color = score != null ? shapleyColor(score) : "#666";
-  return (
-    <div style={{
-      background: "#0e0e0e",
-      border: `1px solid ${color}33`,
-      borderLeft: `3px solid ${color}`,
-      borderRadius: "3px",
-      padding: "10px 12px",
-      marginBottom: "16px",
-    }}>
-      <div style={{ display: "flex", alignItems: "center", gap: "12px", marginBottom: "6px" }}>
-        <span style={{ fontSize: "11px", color: "#666", textTransform: "uppercase", letterSpacing: "0.06em" }}>
-          {label}
-        </span>
-        {score != null && (
-          <div style={{ display: "flex", alignItems: "center", gap: "8px", flex: 1 }}>
-            <div style={{ flex: 1, height: "6px", background: "#1a1a1a", borderRadius: "3px", overflow: "hidden" }}>
-              <div style={{ width: `${score}%`, height: "100%", background: color, borderRadius: "3px" }} />
-            </div>
-            <span style={{ fontSize: "13px", fontWeight: "bold", color, minWidth: "36px", textAlign: "right" }}>
-              {score}<span style={{ fontSize: "10px", color: "#555" }}>/100</span>
-            </span>
-          </div>
-        )}
-        {score == null && (
-          <span style={{ fontSize: "11px", color: "#444" }}>score unavailable — too few family peers</span>
-        )}
-      </div>
-      {description && (
-        <div style={{ fontSize: "11px", color: "#555", marginBottom: features?.length > 0 ? "6px" : 0 }}>
-          {description}
-        </div>
-      )}
-      {features?.length > 0 && (
-        <div style={{ display: "flex", flexDirection: "column", gap: "3px" }}>
-          {features.slice(0, 5).map((f, i) => {
-            const delta = Math.abs(f.outlier_mean - f.baseline_mean);
-            const barWidth = Math.min(delta * 400, 100);
-            return (
-              <div key={i} style={{ display: "flex", alignItems: "center", gap: "8px" }}>
-                <span style={{ fontSize: "10px", color: "#777", width: "240px", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flexShrink: 0 }}
-                  title={f.feature}>
-                  {f.feature}
-                </span>
-                <div style={{ flex: 1, height: "5px", background: "#1a1a1a", borderRadius: "2px", overflow: "hidden" }}>
-                  <div style={{ width: `${barWidth}%`, height: "100%", background: color + "99", borderRadius: "2px" }} />
-                </div>
-                <span style={{ fontSize: "10px", color, minWidth: "58px", textAlign: "right" }}>
-                  {f.outlier_mean.toFixed(3)} vs {f.baseline_mean.toFixed(3)}
-                </span>
-              </div>
-            );
-          })}
-        </div>
-      )}
-    </div>
-  );
-}
-
 const EVENT_COLOR = {
   DHCP_SUCCESS: "#2d7a4f",
   DHCP_FAILURE: "#c83232",
@@ -221,7 +150,6 @@ export default function MacDrilldown({ siteId, mac, apiBase, onBack, wlan }) {
   const meta = data.client_metadata || {};
   const vector = data.feature_vector || {};
   const events = data.events || [];
-  const shapleyFeatures = data.shapley_features || [];
 
   const isOutlier = scores.is_outlier;
   const severityColor = isOutlier ? "#e05555" : "#2d7a4f";
@@ -258,17 +186,6 @@ export default function MacDrilldown({ siteId, mac, apiBase, onBack, wlan }) {
           {isOutlier ? "ANOMALOUS" : "NORMAL"}
         </span>
       </div>
-
-      <ShapleyBlock
-        label="Intra-Device Family Anomaly"
-        score={shapleyScoreFromIfScore(scores.if_score)}
-        features={shapleyFeatures}
-        description={
-          scores.if_score != null
-            ? `IF score ${scores.if_score.toFixed(4)} within ${meta.family || "this"} peer group — how much this device's behavior deviates from its family.`
-            : `Too few ${meta.family || "family"} peers at this site to score intra-family deviation.`
-        }
-      />
 
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "16px", marginBottom: "20px" }}>
         {/* Client metadata */}
@@ -436,7 +353,6 @@ export default function MacDrilldown({ siteId, mac, apiBase, onBack, wlan }) {
               ["SA family is anomalous", scores.service_account.is_family_outlier ? "Yes" : "No"],
               ["Outlier vs SA peers", scores.service_account.is_if_outlier ? "Yes" : "No"],
               ["SA IF score", scores.service_account.if_score != null ? scores.service_account.if_score.toFixed(4) : "N/A (too few peers)"],
-              ["SA centroid IF score", scores.service_account.centroid_if_score != null ? scores.service_account.centroid_if_score.toFixed(4) : "—"],
               ["SA centroid distance", scores.service_account.centroid_dist_score != null ? scores.service_account.centroid_dist_score.toFixed(4) : "—"],
             ].map(([label, value]) => (
               <div key={label} style={{ display: "flex", justifyContent: "space-between", borderBottom: "1px solid #1e1e1e", padding: "3px 0" }}>

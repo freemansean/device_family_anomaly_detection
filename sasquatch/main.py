@@ -16,7 +16,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from client_anomaly.api.auth import auth_router
 from client_anomaly.api.routes import router
-from client_anomaly.scheduler import create_scheduler
+from client_anomaly.scheduler import clear_stale_global_lock, create_scheduler
 
 logging.basicConfig(
     level=logging.INFO,
@@ -29,6 +29,10 @@ _scheduler = create_scheduler()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # A fresh process can't possibly be mid-flight on a background job, so any
+    # lock left in Redis is stale from a previous run that crashed or was
+    # killed before it could release. Clear it before the scheduler starts.
+    await clear_stale_global_lock()
     _scheduler.start()
     log.info("APScheduler started")
     yield

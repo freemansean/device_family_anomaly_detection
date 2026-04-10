@@ -30,6 +30,7 @@ from sklearn.preprocessing import StandardScaler
 from ..anomaly_detector import (
     _anomalies_redis_key,
     _findings_redis_key,
+    _org_anomalies_redis_key,
     _org_findings_redis_key,
     get_anomalies,
     get_findings,
@@ -52,9 +53,13 @@ from ..scheduler import (
     _LAST_COLLECTION_KEY,
     _ORG_DETECT_PROGRESS_KEY,
     _ORG_DETECT_PROGRESS_TTL,
+    _run_org_pipeline_body,
+    _transfer_global_lock,
+    get_auto_detect_enabled,
     get_global_lock_status,
     get_job_status,
     run_org_pipeline,
+    set_auto_detect_enabled,
 )
 from .. import alert_tracker
 from ..webhook_dispatcher import evaluate_and_dispatch, run_family_tshoot
@@ -68,8 +73,20 @@ REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 MIST_API_TOKEN = os.getenv("MIST_API_TOKEN", "")
 MIST_CLOUD_HOST = os.getenv("MIST_CLOUD_HOST", "api.mist.com")
 MIST_ORG_ID = os.getenv("MIST_ORG_ID", "")
-_random_state_env = os.getenv("ANOMALY_RANDOM_STATE", "42")
-_VIZ_RANDOM_STATE: int | None = None if _random_state_env.strip() == "-1" else int(_random_state_env)
+
+
+def _viz_random_state() -> int | None:
+    """Resolve the visualization PCA random seed at call time.
+
+    Reads `anomaly.anomaly_random_state` through the config module so GUI-set
+    overrides in config_overrides.json take effect without a restart. A value
+    of -1 means "non-deterministic" and returns None.
+    """
+    try:
+        val = int(_config_mod.get("anomaly", "anomaly_random_state"))
+    except (KeyError, ValueError, TypeError):
+        val = 42
+    return None if val == -1 else val
 
 
 # Module-level connection pool — created on first use after load_dotenv() has run.
@@ -100,7 +117,7 @@ def _run_pca(X: np.ndarray) -> tuple[np.ndarray, list[float]]:
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X)
     n_components = min(2, X_scaled.shape[0], X_scaled.shape[1])
-    pca = PCA(n_components=n_components, random_state=_VIZ_RANDOM_STATE)
+    pca = PCA(n_components=n_components, random_state=_viz_random_state())
     coords = pca.fit_transform(X_scaled)
     if coords.shape[1] == 1:
         coords = np.hstack([coords, np.zeros((coords.shape[0], 1))])
@@ -279,6 +296,39 @@ async def _org_collect_background_task() -> None:
             ),
         })
 
+        # ── Auto-chain: detect after collect ─────────────────────────────
+        # Rewrite the global lock in place from "collecting" → "detecting"
+        # so a manual trigger cannot sneak in between the two phases. We
+        # keep the same redis_client (and therefore hold the lock the whole
+        # time) — the finally block below still deletes the lock key.
+        if await get_auto_detect_enabled():
+            log.info("[org-collect] Auto-detect enabled — chaining to detection pipeline")
+            await _transfer_global_lock(redis_client, "detecting")
+            try:
+                site_map = await _get_org_site_map(redis_client)
+            except Exception:
+                log.exception("[org-collect] Auto-detect: failed to fetch site map — skipping detect")
+            else:
+                site_ids = list(site_map.keys())
+
+                async def _write_detect_progress(data: dict) -> None:
+                    await redis_client.set(
+                        _ORG_DETECT_PROGRESS_KEY,
+                        json.dumps(data),
+                        ex=_ORG_DETECT_PROGRESS_TTL,
+                    )
+
+                try:
+                    await _run_org_pipeline_body(
+                        site_ids=site_ids,
+                        site_map=site_map,
+                        progress_callback=_write_detect_progress,
+                    )
+                except Exception:
+                    log.exception("[org-collect] Auto-detect chain failed")
+        else:
+            log.debug("[org-collect] Auto-detect disabled — skipping chained detection")
+
     except Exception as exc:
         log.exception("Org-level collection failed")
         await wp({"phase": "error", "message": str(exc)})
@@ -323,6 +373,19 @@ async def get_org_collect_progress():
         await redis_client.aclose()
 
 
+@router.get("/org/hourly-progress")
+async def get_org_hourly_progress():
+    """Return progress of the hourly org-level event poll (same schema as collect-progress)."""
+    redis_client = _get_redis()
+    try:
+        raw = await redis_client.get("sasquatch:progress:org_hourly_poll")
+        if raw:
+            return json.loads(raw)
+        return {"phase": "idle"}
+    finally:
+        await redis_client.aclose()
+
+
 @router.get("/org/job-status")
 async def get_org_job_status():
     """
@@ -356,6 +419,27 @@ async def set_org_polling(body: dict):
     finally:
         await redis_client.aclose()
     log.info(f"Org event polling {'enabled' if enabled else 'disabled'}")
+    return {"enabled": enabled}
+
+
+@router.get("/org/auto-detect")
+async def get_org_auto_detect():
+    """
+    Return whether auto-chain detection is enabled. When true, a successful
+    manual full collect or hourly poll will automatically run the org
+    detection pipeline immediately after the collect completes.
+
+    Default: enabled (missing Redis key counts as on).
+    """
+    return {"enabled": await get_auto_detect_enabled()}
+
+
+@router.post("/org/auto-detect")
+async def set_org_auto_detect(body: dict):
+    """Enable or disable auto-chain detection after collects."""
+    enabled = bool(body.get("enabled", True))
+    await set_auto_detect_enabled(enabled)
+    log.info(f"Auto-detect {'enabled' if enabled else 'disabled'}")
     return {"enabled": enabled}
 
 
@@ -460,6 +544,9 @@ async def set_general_config(body: dict):
     int_bounds = {
         "org_detection_interval_hours": (1, 168),
         "anomaly_min_mac_events": (1, 10000),
+        "alarm_min_family_size": (1, 1000),
+        # Negative dBm. -120 is effectively "off" (below noise floor).
+        "anomaly_rssi_min_threshold": (-120, 0),
     }
     for key, (lo, hi) in int_bounds.items():
         if key in body:
@@ -489,7 +576,6 @@ async def set_anomaly_config(body: dict):
 
     float_bounds = {
         "anomaly_if_contamination": (0.01, 0.5),
-        "anomaly_centroid_if_contamination": (0.01, 0.5),
         "anomaly_dbscan_pca_variance": (0.5, 1.0),
         "anomaly_dbscan_eps": (0.01, 100.0),
         "anomaly_dbscan_family_noise_threshold": (0.0, 1.0),
@@ -507,8 +593,6 @@ async def set_anomaly_config(body: dict):
         "anomaly_min_peers": (1, 500),
         "anomaly_dbscan_min_samples": (1, 500),
         "anomaly_dbscan_min_family_size": (1, 500),
-        "anomaly_centroid_if_min_families": (1, 100),
-        "anomaly_centroid_dist_max_families": (1, 200),
         "anomaly_centroid_healthy_ref_min": (1, 100),
         "anomaly_finding_min_size": (1, 500),
         "markov_min_episode_length": (1, 100),
@@ -606,18 +690,22 @@ async def get_org_summary(wlan: str = Query(..., description="WLAN (SSID) name t
         raw_org = pipeline_results[n * 2]
         org_findings = json.loads(raw_org) if raw_org else []
 
-        from ..webhook_dispatcher import get_health_score_threshold
+        from ..webhook_dispatcher import get_alarm_min_family_size, get_health_score_threshold
         _SUMMARY_HEALTH_THRESHOLD = get_health_score_threshold()
+        _SUMMARY_MIN_FAMILY_SIZE = int(get_alarm_min_family_size())
 
         result = []
         for sid, site_name in sites_sorted:
             findings = findings_by_site[sid]
             health = health_by_site[sid]
             event_count = events_per_site.get(sid, 0)
-            # alert_count: families that are both anomalous (in findings) AND unhealthy
+            # alert_count: families that are both anomalous (in findings) AND unhealthy.
+            # Tiny families below alarm_min_family_size are suppressed to stay in sync
+            # with webhook dispatch and the OrgAlerts feed.
             alert_count = sum(
                 1 for f in findings
                 if health.get(f.get("device_family"), {}).get("health_score", 1.0) < _SUMMARY_HEALTH_THRESHOLD
+                and (f.get("total_mac_count", 0) or 0) >= _SUMMARY_MIN_FAMILY_SIZE
             )
             result.append({
                 "site_id": sid,
@@ -640,7 +728,9 @@ async def get_org_summary(wlan: str = Query(..., description="WLAN (SSID) name t
         "org_moderate_count": sum(1 for f in org_findings if f.get("severity") == "moderate"),
         "org_minimal_count": sum(1 for f in org_findings if f.get("severity") == "minimal"),
         "org_alert_count": sum(
-            1 for f in org_findings if f.get("health_score", 1.0) < _SUMMARY_HEALTH_THRESHOLD
+            1 for f in org_findings
+            if f.get("health_score", 1.0) < _SUMMARY_HEALTH_THRESHOLD
+            and (f.get("total_mac_count", 0) or 0) >= _SUMMARY_MIN_FAMILY_SIZE
         ),
         "org_finding_count": len(org_findings),
     }
@@ -809,6 +899,69 @@ async def trigger_org_client_refresh():
     }
 
 
+@router.get("/org/clients/search")
+async def search_org_clients(
+    mac: str = Query(..., description="MAC address prefix — colons/hyphens/whitespace optional"),
+    limit: int = Query(50, ge=1, le=200, description="Max matches to return"),
+):
+    """
+    Prefix-search the org client cache by MAC address.
+
+    Efficient because ``clients.mac`` is the PRIMARY KEY — a leading-anchored
+    ``LIKE 'prefix%'`` uses the PK index for a range scan (O(log n + results))
+    rather than a full table scan. Each hit is enriched with the most-recent
+    event site_id / wlan / timestamp so the frontend can click-through directly
+    into a MAC drilldown that has data.
+
+    The caller passes any common MAC format (``aa:bb:cc``, ``aa-bb-cc``,
+    ``aabbcc``) — the helper strips separators and lowercases before matching.
+    An input with zero hex characters returns an empty result set without
+    hitting the DB.
+
+    Returns::
+
+      {
+        "query": "aabbcc",
+        "results": [
+          {
+            "mac": "aabbccddee01",
+            "family": "MacBook",
+            "manufacturer": "Apple",
+            "last_username": "srv_Apple_EP",
+            "last_site_id": "abc-123",
+            "last_event_site_id": "abc-123",
+            "last_event_wlan": "Corp-WiFi",
+            "last_event_ts": 1775014952.642,
+            "event_count": 142
+          },
+          ...
+        ],
+        "truncated": false
+      }
+    """
+    from .. import db as _db
+
+    # Defensive normalisation mirrors the db helper so the echoed ``query`` field
+    # reflects what actually got matched against.
+    import re as _re
+    norm = _re.sub(r"[^0-9a-f]", "", (mac or "").lower())[:12]
+    if len(norm) < 2:
+        # Require at least 2 hex chars to avoid returning the entire table on a
+        # single-char fragment. Common practice for search-as-you-type.
+        return {"query": norm, "results": [], "truncated": False}
+
+    results = await _db.search_clients_by_mac_prefix(
+        mac_prefix=norm,
+        org_id=MIST_ORG_ID or None,
+        limit=limit,
+    )
+    return {
+        "query": norm,
+        "results": results,
+        "truncated": len(results) >= limit,
+    }
+
+
 _ORG_SITES_CACHE_KEY = "sasquatch:org_sites_map"
 _ORG_SITES_CACHE_TTL = 300  # 5 minutes
 
@@ -970,8 +1123,9 @@ async def get_org_alerts(wlan: str = Query(..., description="WLAN (SSID) name to
     if not MIST_ORG_ID or not MIST_API_TOKEN:
         raise HTTPException(status_code=500, detail="MIST_ORG_ID or MIST_API_TOKEN not configured.")
 
-    from ..webhook_dispatcher import get_health_score_threshold
+    from ..webhook_dispatcher import get_alarm_min_family_size, get_health_score_threshold
     _ALERT_HEALTH_THRESHOLD = get_health_score_threshold()
+    _ALARM_MIN_FAMILY_SIZE = int(get_alarm_min_family_size())
 
     redis_client = _get_redis()
     try:
@@ -1004,9 +1158,11 @@ async def get_org_alerts(wlan: str = Query(..., description="WLAN (SSID) name to
 
     # Org-wide alerts: org findings where any family-level anomaly flag is set AND unhealthy.
     # Any of centroid IF, DBSCAN past threshold, or Markov qualifies — not just centroid.
+    # Tiny families below alarm_min_family_size are suppressed (same gate as webhook dispatch).
     org_alerts = [
         f for f in org_findings
         if f.get("health_score", 1.0) < _ALERT_HEALTH_THRESHOLD
+        and (f.get("total_mac_count", 0) or 0) >= _ALARM_MIN_FAMILY_SIZE
         and (
             f.get("is_family_outlier")
             or f.get("is_family_dbscan_outlier")
@@ -1017,7 +1173,8 @@ async def get_org_alerts(wlan: str = Query(..., description="WLAN (SSID) name to
         for sa in f.get("sites_affected", []):
             sa["site_name"] = site_map.get(sa["site_id"], sa["site_id"])
 
-    # Per-site alerts: per-site findings cross-referenced with per-site health
+    # Per-site alerts: per-site findings cross-referenced with per-site health.
+    # Tiny families below alarm_min_family_size are suppressed (same gate as webhook dispatch).
     site_alerts = []
     for sid, site_name in sites_sorted:
         findings = findings_by_site[sid]
@@ -1027,6 +1184,7 @@ async def get_org_alerts(wlan: str = Query(..., description="WLAN (SSID) name to
              "health_components": health.get(f.get("device_family"), {}).get("components")}
             for f in findings
             if health.get(f.get("device_family"), {}).get("health_score", 1.0) < _ALERT_HEALTH_THRESHOLD
+            and (f.get("total_mac_count", 0) or 0) >= _ALARM_MIN_FAMILY_SIZE
         ]
         if alerts:
             site_alerts.append({
@@ -1225,32 +1383,27 @@ async def get_org_family_insights(wlan: str = Query(..., description="WLAN (SSID
         pipe = redis_client.pipeline()
         for sid in site_ids_ordered:
             pipe.get(_findings_redis_key(sid, wlan))
-            pipe.get(_anomalies_redis_key(sid, wlan))
             pipe.get(_health_redis_key(sid, wlan))
             pipe.get(_family_event_counts_redis_key(sid, wlan))
         pipe.get(_org_findings_redis_key(wlan))
         pipeline_results = await pipe.execute()
         n = len(site_ids_ordered)
         findings_by_site = {
-            sid: (json.loads(pipeline_results[i * 4]) if pipeline_results[i * 4] else [])
-            for i, sid in enumerate(site_ids_ordered)
-        }
-        anomalies_by_site_insights = {
-            sid: (json.loads(pipeline_results[i * 4 + 1]) if pipeline_results[i * 4 + 1] else {})
+            sid: (json.loads(pipeline_results[i * 3]) if pipeline_results[i * 3] else [])
             for i, sid in enumerate(site_ids_ordered)
         }
         health_by_site = {
-            sid: (json.loads(pipeline_results[i * 4 + 2]) if pipeline_results[i * 4 + 2] else {})
+            sid: (json.loads(pipeline_results[i * 3 + 1]) if pipeline_results[i * 3 + 1] else {})
             for i, sid in enumerate(site_ids_ordered)
         }
         event_counts_by_site = {
-            sid: (json.loads(pipeline_results[i * 4 + 3]) if pipeline_results[i * 4 + 3] else {})
+            sid: (json.loads(pipeline_results[i * 3 + 2]) if pipeline_results[i * 3 + 2] else {})
             for i, sid in enumerate(site_ids_ordered)
         }
         # family_is_family_outlier and family_worst_dbscan_severity come exclusively from
         # org-wide detection, not per-site findings. IF and DBSCAN badges mean the family
         # was flagged across the whole org population, not just at one site.
-        raw_org_findings = pipeline_results[n * 4]
+        raw_org_findings = pipeline_results[n * 3]
         org_findings_list: list[dict] = json.loads(raw_org_findings) if raw_org_findings else []
         family_is_family_outlier: dict[str, bool] = {
             f["device_family"]: True
@@ -1294,9 +1447,6 @@ async def get_org_family_insights(wlan: str = Query(..., description="WLAN (SSID
         family_site_count: Counter = Counter()
         # mac_count is summed across sites (same device at multiple sites counted once per site).
         family_mac_count: Counter = Counter()
-        # Track worst (most anomalous = most negative) centroid IF score and its top_features
-        family_worst_centroid_if_score: dict[str, float] = {}
-        family_worst_centroid_top_features: dict[str, list] = {}
         # Health score aggregation: weighted sum and total weight per family for averaging
         family_health_weighted_sum: dict[str, float] = defaultdict(float)
         family_health_weight_total: dict[str, float] = defaultdict(float)
@@ -1376,23 +1526,6 @@ async def get_org_family_insights(wlan: str = Query(..., description="WLAN (SSID
                     if sh_val is not None and a > 0:
                         family_svc_health_wsum[fam][svc] += float(sh_val) * a
 
-            # Collect worst centroid IF score from anomaly records (available even when
-            # no finding exists for a family at this site).
-            site_anomaly_map = anomalies_by_site_insights.get(site_id, {})
-            seen_fam_centroid: set[str] = set()
-            for mac_data in site_anomaly_map.values():
-                fam = mac_data.get("device_family")
-                if not fam or fam in seen_fam_centroid:
-                    continue
-                c_score = mac_data.get("family_centroid_if_score")
-                if c_score is not None:
-                    seen_fam_centroid.add(fam)
-                    if fam not in family_worst_centroid_if_score or c_score < family_worst_centroid_if_score[fam]:
-                        family_worst_centroid_if_score[fam] = c_score
-                        # Use top_features from the finding if one exists for this family/site
-                        fam_finding = next((f for f in findings if f.get("device_family") == fam), None)
-                        family_worst_centroid_top_features[fam] = fam_finding.get("top_features", []) if fam_finding else []
-
         all_categories = list(EVENT_CATEGORIES.keys()) + ["OTHER"]
         families_out: dict[str, dict] = {}
         for family, cat_counts in family_event_counts.items():
@@ -1441,8 +1574,6 @@ async def get_org_family_insights(wlan: str = Query(..., description="WLAN (SSID
                 "worst_markov_ratio": org_family_markov_ratio.get(family),
                 "markov_family_reason": org_family_markov_reason.get(family),
                 "outlier_sites": family_outlier_sites.get(family, []),
-                "worst_centroid_if_score": family_worst_centroid_if_score.get(family),
-                "worst_centroid_top_features": family_worst_centroid_top_features.get(family, []),
                 "health_score": health_score,
                 "health_components": health_components,
                 "service_health": service_health_out,
@@ -1509,47 +1640,43 @@ async def get_org_family_drilldown(family: str, wlan: str = Query(..., descripti
             if sid and evt.get("wlan") == wlan:
                 events_by_site[sid].append(evt)
 
-        # Fetch anomalies and findings from Redis, client caches from SQLite
+        # Fetch anomalies and findings from Redis, client caches from SQLite.
+        #
+        # Fallback chain for per-site anomalies:
+        #   1. sasquatch:anomalies:{site}:{wlan}      — written by score() in Phase 4
+        #   2. sasquatch:org_anomalies:{site}:{wlan}  — written by score_org_wide() in Phase 3
+        #
+        # Phase 4 silently skips (site, wlan) combos where build_features wrote an
+        # empty feature dict (every MAC below ANOMALY_MIN_MAC_EVENTS), but Phase 3
+        # still scores those MACs via the org-wide peer pool and writes
+        # org_anomalies keyed by real MAC with an identical record shape. Without
+        # this fallback, the drilldown under-counts any alert card whose MACs were
+        # only scored org-wide — mirroring the fallback already in place in
+        # `get_mac_anomaly` (see routes.py ~2396).
         site_ids_ordered = list(site_map.keys())
         pipe = redis_client.pipeline()
         for sid in site_ids_ordered:
             pipe.get(_anomalies_redis_key(sid, wlan))
             pipe.get(_findings_redis_key(sid, wlan))
+            pipe.get(_org_anomalies_redis_key(sid, wlan))
         pipeline_results = await pipe.execute()
-        anomalies_by_site = {
-            sid: (json.loads(pipeline_results[i * 2]) if pipeline_results[i * 2] else None)
-            for i, sid in enumerate(site_ids_ordered)
-        }
+        anomalies_by_site = {}
+        for i, sid in enumerate(site_ids_ordered):
+            per_site_raw = pipeline_results[i * 3]
+            org_raw = pipeline_results[i * 3 + 2]
+            if per_site_raw:
+                anomalies_by_site[sid] = json.loads(per_site_raw)
+            elif org_raw:
+                anomalies_by_site[sid] = json.loads(org_raw)
+            else:
+                anomalies_by_site[sid] = None
         findings_by_site = {
-            sid: (json.loads(pipeline_results[i * 2 + 1]) if pipeline_results[i * 2 + 1] else [])
+            sid: (json.loads(pipeline_results[i * 3 + 1]) if pipeline_results[i * 3 + 1] else [])
             for i, sid in enumerate(site_ids_ordered)
         }
 
         # Client cache is org-wide (MAC unique across the org) — load once.
         org_client_cache: dict = await get_client_cache() or {}
-
-        # Collect worst centroid IF score from anomaly records across sites.
-        # Reading from per-MAC anomaly records (not findings) means the score is available
-        # even when a family's outlier_ratio is below the finding threshold.
-        worst_centroid_if_score: float | None = None
-        worst_centroid_top_features: list = []
-        for sid in site_ids_ordered:
-            site_anomalies = anomalies_by_site.get(sid)
-            if not site_anomalies:
-                continue
-            seen_score_this_site = False
-            for mac_data in site_anomalies.values():
-                if mac_data.get("device_family") != family:
-                    continue
-                c_score = mac_data.get("family_centroid_if_score")
-                if c_score is not None and not seen_score_this_site:
-                    seen_score_this_site = True
-                    if worst_centroid_if_score is None or c_score < worst_centroid_if_score:
-                        worst_centroid_if_score = c_score
-                        # Pull top_features from the finding for this site/family if available
-                        site_findings = findings_by_site.get(sid, [])
-                        fam_finding = next((f for f in site_findings if f.get("device_family") == family), None)
-                        worst_centroid_top_features = fam_finding.get("top_features", []) if fam_finding else []
 
         for site_id, site_name in site_map.items():
             anomalies_raw_data = anomalies_by_site.get(site_id)
@@ -1687,8 +1814,6 @@ async def get_org_family_drilldown(family: str, wlan: str = Query(..., descripti
         "markov_outlier_count": total_markov_outliers,
         "rows": rows,
         "category_keys": list(EVENT_CATEGORIES.keys()),
-        "worst_centroid_if_score": worst_centroid_if_score,
-        "worst_centroid_top_features": worst_centroid_top_features,
     }
 
 
@@ -2034,10 +2159,10 @@ async def get_family_if_outliers(site_id: str, family: str, wlan: str = Query(..
         all_clients.sort(key=lambda x: (x["if_score"] is None, x["if_score"] or 0))
         if_outlier_count = sum(1 for c in all_clients if c["is_if_outlier"])
 
-        centroid_if_score = next(
-            (anomalies[k].get("family_centroid_if_score")
+        centroid_dist_score = next(
+            (anomalies[k].get("family_centroid_dist_score")
              for k in family_keys
-             if anomalies[k].get("family_centroid_if_score") is not None),
+             if anomalies[k].get("family_centroid_dist_score") is not None),
             None,
         )
         findings = await get_findings(site_id, wlan)
@@ -2054,7 +2179,7 @@ async def get_family_if_outliers(site_id: str, family: str, wlan: str = Query(..
             "total_family_count": len(family_keys),
             "if_outlier_count": if_outlier_count,
             "outliers": all_clients,
-            "centroid_if_score": centroid_if_score,
+            "centroid_dist_score": centroid_dist_score,
             "top_features": family_top_features,
         }
 
@@ -2086,13 +2211,13 @@ async def get_family_if_outliers(site_id: str, family: str, wlan: str = Query(..
     all_clients.sort(key=lambda x: (x["if_score"] is None, x["if_score"] or 0))
     if_outlier_count = sum(1 for c in all_clients if c["is_if_outlier"])
 
-    # Pull centroid_if_score from anomaly records (available for all families where
-    # centroid IF ran, regardless of whether a finding was generated).
+    # Pull centroid_dist_score from anomaly records (available for all families where
+    # centroid distance ran, regardless of whether a finding was generated).
     # Fall back to the stored finding for top_features.
-    centroid_if_score = next(
-        (anomalies[m].get("family_centroid_if_score")
+    centroid_dist_score = next(
+        (anomalies[m].get("family_centroid_dist_score")
          for m in family_macs
-         if anomalies[m].get("family_centroid_if_score") is not None),
+         if anomalies[m].get("family_centroid_dist_score") is not None),
         None,
     )
     findings = await get_findings(site_id, wlan)
@@ -2109,7 +2234,7 @@ async def get_family_if_outliers(site_id: str, family: str, wlan: str = Query(..
         "total_family_count": len(family_macs),
         "if_outlier_count": if_outlier_count,
         "outliers": all_clients,
-        "centroid_if_score": centroid_if_score,
+        "centroid_dist_score": centroid_dist_score,
         "top_features": family_top_features,
     }
 
@@ -2237,10 +2362,22 @@ async def get_mac_anomaly(site_id: str, mac: str, wlan: str = Query(..., descrip
     """
     mac_normalized = mac.replace(":", "").lower()
 
+    # Fallback chain for per-MAC anomaly scores:
+    #   1. Per-site anomalies (written by score() in Phase 4 of the org pipeline)
+    #   2. Org anomalies (written by score_org_wide() in Phase 3 — explicitly persisted
+    #      per-site keyed by MAC for exactly this drilldown use case)
+    # The per-site key is absent for many (site, wlan) combinations in practice
+    # (e.g. when Phase 4 was skipped or the WLAN had too few peers to run per-family
+    # IF), so falling back to the org-wide record lets drilldown work whenever ANY
+    # scoring pass covered this MAC. If neither pass includes it, we still return
+    # a useful payload — events + metadata with empty scores — rather than 404'ing.
     anomalies = await get_anomalies(site_id, wlan)
     mac_scores = anomalies.get(mac_normalized)
     if mac_scores is None:
-        raise HTTPException(status_code=404, detail=f"No anomaly data for MAC {mac}")
+        raw_org_anomalies = await _redis_get(_org_anomalies_redis_key(site_id, wlan))
+        if raw_org_anomalies:
+            org_anomalies = json.loads(raw_org_anomalies)
+            mac_scores = org_anomalies.get(mac_normalized)
 
     raw_features = await _redis_get(_features_redis_key(site_id, wlan))
     features = json.loads(raw_features) if raw_features else {}
@@ -2258,31 +2395,15 @@ async def get_mac_anomaly(site_id: str, mac: str, wlan: str = Query(..., descrip
     client_cache = await get_client_cache() or {}
     client_meta = client_cache.get(mac_normalized, {})
 
-    # Compute per-MAC Shapley features: top feature deviations vs family mean
-    shapley_features: list[dict] = []
+    # Only 404 if we have nothing to show — no scores, no features, no events, and
+    # no client cache entry. That's the true "unknown MAC" case.
+    if mac_scores is None and not mac_features and not mac_events and not client_meta:
+        raise HTTPException(status_code=404, detail=f"No data for MAC {mac}")
+
+    if mac_scores is None:
+        mac_scores = {}
+
     mac_vec = mac_features.get("vector", {})
-    device_family = mac_scores.get("device_family", "Unknown")
-    if mac_vec and features:
-        family_vectors = [
-            features[m]["vector"]
-            for m in features
-            if features[m].get("device_family") == device_family and m != mac_normalized
-        ]
-        if family_vectors:
-            keys = list(mac_vec.keys())
-            family_arr = np.array([[v.get(k, 0.0) for k in keys] for v in family_vectors])
-            family_means = family_arr.mean(axis=0)
-            mac_arr = np.array([mac_vec.get(k, 0.0) for k in keys])
-            diffs = np.abs(mac_arr - family_means)
-            top_indices = np.argsort(diffs)[::-1][:5]
-            shapley_features = [
-                {
-                    "feature": keys[i],
-                    "outlier_mean": float(mac_arr[i]),
-                    "baseline_mean": float(family_means[i]),
-                }
-                for i in top_indices
-            ]
 
     # Per-MAC health: aggregate score, per-service health, and any service alarms.
     # Computed on demand from the MAC's feature vector — no separate Redis key needed.
@@ -2309,7 +2430,6 @@ async def get_mac_anomaly(site_id: str, mac: str, wlan: str = Query(..., descrip
         "client_metadata": client_meta,
         "anomaly_scores": mac_scores,
         "feature_vector": mac_features.get("vector", {}),
-        "shapley_features": shapley_features,
         "health_score": mac_health_score,
         "health_components": mac_health_components,
         "service_health": mac_service_health_out,

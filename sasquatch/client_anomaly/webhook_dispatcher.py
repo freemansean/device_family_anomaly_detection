@@ -58,6 +58,18 @@ def get_health_score_threshold() -> float:
     return config.get("anomaly", "anomaly_health_score_threshold")
 
 
+def get_alarm_min_family_size() -> int:
+    """Read the minimum device-family size required to generate an alarm.
+
+    Families with `total_mac_count` below this threshold are suppressed from
+    both webhook dispatch and the OrgAlerts API feed, even if they otherwise
+    pass the dual gate. Default 1 (no suppression — every family eligible).
+    Resolution: config_overrides.json → env var → hardcoded default.
+    Imported by routes.py so the same floor is used for API alert filtering.
+    """
+    return config.get("general", "alarm_min_family_size")
+
+
 async def _get_webhook_config() -> dict:
     """
     Read runtime webhook configuration from Redis (sasquatch:webhook_config).
@@ -161,6 +173,72 @@ async def run_family_tshoot(site_id: str, family: str, wlan: str) -> list[dict]:
     return list(await asyncio.gather(*[_one(m) for m in worst_macs]))
 
 
+def _slim_finding_for_webhook(finding: dict, org_scope: bool) -> dict:
+    """
+    Project a finding down to the minimal shape the Sasquatch webhook consumer cares about.
+
+    Dropped as of the 2026-04 trim (reasoning in TODO.md):
+      - severity, outlier_ratio, weighted_outlier_score
+          → admin tunes alerting via thresholds, raw ratio is hard to interpret
+      - centroid_dist_score, dbscan_family_noise_ratio, dbscan_severity,
+        dbscan_outlier_ratio, dbscan_outlier_count, dbscan_outlier_site_count
+          → internal detector metrics; consumers only need the is_family_*_outlier flags
+      - if_outlier_macs, if_outlier_count
+          → subsumed by affected_mac_count + worst_health_macs
+      - markov_family_anomaly_ratio, markov_evaluatable_count,
+        markov_family_anomalous_count
+          → collapsed into markov_family_reason
+      - example_macs
+          → legacy component; worst_health_macs carries the actionable devices
+      - top_features
+          → current feature list needs rework before it is useful downstream
+      - service_alarm_counts
+          → consumer reads service_alarms list + service_health dict
+      - wlan (per-finding)
+          → always matches top-level wlan in the envelope
+
+    Kept: family identity, gate flags, health evidence, worst-health MACs, marvis_tshoot,
+    and org-only site fanout fields.
+    """
+    slim = {
+        "device_family": finding.get("device_family"),
+        "family_kind": finding.get("family_kind"),
+        "affected_mac_count": finding.get("affected_mac_count"),
+        "total_mac_count": finding.get("total_mac_count"),
+        "is_family_outlier": finding.get("is_family_outlier", False),
+        "is_family_dbscan_outlier": finding.get("is_family_dbscan_outlier", False),
+        "is_family_markov_outlier": finding.get("is_family_markov_outlier", False),
+        "markov_family_reason": finding.get("markov_family_reason"),
+        "probable_pattern": finding.get("probable_pattern"),
+        "health_score": finding.get("health_score"),
+        "health_components": finding.get("health_components", {}),
+        "service_alarms": finding.get("service_alarms", []),
+        "service_health": finding.get("service_health", {}),
+    }
+
+    # Service-account fields — only include when the family actually is one,
+    # so non-SA payloads aren't cluttered with empty strings / empty lists.
+    if finding.get("family_kind") == "service_account":
+        slim["service_account_label"] = finding.get("service_account_label", "")
+        slim["service_account_member_families"] = finding.get(
+            "service_account_member_families", []
+        )
+
+    # Worst-health MACs + TSHOOT enrichment are only populated for site-scope findings
+    # (score_org_wide does not compute them). Preserve them when present.
+    if "worst_health_macs" in finding:
+        slim["worst_health_macs"] = finding["worst_health_macs"]
+    if "marvis_tshoot" in finding:
+        slim["marvis_tshoot"] = finding["marvis_tshoot"]
+
+    # Org-only fanout fields so downstream can page the right site owners.
+    if org_scope:
+        slim["site_count"] = finding.get("site_count", 0)
+        slim["sites_affected"] = finding.get("sites_affected", [])
+
+    return slim
+
+
 async def _post_with_retry(url: str, payload: dict) -> bool:
     """
     POST payload to url. Retries 3 times with exponential backoff.
@@ -215,6 +293,7 @@ async def evaluate_and_dispatch(
     """
     config = await _get_webhook_config()
     threshold = get_health_score_threshold()
+    alarm_min_family_size = int(get_alarm_min_family_size())
 
     effective_url = config["url"]
     if not config["enabled"] or not effective_url:
@@ -281,6 +360,17 @@ async def evaluate_and_dispatch(
             log.debug(
                 "[%s] Skipping webhook for [%s]: affected_mac_count=%d < family_size_threshold=%d",
                 wlan, family, affected_count, family_size_threshold,
+            )
+            continue
+
+        # Gate 4: suppress tiny device families entirely — a family with fewer than
+        # alarm_min_family_size total members can't produce a statistically meaningful
+        # alarm. Set via the General Config tab; default 1 = no suppression.
+        total_count = f.get("total_mac_count", 0) or 0
+        if total_count < alarm_min_family_size:
+            log.debug(
+                "[%s] Skipping alarm for [%s]: total_mac_count=%d < alarm_min_family_size=%d",
+                wlan, family, total_count, alarm_min_family_size,
             )
             continue
 
@@ -351,13 +441,17 @@ async def evaluate_and_dispatch(
             wlan, config["marvis_tshoot_enabled"], bool(MIST_ORG_ID), bool(MIST_API_TOKEN),
         )
 
+    slim_findings = [_slim_finding_for_webhook(f, org_scope) for f in qualifying]
+
     payload = {
         "source": "sasquatch_client_anomaly",
-        "site_id": site_id,
+        "scope": "org" if org_scope else "site",
+        # site_id is meaningful only for site-scope dispatch; org-scope callers
+        # pass the sentinel "__org__" which is not a valid Mist site_id.
+        "site_id": None if org_scope else site_id,
         "wlan": wlan,
         "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-        "finding_count": len(qualifying),
-        "findings": qualifying,
+        "findings": slim_findings,
     }
 
     log.info(

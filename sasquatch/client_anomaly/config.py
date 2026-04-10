@@ -31,14 +31,27 @@ DEFAULTS = {
         "org_detection_interval_hours": {"default": 1, "env": "ORG_DETECTION_INTERVAL_HOURS", "cast": int},
         # Minimum events per MAC to be included in ML feature matrix
         "anomaly_min_mac_events": {"default": 5, "env": "ANOMALY_MIN_MAC_EVENTS", "cast": int},
+        # Suppress alarms for device families whose total MAC count is below this
+        # threshold. Small families can trip the detector on a single quirky device
+        # — raising this floor lets operators quiet that noise without touching the
+        # detection pipeline itself. Applies to both webhook dispatch and the
+        # OrgAlerts UI feed. Set to 1 to disable (default — every family eligible).
+        "alarm_min_family_size": {"default": 1, "env": "ALARM_MIN_FAMILY_SIZE", "cast": int},
+        # RSSI floor (dBm) below which *failure* events are discarded during
+        # enrichment. Clients at the fringe of RF coverage generate auth/roam
+        # failure events that reflect poor signal, not device-level behavior —
+        # dropping them keeps the feature vectors focused on actionable
+        # anomalies. Only applies to auth/roam/association failure event types;
+        # successful events and non-auth types (DHCP, DNS, ARP, etc.) pass
+        # through regardless of signal strength. Set to a very negative value
+        # (e.g. -120) to effectively disable the filter.
+        "anomaly_rssi_min_threshold": {"default": -87, "env": "ANOMALY_RSSI_MIN_THRESHOLD", "cast": int},
     },
 
     # ── Anomaly Config ──────────────────────────────────────────────
     "anomaly": {
         # Isolation Forest contamination (per-family, Stage 2)
         "anomaly_if_contamination": {"default": 0.05, "env": "ANOMALY_IF_CONTAMINATION", "cast": float},
-        # Centroid IF contamination (inter-family, Stage 1b)
-        "anomaly_centroid_if_contamination": {"default": 0.15, "env": "ANOMALY_CENTROID_IF_CONTAMINATION", "cast": float},
         # Number of IF trees
         "anomaly_if_n_estimators": {"default": 200, "env": "ANOMALY_IF_N_ESTIMATORS", "cast": int},
         # Random seed (-1 for random)
@@ -55,11 +68,7 @@ DEFAULTS = {
         "anomaly_dbscan_min_family_size": {"default": 2, "env": "ANOMALY_DBSCAN_MIN_FAMILY_SIZE", "cast": int},
         # DBSCAN family noise threshold
         "anomaly_dbscan_family_noise_threshold": {"default": 0.5, "env": "ANOMALY_DBSCAN_FAMILY_NOISE_THRESHOLD", "cast": float},
-        # Min qualifying families for centroid detection
-        "anomaly_centroid_if_min_families": {"default": 3, "env": "ANOMALY_CENTROID_IF_MIN_FAMILIES", "cast": int},
-        # Max families for cosine-distance fallback path
-        "anomaly_centroid_dist_max_families": {"default": 10, "env": "ANOMALY_CENTROID_DIST_MAX_FAMILIES", "cast": int},
-        # Cosine distance threshold for family flagging
+        # Cosine distance threshold for family flagging (Stage 1b)
         "anomaly_centroid_dist_threshold": {"default": 0.35, "env": "ANOMALY_CENTROID_DIST_THRESHOLD", "cast": float},
         # Health threshold for healthy-only centroid reference
         "anomaly_centroid_healthy_ref_threshold": {"default": 0.75, "env": "ANOMALY_CENTROID_HEALTHY_REF_THRESHOLD", "cast": float},

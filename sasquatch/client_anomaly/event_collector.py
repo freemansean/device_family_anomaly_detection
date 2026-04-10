@@ -120,11 +120,30 @@ IGNORED_EVENT_TYPES: frozenset[str] = frozenset({
 # failure ratios and depresses health scores for devices in marginal coverage areas.
 _AUTH_FAILURE_IGNORED_STATUS_CODES: frozenset[int] = frozenset({-79})
 
-# Events with RSSI weaker than this threshold are discarded. Clients at the fringe of
-# RF coverage generate high false-positive rates — their event patterns reflect poor
-# signal, not authentic device behavior. Events with no rssi field are accepted as-is
-# (some event types such as DHCP and DNS do not carry a signal measurement).
-_RSSI_MIN_THRESHOLD = -87
+# Events with RSSI weaker than the configured threshold are discarded during
+# enrichment — but ONLY when the event type is an auth/roam/association failure.
+# Rationale: a failure event from a client at the fringe of RF coverage likely
+# reflects poor signal, not device-level behavior. Successful events and
+# non-auth types (DHCP, DNS, ARP, etc.) pass through regardless of signal
+# strength: if they happened, the RF link was good enough. The threshold is
+# read from `config.get("general", "anomaly_rssi_min_threshold")` (env var
+# `ANOMALY_RSSI_MIN_THRESHOLD`, default -87 dBm).
+_RSSI_FILTER_EVENT_TYPES: frozenset[str] = frozenset({
+    # AUTH_FAILURE
+    "MARVIS_EVENT_CLIENT_AUTH_FAILURE",
+    "MARVIS_EVENT_CLIENT_AUTH_DENIED",
+    "MARVIS_EVENT_CLIENT_MAC_AUTH_FAILURE",
+    "MARVIS_EVENT_SAE_AUTH_FAILURE",
+    "SA_QUERY_TIMEOUT",
+    # ASSOCIATION_FAILURE (flat list, not in EVENT_CATEGORIES)
+    "CLIENT_ASSOCIATION_FAILURE",
+    # ROAM_FAILURE
+    "MARVIS_EVENT_CLIENT_FBT_FAILURE",
+    "MARVIS_EVENT_CLIENT_AUTH_FAILURE_OKC",
+    "MARVIS_EVENT_CLIENT_AUTH_FAILURE_11R",
+    "MARVIS_EVENT_WLC_FT_KEY_NOT_FOUND",
+    "CLIENT_REASSOCIATION_FAILURE",
+})
 
 # Known Mist client event types — used to define the ML feature vector dimensions.
 # Fetched live from /api/v1/const/client_events at startup and cached in Redis,
@@ -525,7 +544,10 @@ def _dedup_events(events: list[dict]) -> list[dict]:
 
 
 def _enrich_batch(
-    events: list[dict], client_cache: dict
+    events: list[dict],
+    client_cache: dict,
+    rssi_threshold: int,
+    stats: dict[str, int] | None = None,
 ) -> tuple[list[dict], set[str], set[str]]:
     """Enrich a batch of raw events.
 
@@ -539,6 +561,16 @@ def _enrich_batch(
     Events in IGNORED_EVENT_TYPES are silently dropped before enrichment.
     Mist API variant duplicates (has_pcap variants, pcap_url JWT rotation) are
     collapsed by _dedup_events before enrichment.
+
+    RSSI filtering is narrow: only auth/roam/association failure events
+    (`_RSSI_FILTER_EVENT_TYPES`) with `rssi < rssi_threshold` are dropped.
+    Successful events and non-auth types (DHCP, DNS, ARP, etc.) pass through
+    regardless of signal strength — the fact that they happened is evidence
+    the link was good enough.
+
+    If `stats` is provided, the in/out counters for this batch are added to
+    the accumulator keys `transmission_failure_skipped` and
+    `weak_signal_skipped` so the caller can log a per-collect summary.
     """
     events = _dedup_events(events)
     known_types = set(MIST_CLIENT_EVENT_TYPES)
@@ -557,24 +589,23 @@ def _enrich_batch(
         ):
             transmission_failure_skipped += 1
             continue
-        rssi = event.get("rssi")
-        if rssi is not None and rssi < _RSSI_MIN_THRESHOLD:
-            weak_signal_skipped += 1
-            continue
+        if event_type in _RSSI_FILTER_EVENT_TYPES:
+            rssi = event.get("rssi")
+            if rssi is not None and rssi < rssi_threshold:
+                weak_signal_skipped += 1
+                continue
         if event_type and event_type not in known_types:
             unknown_types.add(event_type)
         mac = (event.get("mac") or "").replace(":", "").lower()
         if mac and mac not in client_cache:
             cache_miss_macs.add(mac)
         enriched.append(_enrich_event(event, client_cache))
-    if transmission_failure_skipped:
-        log.debug(
-            f"Skipped {transmission_failure_skipped} AUTH_FAILURE events with "
-            f"status_code in {set(_AUTH_FAILURE_IGNORED_STATUS_CODES)} (transmission failures)"
+    if stats is not None:
+        stats["transmission_failure_skipped"] = (
+            stats.get("transmission_failure_skipped", 0) + transmission_failure_skipped
         )
-    if weak_signal_skipped:
-        log.debug(
-            f"Skipped {weak_signal_skipped} events with rssi < {_RSSI_MIN_THRESHOLD} dBm (weak signal)"
+        stats["weak_signal_skipped"] = (
+            stats.get("weak_signal_skipped", 0) + weak_signal_skipped
         )
     return enriched, unknown_types, cache_miss_macs
 
@@ -611,6 +642,8 @@ async def reenrich_stale_events(site_id: str, client_cache: dict[str, dict]) -> 
 async def _enrich_and_write_org_batch(
     events_by_site: dict[str, list[dict]],
     client_cache: dict[str, dict],
+    rssi_threshold: int,
+    stats: dict[str, int] | None = None,
 ) -> tuple[dict[str, int], set[str]]:
     """
     Enrich and write org-level events grouped by site_id.
@@ -627,7 +660,9 @@ async def _enrich_and_write_org_batch(
         if not site_events:
             continue
 
-        enriched, unknown_types, miss_macs = _enrich_batch(site_events, client_cache)
+        enriched, unknown_types, miss_macs = _enrich_batch(
+            site_events, client_cache, rssi_threshold, stats
+        )
         all_unknown_types.update(unknown_types)
 
         if miss_macs:
@@ -664,6 +699,8 @@ async def _flush_org_batch(
     all_unknown_types: set[str],
     batch_num: int,
     client_cache: dict[str, dict],
+    rssi_threshold: int,
+    filter_stats: dict[str, int] | None = None,
 ) -> None:
     """
     Group a raw event batch by site_id, enrich, and write to SQLite.
@@ -674,6 +711,11 @@ async def _flush_org_batch(
 
     `client_cache` is the org-wide MAC -> metadata map loaded once at the start
     of the streaming run and shared across every batch and every site.
+
+    `rssi_threshold` is the per-collect RSSI floor (dBm) resolved once at the
+    start of the collect. `filter_stats` is a mutable accumulator updated in
+    place by `_enrich_batch` so the streaming caller can log a single
+    per-collect summary at the end.
     """
     events_by_site: dict[str, list[dict]] = {}
     for event in raw_batch:
@@ -686,7 +728,7 @@ async def _flush_org_batch(
         f"{len(events_by_site)} sites → SQLite"
     )
     batch_site_counts, batch_unknown = await _enrich_and_write_org_batch(
-        events_by_site, client_cache
+        events_by_site, client_cache, rssi_threshold, filter_stats
     )
     for sid, count in batch_site_counts.items():
         site_counts[sid] = site_counts.get(sid, 0) + count
@@ -731,8 +773,16 @@ async def _collect_org_streaming(
             "[org] Client cache is empty — proceeding with OUI-only enrichment."
         )
 
+    # Resolve the RSSI floor once per collect so every batch uses a consistent
+    # value even if the override is edited mid-run.
+    rssi_threshold = int(config.get("general", "anomaly_rssi_min_threshold"))
+
     site_counts: dict[str, int] = {}
     all_unknown_types: set[str] = set()
+    filter_stats: dict[str, int] = {
+        "transmission_failure_skipped": 0,
+        "weak_signal_skipped": 0,
+    }
     batch_num = 0
 
     try:
@@ -746,7 +796,13 @@ async def _collect_org_streaming(
         ):
             batch_num += 1
             await _flush_org_batch(
-                raw_batch, site_counts, all_unknown_types, batch_num, client_cache
+                raw_batch,
+                site_counts,
+                all_unknown_types,
+                batch_num,
+                client_cache,
+                rssi_threshold,
+                filter_stats,
             )
     except Exception as exc:
         total_so_far = sum(site_counts.values())
@@ -767,6 +823,14 @@ async def _collect_org_streaming(
     log.info(
         f"[org] {label} complete: {total} rows written across "
         f"{len(site_counts)} sites in {batch_num} batches"
+    )
+    log.info(
+        f"[org] {label} filter summary: "
+        f"{filter_stats['weak_signal_skipped']} failure events dropped "
+        f"(rssi < {rssi_threshold} dBm, only auth/roam/association failures); "
+        f"{filter_stats['transmission_failure_skipped']} AUTH_FAILURE events "
+        f"dropped (status_code in {set(_AUTH_FAILURE_IGNORED_STATUS_CODES)}, "
+        f"transmission failures)"
     )
     return site_counts
 
