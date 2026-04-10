@@ -1,6 +1,9 @@
 import { useState, useEffect } from "react";
 import { apiFetch } from "../api";
 
+const SA_COLOR = "#d4a06a";
+const SA_BG = "#2a1f15";
+
 function shapleyScoreFromIfScore(ifScore) {
   if (ifScore == null) return null;
   return Math.max(0, Math.min(100, Math.round((0.5 - ifScore) / 1.0 * 100)));
@@ -223,6 +226,17 @@ export default function MacDrilldown({ siteId, mac, apiBase, onBack, wlan }) {
   const isOutlier = scores.is_outlier;
   const severityColor = isOutlier ? "#e05555" : "#2d7a4f";
 
+  const healthScore = data.health_score;
+  const serviceAlarms = data.service_alarms || [];
+  const serviceHealth = data.service_health || {};
+  const healthPctStr = healthScore != null ? `${Math.round(healthScore * 100)}%` : "—";
+  const healthColor =
+    healthScore == null ? "#666"
+    : healthScore >= 0.85 ? "#4caf7d"
+    : healthScore >= 0.75 ? "#e0a835"
+    : healthScore >= 0.55 ? "#e07835"
+    : "#e05555";
+
   return (
     <div>
       <div style={{ display: "flex", alignItems: "center", gap: "12px", marginBottom: "16px" }}>
@@ -276,29 +290,165 @@ export default function MacDrilldown({ siteId, mac, apiBase, onBack, wlan }) {
           ))}
         </div>
 
-        {/* Anomaly scores */}
+        {/* Anomaly / Health scores */}
         <div style={cardStyle}>
-          <h3 style={cardTitleStyle}>Anomaly Scores</h3>
+          <h3 style={cardTitleStyle}>Anomaly / Health Scores</h3>
           {[
             ["IF score",       scores.if_score != null ? scores.if_score.toFixed(4) : "N/A (too few peers)"],
-            ["IF outlier",     scores.is_if_outlier ? "Yes" : "No"],
-            ["DBSCAN label",   scores.dbscan_label],
-            ["DBSCAN outlier", scores.is_dbscan_outlier ? "Yes" : "No"],
-            ["Family outlier", scores.is_family_outlier ? "Yes" : "No"],
-            ["Markov outlier", scores.is_markov_outlier ? "Yes" : "No"],
-            ["Markov ep. ratio", scores.markov_episode_anomaly_ratio != null ? `${(scores.markov_episode_anomaly_ratio * 100).toFixed(1)}%` : "—"],
-            ["Markov anomalous ep.", scores.markov_anomalous_episodes != null ? `${scores.markov_anomalous_episodes} / ${scores.markov_scoreable_episodes}` : "—"],
-            ["Markov truncated ep.", scores.markov_short_episodes != null ? `${scores.markov_short_episodes} / ${scores.markov_total_episodes}` : "—"],
-            ["is_outlier",     isOutlier ? "Yes" : "No"],
-            ["Total events",   data.event_count],
+            ["Outlier compared to peers",     scores.is_if_outlier ? "Yes" : "No"],
+            ["Outlier compared to site / wlan groups", scores.is_dbscan_outlier ? "Yes" : "No"],
+            ["Device family is anomalous", scores.is_family_outlier ? "Yes" : "No"],
           ].map(([label, value]) => (
             <div key={label} style={kvRow}>
               <span style={{ color: "#666" }}>{label}</span>
               <span style={{ color: String(value) === "Yes" ? "#e05555" : "#ccc" }}>{String(value)}</span>
             </div>
           ))}
+          {/* Markov reason — single row collapsing the anomaly/repeated signals
+              with a sub-text giving the supporting detail. */}
+          {(() => {
+            const reason = scores.markov_reason;
+            const labelText = reason === "repeated"
+              ? "repeated"
+              : reason === "anomaly"
+                ? "anomaly"
+                : "—";
+            const labelColor = reason ? "#e05555" : "#444";
+            let detail = null;
+            if (reason === "repeated" && scores.stuck_loop_pair) {
+              const pct = scores.stuck_loop_fraction != null
+                ? `${(scores.stuck_loop_fraction * 100).toFixed(0)}%`
+                : "";
+              detail = `${scores.stuck_loop_pair}${pct ? ` @ ${pct}` : ""}`;
+            } else if (reason === "anomaly" && scores.markov_scoreable_episodes != null) {
+              const ratioPct = scores.markov_episode_anomaly_ratio != null
+                ? `${(scores.markov_episode_anomaly_ratio * 100).toFixed(0)}%`
+                : "";
+              detail = `${scores.markov_anomalous_episodes}/${scores.markov_scoreable_episodes} episodes${ratioPct ? ` (${ratioPct})` : ""}`;
+            }
+            return (
+              <div style={{ ...kvRow, alignItems: "flex-start" }}>
+                <span style={{ color: "#666" }}>Markov reason</span>
+                <span style={{ display: "flex", flexDirection: "column", alignItems: "flex-end" }}>
+                  <span style={{ color: labelColor }}>{labelText}</span>
+                  {detail && (
+                    <span style={{ color: "#555", fontSize: "11px", marginTop: "2px" }}>
+                      {detail}
+                    </span>
+                  )}
+                </span>
+              </div>
+            );
+          })()}
+          {/* Health row — overall device health (success / total outcome-bearing events) */}
+          <div style={kvRow}>
+            <span style={{ color: "#666" }}>Health</span>
+            {healthScore == null ? (
+              <span style={{ color: "#444" }}>—</span>
+            ) : (
+              <span style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+                <div style={{ width: "60px", height: "6px", background: "#222", borderRadius: "2px", overflow: "hidden" }}>
+                  <div style={{
+                    width: `${Math.round(healthScore * 100)}%`,
+                    height: "100%",
+                    background: healthColor,
+                    borderRadius: "2px",
+                  }} />
+                </div>
+                <span style={{ color: healthColor, fontSize: "12px", minWidth: "36px", textAlign: "right" }}>
+                  {healthPctStr}
+                </span>
+              </span>
+            )}
+          </div>
+          {/* Service Alarm row — cards for each service the MAC has below 50% health */}
+          <div style={kvRow}>
+            <span style={{ color: "#666" }}>Service Alarm</span>
+            {serviceAlarms.length === 0 ? (
+              <span style={{ color: "#444" }}>—</span>
+            ) : (
+              <span style={{ display: "flex", flexWrap: "wrap", gap: "4px", justifyContent: "flex-end" }}>
+                {serviceAlarms.map((svc) => {
+                  const sh = serviceHealth[svc];
+                  const pct = sh != null && sh.health != null ? `${Math.round(sh.health * 100)}%` : "";
+                  return (
+                    <span
+                      key={svc}
+                      title={pct ? `${svc.toUpperCase()} health ${pct}` : svc.toUpperCase()}
+                      style={{
+                        background: "#e0555522",
+                        color: "#e05555",
+                        border: "1px solid #e0555544",
+                        borderRadius: "3px",
+                        padding: "2px 7px",
+                        fontSize: "11px",
+                        textTransform: "uppercase",
+                        letterSpacing: "0.04em",
+                        fontWeight: 600,
+                      }}
+                    >
+                      {svc}
+                    </span>
+                  );
+                })}
+              </span>
+            )}
+          </div>
         </div>
       </div>
+
+      {/* Service-account family membership — shown only when this MAC is part of a username-based virtual family */}
+      {scores.service_account && scores.service_account.family && (
+        <div style={{
+          background: SA_BG,
+          border: `1px solid ${SA_COLOR}44`,
+          borderLeft: `3px solid ${SA_COLOR}`,
+          borderRadius: "4px",
+          padding: "12px 14px",
+          marginBottom: "20px",
+        }}>
+          <div style={{ display: "flex", alignItems: "center", gap: "10px", marginBottom: "8px" }}>
+            <span style={{
+              fontSize: "10px",
+              color: SA_COLOR,
+              textTransform: "uppercase",
+              letterSpacing: "0.08em",
+              fontWeight: 600,
+              background: `${SA_COLOR}22`,
+              border: `1px solid ${SA_COLOR}44`,
+              padding: "2px 7px",
+              borderRadius: "3px",
+            }}>SVC ACCT</span>
+            <span style={{ fontSize: "13px", color: "#ccc" }}>
+              Also part of service account{" "}
+              <span style={{ color: SA_COLOR, fontFamily: "monospace", fontWeight: 600 }}>
+                {scores.service_account.family.replace(/\.service_account$/, "")}
+              </span>
+            </span>
+          </div>
+          <div style={{ fontSize: "11px", color: "#777", marginBottom: "10px" }}>
+            This device shares its <code style={{ color: SA_COLOR }}>last_username</code> with ≥50 other MACs across the org.
+            The username forms a virtual family that is scored independently of this device's primary family ({meta.family || "—"}).
+          </div>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "6px 16px", fontSize: "12px" }}>
+            {[
+              ["Username", scores.service_account.last_username || "—"],
+              ["SA family is anomalous", scores.service_account.is_family_outlier ? "Yes" : "No"],
+              ["Outlier vs SA peers", scores.service_account.is_if_outlier ? "Yes" : "No"],
+              ["SA IF score", scores.service_account.if_score != null ? scores.service_account.if_score.toFixed(4) : "N/A (too few peers)"],
+              ["SA centroid IF score", scores.service_account.centroid_if_score != null ? scores.service_account.centroid_if_score.toFixed(4) : "—"],
+              ["SA centroid distance", scores.service_account.centroid_dist_score != null ? scores.service_account.centroid_dist_score.toFixed(4) : "—"],
+            ].map(([label, value]) => (
+              <div key={label} style={{ display: "flex", justifyContent: "space-between", borderBottom: "1px solid #1e1e1e", padding: "3px 0" }}>
+                <span style={{ color: "#666" }}>{label}</span>
+                <span style={{ color: String(value) === "Yes" ? "#e05555" : "#ccc", fontFamily: label === "Username" ? "monospace" : undefined }}>
+                  {String(value)}
+                </span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
 
       {/* Domain health axes */}
       <div style={{ ...cardStyle, marginBottom: "20px" }}>

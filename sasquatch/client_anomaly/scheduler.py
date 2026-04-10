@@ -1,511 +1,371 @@
 """
-scheduler.py — APScheduler job definitions.
+scheduler.py — APScheduler job definitions and global mutex.
 
-Jobs:
+Scheduled jobs:
 - client_refresh_job: Daily at 00:00 — refresh client device cache.
-- event_and_detect_job: Every SITE_FOCUS_DETECTION_INTERVAL minutes — collect events for the focus site and run detection.
+- markov_baseline_job: Daily at 00:30 — rebuild Markov baselines.
+- org_event_poll_job: Hourly (optional) — collection only, no detection.
+- sqlite_retention_job: Daily at 03:00 — purge expired events.
 
-Detection runs independently for each unique WLAN present in the site's event data.
-Every event must have a WLAN (SSID) associated with it; there is no cross-WLAN
-combined scope. This allows the frontend to display per-WLAN anomaly findings.
+Anomaly detection is triggered only (not scheduled) — via POST /api/v1/org/detect
+or the UI. A global mutex (sasquatch:lock:global_operation) ensures only one
+operation (collecting or detecting) runs at a time.
 """
 
+import json
 import logging
 import os
+import time as _time
 from datetime import datetime, timezone
 
-import httpx
 import redis.asyncio as aioredis
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from .anomaly_detector import score, score_org_wide
-from .client_cache import get_client_cache, refresh_client_cache
-from .event_collector import collect, collect_full, ensure_event_type_index, get_wlans, reenrich_stale_events
+from .client_cache import get_client_cache, refresh_client_cache_org
+from .event_collector import collect_org, ensure_event_type_index, get_wlans, reenrich_stale_events
 from .feature_engineer import build_features, get_features
 from .health_scorer import score_health
 from .markov_analyzer import baseline_exists as markov_baseline_exists
 from .markov_analyzer import build_and_store_baseline as build_markov_baseline
 from .webhook_dispatcher import evaluate_and_dispatch
 
-from . import config
+from . import db
 
 log = logging.getLogger(__name__)
 
-SITE_ID = os.getenv("MIST_SITE_ID", "")
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 MIST_API_TOKEN = os.getenv("MIST_API_TOKEN", "")
-MIST_CLOUD_HOST = os.getenv("MIST_CLOUD_HOST", "api.mist.com")
 MIST_ORG_ID = os.getenv("MIST_ORG_ID", "")
 
-ORG_FOCUS_VALUE = "__org__"
+# Global mutex: only one operation (collecting or detecting) at a time.
+_GLOBAL_LOCK_KEY = "sasquatch:lock:global_operation"
+_GLOBAL_LOCK_TTL_SECONDS = 2 * 60 * 60  # 2 hours
 
-# Lock TTL: generous upper bound for a full collection + scoring cycle.
-_LOCK_TTL_SECONDS = 45 * 60  # 45 minutes
-# Org-wide lock covers event collection + feature build + scoring across all sites.
-_ORG_LOCK_TTL_SECONDS = 2 * 60 * 60  # 2 hours
+# Redis keys for tracking last operation timestamps
+_LAST_COLLECTION_KEY = "sasquatch:last_collection"
+_LAST_DETECTION_KEY = "sasquatch:last_detection"
 
 
-async def _acquire_lock(site_id: str) -> tuple[aioredis.Redis, bool]:
+async def _acquire_global_lock(operation: str) -> tuple[aioredis.Redis, bool]:
     """
-    Try to acquire the per-site detection lock via Redis SETNX.
+    Try to acquire the global operation lock via Redis SETNX.
+    operation: "collecting" or "detecting" — stored as the lock value.
     Returns (redis_client, acquired). Caller must release the client regardless.
     """
     client = aioredis.from_url(REDIS_URL, decode_responses=True)
-    key = f"sasquatch:lock:detection:{site_id}"
-    acquired = await client.set(key, "1", nx=True, ex=_LOCK_TTL_SECONDS)
+    acquired = await client.set(
+        _GLOBAL_LOCK_KEY,
+        json.dumps({"operation": operation, "started_at": _time.time()}),
+        nx=True,
+        ex=_GLOBAL_LOCK_TTL_SECONDS,
+    )
     return client, bool(acquired)
 
 
-async def _release_lock(redis_client: aioredis.Redis, site_id: str) -> None:
+async def _release_global_lock(redis_client: aioredis.Redis) -> None:
     try:
-        await redis_client.delete(f"sasquatch:lock:detection:{site_id}")
+        await redis_client.delete(_GLOBAL_LOCK_KEY)
     finally:
         await redis_client.aclose()
 
 
-async def _get_focus_site() -> str:
-    """Return the active focus site: Redis override first, then MIST_SITE_ID env var."""
+async def get_global_lock_status() -> dict | None:
+    """Return the current global lock value, or None if no lock is held."""
     client = aioredis.from_url(REDIS_URL, decode_responses=True)
     try:
-        override = await client.get("sasquatch:focus_site")
-        return override if override else SITE_ID
+        raw = await client.get(_GLOBAL_LOCK_KEY)
+        if raw:
+            return json.loads(raw)
+        return None
     finally:
         await client.aclose()
 
 
-async def _get_org_sites() -> list[str]:
-    """Fetch all site IDs for the configured org from the Mist API."""
-    if not MIST_ORG_ID or not MIST_API_TOKEN:
-        log.error("MIST_ORG_ID or MIST_API_TOKEN not configured — cannot fetch org sites")
-        return []
-    url = f"https://{MIST_CLOUD_HOST}/api/v1/orgs/{MIST_ORG_ID}/sites"
-    headers = {"Authorization": f"Token {MIST_API_TOKEN}"}
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(url, headers=headers)
-            resp.raise_for_status()
-            return [s["id"] for s in resp.json() if "id" in s]
-    except Exception:
-        log.exception("Failed to fetch org sites from Mist API")
-        return []
-
-
-async def _run_wlan_detection(
-    site_id: str,
-    org_pools: "dict[str, dict[str, list[dict]]] | None" = None,
-) -> dict:
+async def get_job_status() -> dict:
     """
-    Build features and run anomaly scoring for each unique WLAN found in the site's
-    event data. Webhook dispatch runs per WLAN scope so that WLAN-scoped anomalies
-    (e.g. Windows anomalous on one WLAN but not another) are independently evaluated
-    and can trigger alerts.
-
-    org_pools: optional {wlan: {family: [feature_records from OTHER sites]}} used to
-      supplement small device families that would otherwise be skipped by IF.
-
-    Returns summary dict with total MACs scored and WLAN count.
+    Return current job state: active operation, polling status, and last
+    collection/detection timestamps.
     """
-    wlans = await get_wlans(site_id=site_id)
-    if not wlans:
-        log.info(f"[wlan detection] Site {site_id}: no WLANs detected — skipping detection")
-        return {"macs_scored": 0, "wlan_scopes": 0}
-
-    log.info(f"[wlan detection] Site {site_id}: running {len(wlans)} WLAN scope(s): {wlans}")
-
-    total_macs = 0
-    _redis_for_baseline = aioredis.from_url(REDIS_URL, decode_responses=True)
+    client = aioredis.from_url(REDIS_URL, decode_responses=True)
     try:
-        event_type_index = await ensure_event_type_index(_redis_for_baseline)
-        for wlan in wlans:
-            if not await markov_baseline_exists(site_id, wlan, _redis_for_baseline):
-                log.info(
-                    "[wlan detection] No Markov baseline for site=%s wlan=%s — building now",
-                    site_id, wlan,
-                )
-                try:
-                    result = await build_markov_baseline(site_id, wlan, event_type_index)
-                    log.info(
-                        "[wlan detection] Markov baseline built: site=%s wlan=%s "
-                        "macs=%d events=%d episodes=%d",
-                        site_id, wlan,
-                        result.get("macs", 0),
-                        result.get("events", 0),
-                        result.get("normal_episodes", 0),
-                    )
-                except Exception:
-                    log.exception(
-                        "[wlan detection] Failed to build Markov baseline for site=%s wlan=%s",
-                        site_id, wlan,
-                    )
+        raw_lock = await client.get(_GLOBAL_LOCK_KEY)
+        polling_enabled = await client.get("sasquatch:event_polling_enabled")
+        last_collection = await client.get(_LAST_COLLECTION_KEY)
+        last_detection = await client.get(_LAST_DETECTION_KEY)
     finally:
-        await _redis_for_baseline.aclose()
+        await client.aclose()
 
-    for wlan in wlans:
-        try:
-            mac_count = await build_features(site_id, wlan)
-            await score_health(site_id, wlan)
-            org_ctx = org_pools.get(wlan) if org_pools else None
-            scored = await score(site_id, wlan, org_family_contexts=org_ctx)
-            log.info(f"[wlan detection] site={site_id} wlan={wlan}: {scored} MACs scored")
-            total_macs = max(total_macs, scored)
-            await evaluate_and_dispatch(site_id, wlan=wlan)
-        except Exception:
-            log.exception(f"[wlan detection] Failed for site={site_id} wlan={wlan}")
+    active_operation = None
+    started_at = None
+    if raw_lock:
+        lock_data = json.loads(raw_lock)
+        active_operation = lock_data.get("operation")
+        started_at = lock_data.get("started_at")
 
-    return {"macs_scored": total_macs, "wlan_scopes": len(wlans)}
+    return {
+        "active_operation": active_operation,
+        "started_at": started_at,
+        "polling_enabled": polling_enabled == "1",
+        "last_collection": last_collection,
+        "last_detection": last_detection,
+    }
 
 
-async def build_org_pools(
+async def _record_last_timestamp(key: str) -> None:
+    """Write the current UTC ISO timestamp to a Redis key (no TTL)."""
+    client = aioredis.from_url(REDIS_URL, decode_responses=True)
+    try:
+        await client.set(key, datetime.now(timezone.utc).isoformat())
+    finally:
+        await client.aclose()
+
+
+_ORG_DETECT_PROGRESS_KEY = "sasquatch:progress:org_detect"
+_ORG_DETECT_PROGRESS_TTL = 300  # 5 minutes
+
+
+async def run_org_pipeline(
     site_ids: list[str],
-    exclude_site: str,
-    wlans_by_site: "dict[str, list[str]]",
-) -> "dict[str, dict[str, list[dict]]]":
-    """
-    Load feature records from all sites EXCEPT exclude_site and pool them by WLAN
-    and device family. Used to build the org-level IF context for a single site.
-
-    Returns {wlan: {family: [feature_records]}}.
-    """
-    from collections import defaultdict
-
-    pools: dict[str, dict[str, list]] = defaultdict(lambda: defaultdict(list))
-    for sid in site_ids:
-        if sid == exclude_site:
-            continue
-        for wlan in wlans_by_site.get(sid, []):
-            features = await get_features(sid, wlan)
-            if not features:
-                continue
-            for record in features.values():
-                family = record.get("device_family", "Unknown")
-                pools[wlan][family].append(record)
-
-    return {wlan: dict(fam_map) for wlan, fam_map in pools.items()}
-
-
-async def client_refresh_job():
-    """Daily job: refresh the MAC → device metadata cache from Mist API."""
-    site_id = await _get_focus_site()
-    if not site_id:
-        log.error("No focus site configured — skipping client refresh")
-        return
-    if site_id == ORG_FOCUS_VALUE:
-        site_ids = await _get_org_sites()
-        if not site_ids:
-            log.error("Org focus set but no sites returned — skipping client refresh")
-            return
-        for sid in site_ids:
-            try:
-                count = await refresh_client_cache(sid)
-                log.info(f"Client cache refreshed for site {sid}: {count} devices")
-                cache = await get_client_cache(sid)
-                reenriched = await reenrich_stale_events(sid, cache)
-                if reenriched:
-                    log.info(f"Re-enriched {reenriched} stale events for site {sid}")
-            except Exception:
-                log.exception(f"client_refresh_job failed for site {sid}")
-        return
-    try:
-        count = await refresh_client_cache(site_id)
-        log.info(f"Client cache refreshed for site {site_id}: {count} devices")
-        cache = await get_client_cache(site_id)
-        reenriched = await reenrich_stale_events(site_id, cache)
-        if reenriched:
-            log.info(f"Re-enriched {reenriched} stale events for site {site_id}")
-    except Exception:
-        log.exception("client_refresh_job failed")
-
-
-async def run_detection_cycle(site_id: str, full_refresh: bool = False) -> dict:
-    """
-    Core detection pipeline: collect → features (per WLAN) → score (per WLAN) → dispatch.
-    Acquires a Redis lock so only one run proceeds at a time.
-
-    full_refresh=False (default, scheduler): incremental 1hr append.
-    full_refresh=True (API trigger): full 24hr backfill.
-
-    Returns a summary dict; raises RuntimeError if the lock is already held.
-    """
-    redis_client, acquired = await _acquire_lock(site_id)
-    if not acquired:
-        await redis_client.aclose()
-        raise RuntimeError(f"Detection cycle already running for site {site_id} — skipping")
-
-    try:
-        if full_refresh:
-            event_count = await collect_full(site_id)
-        else:
-            event_count = await collect(site_id)
-        log.info(f"[cycle] Events collected: {event_count}")
-
-        wlan_summary = await _run_wlan_detection(site_id)
-        log.info(f"[cycle] WLAN detection complete: {wlan_summary}")
-
-        return {
-            "events": event_count,
-            "macs_scored": wlan_summary["macs_scored"],
-            "wlan_scopes": wlan_summary["wlan_scopes"],
-        }
-
-    finally:
-        await _release_lock(redis_client, site_id)
-
-
-async def run_collect_only(site_id: str) -> dict:
-    """
-    Collect events from Mist and store in Redis — no scoring.
-    Acquires the same per-site lock as run_detection_cycle to prevent overlap.
-    Raises RuntimeError if a cycle is already in progress.
-    """
-    redis_client, acquired = await _acquire_lock(site_id)
-    if not acquired:
-        await redis_client.aclose()
-        raise RuntimeError(f"Detection cycle already running for site {site_id} — skipping")
-
-    try:
-        event_count = await collect_full(site_id)
-        log.info(f"[collect] Events collected: {event_count}")
-        return {"events": event_count}
-    finally:
-        await _release_lock(redis_client, site_id)
-
-
-async def run_detect_only(
-    site_id: str,
-    org_pools: "dict[str, dict[str, list[dict]]] | None" = None,
+    site_map: dict[str, str],
+    progress_callback=None,
 ) -> dict:
     """
-    Run feature engineering + anomaly scoring on events already in Redis.
-    Does NOT pull new events from Mist. Runs for __all__ + each unique WLAN.
-    Acquires the same per-site lock as run_detection_cycle to prevent overlap.
-    Raises RuntimeError if the lock is already held.
-    Raises ValueError if no events are found in Redis for this site.
+    ARCH-5 org detection pipeline — org-first, then per-site, with progress.
 
-    org_pools: optional pre-built org-level feature context (from build_org_pools).
-      When provided, families below MIN_PEERS at this site are supplemented with
-      records from other sites before running Isolation Forest.
+    Sequence:
+      1. Acquire global mutex
+      2. Build features + score health for all sites/WLANs
+      3. Run org-wide anomaly detection → write org findings → dispatch org webhook
+      4. Run per-site anomaly detection (iterate each site) → dispatch per-site webhooks
+      5. Release global mutex
+
+    Org findings appear in Redis as soon as phase 3 completes (frontend auto-refreshes).
+    Per-site findings appear incrementally as each site completes in phase 4.
+    If the pipeline fails mid-site, previously completed sites retain their results.
+
+    progress_callback: optional async callable(dict) to write progress updates.
+    site_map: {site_id: site_name} for progress messages.
+
+    Returns summary dict; raises RuntimeError if the lock is already held.
     """
-    from .event_collector import get_events
-    redis_client, acquired = await _acquire_lock(site_id)
+    redis_client, acquired = await _acquire_global_lock("detecting")
     if not acquired:
         await redis_client.aclose()
-        raise RuntimeError(f"Detection cycle already running for site {site_id} — skipping")
+        raise RuntimeError("Another operation is already running — skipping")
+
+    started = _time.time()
+
+    async def _progress(data: dict) -> None:
+        data["started_at"] = started
+        if progress_callback:
+            await progress_callback(data)
 
     try:
-        events = await get_events(site_id=site_id)
-        if not events:
-            raise ValueError(f"No events in Redis for site {site_id} — run /collect first")
+        total_sites = len(site_ids)
+        await _progress({
+            "phase": "building_features",
+            "current_site": None,
+            "sites_complete": 0,
+            "total_sites": total_sites,
+            "org_complete": False,
+        })
 
-        wlan_summary = await _run_wlan_detection(site_id, org_pools=org_pools)
-        log.info(f"[detect] WLAN detection complete: {wlan_summary}")
-
-        return {
-            "macs_with_features": wlan_summary["macs_scored"],
-            "macs_scored": wlan_summary["macs_scored"],
-            "wlan_scopes": wlan_summary["wlan_scopes"],
-        }
-    finally:
-        await _release_lock(redis_client, site_id)
-
-
-async def event_and_detect_job():
-    """Scheduled wrapper — delegates to run_detection_cycle with lock protection."""
-    site_id = await _get_focus_site()
-    if not site_id:
-        log.error("No focus site configured — skipping detection cycle")
-        return
-    if site_id == ORG_FOCUS_VALUE:
-        site_ids = await _get_org_sites()
-        if not site_ids:
-            log.error("Org focus set but no sites returned — skipping detection cycle")
-            return
-        log.info(f"[org] Running detection cycle for {len(site_ids)} sites")
-        for sid in site_ids:
-            try:
-                cache = await get_client_cache(sid)
-                if cache is None:
-                    log.info(f"[org] Client cache missing for site {sid} — refreshing")
-                    await refresh_client_cache(sid)
-                await run_detection_cycle(sid)
-            except RuntimeError as exc:
-                log.warning(str(exc))  # Lock contention — not an error
-            except Exception:
-                log.exception(f"[cycle] detection cycle failed for site {sid}")
-        return
-    try:
-        await run_detection_cycle(site_id)
-    except RuntimeError as exc:
-        log.warning(str(exc))  # Lock contention — not an error
-    except Exception:
-        log.exception("[cycle] detection cycle failed")
-
-
-async def org_cross_site_detect_job() -> None:
-    """
-    Scheduled job: full org-wide cross-site anomaly detection.
-
-    Unlike the per-site event_and_detect_job, this job pools every MAC from every
-    site in the org into a single population and runs DBSCAN, Family Centroid IF,
-    and Isolation Forest against that combined dataset. Each MAC is scored relative
-    to all org peers in its device family rather than just the MACs at its own site.
-
-    Pipeline:
-      1. Collect incremental events for every org site.
-      2. Build per-WLAN feature vectors for every org site.
-      3. For each WLAN scope, run score_org_wide across the pooled population.
-      4. Dispatch webhooks per site using the org-wide findings.
-
-    Results are stored separately from per-site results:
-      sasquatch:org_anomalies:{site_id}:{wlan_key}
-      sasquatch:org_findings:{site_id}:{wlan_key}
-
-    Only runs when MIST_ORG_ID and MIST_API_TOKEN are configured.
-    Runs every ORG_DETECTION_INTERVAL_HOURS (default: 6).
-    Holds a Redis lock (sasquatch:lock:org_detection) for the duration of the cycle
-    so concurrent scheduled triggers are skipped rather than stacked.
-    """
-    if not MIST_ORG_ID or not MIST_API_TOKEN:
-        log.debug("[org-detect] MIST_ORG_ID or MIST_API_TOKEN not configured — skipping")
-        return
-
-    # Check if org detection has been disabled by the administrator via the GUI.
-    _flag_client = aioredis.from_url(REDIS_URL, decode_responses=True)
-    try:
-        _flag = await _flag_client.get("sasquatch:org_detection_enabled")
-    finally:
-        await _flag_client.aclose()
-    if _flag == "0":
-        log.info("[org-detect] Org detection disabled by administrator — skipping cycle")
-        return
-
-    # Acquire org-wide lock
-    lock_client = aioredis.from_url(REDIS_URL, decode_responses=True)
-    lock_key = "sasquatch:lock:org_detection"
-    acquired = await lock_client.set(lock_key, "1", nx=True, ex=_ORG_LOCK_TTL_SECONDS)
-    await lock_client.aclose()
-    if not acquired:
-        log.warning("[org-detect] Lock already held — skipping cycle")
-        return
-
-    lock_release_client = aioredis.from_url(REDIS_URL, decode_responses=True)
-    try:
-        site_ids = await _get_org_sites()
-        if not site_ids:
-            log.error("[org-detect] No org sites returned — skipping")
-            return
-
-        log.info(f"[org-detect] Starting cross-site detection for {len(site_ids)} sites")
-
-        # Step 1: Ensure client caches are warm, then collect events for all sites.
-        # Use the org job's interval as the collection window so non-focused sites
-        # receive complete event coverage between org cycles (not just the last hour).
-        # Acquire the per-site lock before collecting to avoid a duplicate Mist API
-        # call when event_and_detect_job is already running collect() for the same site.
-        # If the lock is held, skip collection and use whatever events are already in Redis.
-        org_duration = f"{config.get('general', 'org_detection_interval_hours')}h"
-        for sid in site_ids:
-            try:
-                cache = await get_client_cache(sid)
-                if cache is None:
-                    log.info(f"[org-detect] Client cache missing for site {sid} — refreshing")
-                    await refresh_client_cache(sid)
-                lock_client, lock_acquired = await _acquire_lock(sid)
-                if not lock_acquired:
-                    await lock_client.aclose()
-                    log.info(
-                        f"[org-detect] Site {sid}: per-site cycle in progress — "
-                        "skipping duplicate collect, using existing Redis events"
-                    )
-                else:
-                    try:
-                        await collect(sid, duration=org_duration)
-                    finally:
-                        await _release_lock(lock_client, sid)
-            except Exception:
-                log.exception(f"[org-detect] Event collection failed for site {sid}")
-
-        # Step 2: Build features and health scores for every site and record each site's WLAN set.
+        # ── Phase 2: Build features + score health for all sites ──────────
         wlans_by_site: dict[str, list[str]] = {}
-        for sid in site_ids:
+        _redis_for_baseline = aioredis.from_url(REDIS_URL, decode_responses=True)
+        try:
+            event_type_index = await ensure_event_type_index(_redis_for_baseline)
+        finally:
+            await _redis_for_baseline.aclose()
+
+        for i, sid in enumerate(site_ids):
+            site_name = site_map.get(sid, sid[:8])
+            await _progress({
+                "phase": "building_features",
+                "current_site": site_name,
+                "sites_complete": i,
+                "total_sites": total_sites,
+                "org_complete": False,
+            })
             try:
                 wlans = await get_wlans(site_id=sid)
                 wlans_by_site[sid] = wlans
+
+                # Build Markov baselines if missing (same fallback as _run_wlan_detection)
+                _redis_bl = aioredis.from_url(REDIS_URL, decode_responses=True)
+                try:
+                    for wlan in wlans:
+                        if not await markov_baseline_exists(sid, wlan, _redis_bl):
+                            log.info("[org pipeline] No Markov baseline for site=%s wlan=%s — building", sid, wlan)
+                            try:
+                                await build_markov_baseline(sid, wlan, event_type_index)
+                            except Exception:
+                                log.exception("[org pipeline] Markov baseline build failed site=%s wlan=%s", sid, wlan)
+                finally:
+                    await _redis_bl.aclose()
+
                 for wlan in wlans:
                     await build_features(sid, wlan)
                     await score_health(sid, wlan)
-                log.info(
-                    f"[org-detect] Features built for site {sid}: "
-                    f"{len(wlans)} WLAN scope(s)"
-                )
             except Exception:
-                log.exception(f"[org-detect] Feature build failed for site {sid}")
+                log.exception(f"[org pipeline] Feature build failed for site {sid}")
                 wlans_by_site.setdefault(sid, [])
 
-        # Step 3: Determine the union of all WLAN scopes across the org.
+        # ── Phase 3: Org-wide anomaly detection ──────────────────────────
+        await _progress({
+            "phase": "org_scoring",
+            "current_site": None,
+            "sites_complete": 0,
+            "total_sites": total_sites,
+            "org_complete": False,
+        })
+
         all_wlans: set[str] = set()
         for wlans in wlans_by_site.values():
             all_wlans.update(wlans)
 
-        # Step 4: For each WLAN scope, pool all site features and run org-wide scoring.
+        org_total_macs: dict[str, int] = {}
         for wlan in sorted(all_wlans):
+            features_this_wlan: dict[str, dict] = {}
+            for sid in site_ids:
+                site_features = await get_features(sid, wlan)
+                if site_features:
+                    features_this_wlan[sid] = site_features
+
+            if not features_this_wlan:
+                continue
+
             try:
-                features_this_wlan: dict[str, dict] = {}
-                for sid in site_ids:
-                    site_features = await get_features(sid, wlan)
-                    if site_features:
-                        features_this_wlan[sid] = site_features
-
-                if not features_this_wlan:
-                    log.info(f"[org-detect] No features for wlan={wlan} — skipping")
-                    continue
-
-                total_macs = sum(len(f) for f in features_this_wlan.values())
-                log.info(
-                    f"[org-detect] Org-wide scoring wlan={wlan}: {total_macs} MACs "
-                    f"across {len(features_this_wlan)} sites"
-                )
-                site_macs_scored = await score_org_wide(features_this_wlan, wlan=wlan)
-                log.info(f"[org-detect] Scoring complete wlan={wlan}: {site_macs_scored}")
-
+                scored = await score_org_wide(features_this_wlan, wlan=wlan)
+                for sid, n in scored.items():
+                    org_total_macs[sid] = org_total_macs.get(sid, 0) + n
             except Exception:
-                log.exception(f"[org-detect] Org-wide scoring failed for wlan={wlan}")
+                log.exception(f"[org pipeline] score_org_wide failed for wlan={wlan}")
 
-        # Step 5: Dispatch org-wide webhook per WLAN scope from the combined findings.
+        # Dispatch org-wide webhooks
         for wlan in sorted(all_wlans):
             try:
                 await evaluate_and_dispatch("__org__", wlan=wlan, org_scope=True)
             except Exception:
-                log.exception(f"[org-detect] Org-wide webhook dispatch failed for wlan={wlan} (non-fatal)")
+                log.exception(f"[org pipeline] Org webhook dispatch failed for wlan={wlan}")
 
-        log.info(
-            f"[org-detect] Cross-site detection cycle complete for {len(site_ids)} sites"
-        )
+        await _progress({
+            "phase": "site_scoring",
+            "current_site": None,
+            "sites_complete": 0,
+            "total_sites": total_sites,
+            "org_complete": True,
+        })
 
+        # ── Phase 4: Per-site anomaly detection (sequential) ─────────────
+        for i, sid in enumerate(site_ids):
+            site_name = site_map.get(sid, sid[:8])
+            await _progress({
+                "phase": "site_scoring",
+                "current_site": site_name,
+                "sites_complete": i,
+                "total_sites": total_sites,
+                "org_complete": True,
+            })
+
+            wlans = wlans_by_site.get(sid, [])
+            for wlan in wlans:
+                try:
+                    await score(sid, wlan)
+                    await evaluate_and_dispatch(sid, wlan=wlan)
+                except Exception:
+                    log.exception(f"[org pipeline] Per-site scoring failed for site={sid} wlan={wlan}")
+
+        # ── Done ─────────────────────────────────────────────────────────
+        await _record_last_timestamp(_LAST_DETECTION_KEY)
+
+        await _progress({
+            "phase": "complete",
+            "current_site": None,
+            "sites_complete": total_sites,
+            "total_sites": total_sites,
+            "org_complete": True,
+        })
+
+        return {
+            "status": "ok",
+            "site_count": total_sites,
+            "org_macs_scored": org_total_macs,
+        }
+
+    except Exception:
+        log.exception("[org pipeline] Pipeline failed")
+        await _progress({
+            "phase": "error",
+            "current_site": None,
+            "sites_complete": 0,
+            "total_sites": len(site_ids),
+            "org_complete": False,
+            "message": "Pipeline failed — check server logs",
+        })
+        raise
     finally:
-        await lock_release_client.delete(lock_key)
-        await lock_release_client.aclose()
+        await _release_global_lock(redis_client)
+
+
+async def client_refresh_job():
+    """Daily job: refresh the org-wide MAC → device metadata cache from Mist API.
+
+    The cache is now org-scoped (MACs are unique across the org), so a single
+    refresh call serves every site. After the refresh we re-enrich stored
+    events for every site that has data in the retention window, using the
+    same shared cache.
+    """
+    if not MIST_ORG_ID:
+        log.error("MIST_ORG_ID not configured — skipping client refresh")
+        return
+    try:
+        total = await refresh_client_cache_org(MIST_ORG_ID)
+    except Exception:
+        log.exception("client_refresh_job: org-level client fetch failed")
+        return
+    log.info(f"Org client cache refreshed: {total} devices")
+
+    try:
+        cache = await get_client_cache()
+    except Exception:
+        log.exception("client_refresh_job: failed to load freshly written cache")
+        return
+    if cache is None:
+        log.error("client_refresh_job: cache missing immediately after refresh")
+        return
+
+    site_ids = await db.get_site_ids_with_events()
+    for sid in site_ids:
+        try:
+            reenriched = await reenrich_stale_events(sid, cache)
+            if reenriched:
+                log.info(f"Re-enriched {reenriched} stale events for site {sid}")
+        except Exception:
+            log.exception(f"client_refresh_job: re-enrichment failed for site {sid}")
 
 
 async def markov_baseline_job() -> None:
     """
-    Daily job: build Markov Chain transition matrix baselines for all site/wlan combinations.
+    Daily job: build Markov Chain transition matrix baselines for every site/WLAN
+    pair that has events in SQLite.
 
     Runs at 00:30 (30 minutes after the client cache refresh at 00:00) so that any
     newly-refreshed client enrichment is reflected in the baseline events before the
     matrix is built.
 
-    For each site and each WLAN scope, loads the last 24hr of events from Redis and
-    computes:
+    For each site and each WLAN scope, loads the last 24hr of events and computes:
       - Event-level NxN transition count matrix (Laplace-smoothed, row-normalized)
       - Episode-type 2x2 transition count matrix (short/normal episode states)
 
     Stored at sasquatch:markov_baseline:{site_id}:{wlan_key} with 48hr TTL.
-    On first deploy (no events yet) the key is simply not written — the detection cycle
-    will skip Markov scoring until the next daily run after events are collected.
+    On first deploy (no events yet) the iteration is empty — the next daily run
+    after events accumulate populates the baselines.
     """
-    site_id = await _get_focus_site()
-    if not site_id:
-        log.error("[markov baseline] No focus site configured — skipping")
+    site_ids = await db.get_site_ids_with_events()
+    if not site_ids:
+        log.info("[markov baseline] No sites with events in SQLite — skipping")
         return
 
     redis_client = aioredis.from_url(REDIS_URL, decode_responses=True)
@@ -514,46 +374,89 @@ async def markov_baseline_job() -> None:
     finally:
         await redis_client.aclose()
 
-    if site_id == ORG_FOCUS_VALUE:
-        site_ids = await _get_org_sites()
-        if not site_ids:
-            log.error("[markov baseline] Org focus set but no sites returned — skipping")
-            return
-        for sid in site_ids:
-            try:
-                wlans = await get_wlans(site_id=sid)
-                for wlan in wlans:
-                    result = await build_markov_baseline(sid, wlan, event_type_index)
-                    log.info(
-                        "[markov baseline] site=%s wlan=%s: %d MACs, %d events, "
-                        "%d normal episodes",
-                        sid, wlan,
-                        result.get("macs", 0),
-                        result.get("events", 0),
-                        result.get("normal_episodes", 0),
-                    )
-            except Exception:
-                log.exception("[markov baseline] Failed for site=%s", sid)
+    for sid in site_ids:
+        try:
+            wlans = await get_wlans(site_id=sid)
+            for wlan in wlans:
+                result = await build_markov_baseline(sid, wlan, event_type_index)
+                log.info(
+                    "[markov baseline] site=%s wlan=%s: %d MACs, %d events, "
+                    "%d normal episodes",
+                    sid, wlan,
+                    result.get("macs", 0),
+                    result.get("events", 0),
+                    result.get("normal_episodes", 0),
+                )
+        except Exception:
+            log.exception("[markov baseline] Failed for site=%s", sid)
+
+
+async def org_event_poll_job() -> None:
+    """
+    Optional hourly org-level event collection (collection only, no detection).
+
+    Controlled by the `sasquatch:event_polling_enabled` Redis key, toggled via
+    POST /api/v1/org/polling. When disabled (default), this job exits immediately.
+
+    Acquires the global mutex to prevent overlap with detection operations.
+    """
+    if not MIST_ORG_ID or not MIST_API_TOKEN:
+        log.debug("[org-poll] MIST_ORG_ID or MIST_API_TOKEN not configured — skipping")
+        return
+
+    redis_client = aioredis.from_url(REDIS_URL, decode_responses=True)
+    try:
+        enabled = await redis_client.get("sasquatch:event_polling_enabled")
+    finally:
+        await redis_client.aclose()
+
+    if enabled != "1":
+        log.debug("[org-poll] Event polling disabled — skipping")
+        return
+
+    lock_client, acquired = await _acquire_global_lock("collecting")
+    if not acquired:
+        await lock_client.aclose()
+        log.warning("[org-poll] Global lock held — skipping this poll cycle")
         return
 
     try:
-        wlans = await get_wlans(site_id=site_id)
-        for wlan in wlans:
-            result = await build_markov_baseline(site_id, wlan, event_type_index)
-            log.info(
-                "[markov baseline] site=%s wlan=%s: %d MACs, %d events, "
-                "%d normal episodes",
-                site_id, wlan,
-                result.get("macs", 0),
-                result.get("events", 0),
-                result.get("normal_episodes", 0),
-            )
+        log.info("[org-poll] Starting hourly org-level event collection")
+        site_counts = await collect_org(MIST_ORG_ID, duration="1h")
+        total = sum(site_counts.values())
+        log.info(
+            f"[org-poll] Collection complete: {total} events "
+            f"across {len(site_counts)} sites"
+        )
+        await _record_last_timestamp(_LAST_COLLECTION_KEY)
     except Exception:
-        log.exception("[markov baseline] Failed for site=%s", site_id)
+        log.exception("[org-poll] Event collection failed")
+    finally:
+        await _release_global_lock(lock_client)
+
+
+async def sqlite_retention_job():
+    """Purge SQLite events older than the 7-day retention window."""
+    try:
+        deleted = await db.purge_old_events()
+        if deleted:
+            log.info(f"[retention] Purged {deleted} expired events from SQLite")
+    except Exception:
+        log.exception("[retention] SQLite retention purge failed")
 
 
 def create_scheduler() -> AsyncIOScheduler:
     scheduler = AsyncIOScheduler()
+
+    # Daily at 03:00 — purge expired events from SQLite
+    scheduler.add_job(
+        sqlite_retention_job,
+        "cron",
+        hour=3,
+        minute=0,
+        id="sqlite_retention",
+        name="SQLite Event Retention Cleanup",
+    )
 
     # Daily at midnight — client cache refresh
     scheduler.add_job(
@@ -580,30 +483,18 @@ def create_scheduler() -> AsyncIOScheduler:
         next_run_time=datetime.now(timezone.utc),
     )
 
-    # Periodic per-site detection cycle
-    site_interval = config.get("general", "site_focus_detection_interval")
-    scheduler.add_job(
-        event_and_detect_job,
-        "interval",
-        minutes=site_interval,
-        id="event_and_detect",
-        name="Event Collection + Anomaly Detection",
-    )
+    # ARCH-4: Scheduled detection jobs removed. Anomaly detection is now triggered
+    # only via POST /api/v1/org/detect or the UI "Re-detect" button.
 
-    # Org-wide cross-site detection — only active when MIST_ORG_ID is configured.
-    # Pools all org MACs together so each MAC is scored against the full org population.
+    # Optional hourly org-level event polling (collection only, no detection).
+    # Disabled by default — toggled via POST /api/v1/org/polling.
     if MIST_ORG_ID:
-        org_interval = config.get("general", "org_detection_interval_hours")
         scheduler.add_job(
-            org_cross_site_detect_job,
+            org_event_poll_job,
             "interval",
-            hours=org_interval,
-            id="org_cross_site_detect",
-            name="Org Cross-Site Anomaly Detection",
-        )
-        log.info(
-            f"Org cross-site detection scheduled every {org_interval}h "
-            f"(org={MIST_ORG_ID})"
+            hours=1,
+            id="org_event_poll",
+            name="Org-Level Event Poll",
         )
 
     return scheduler

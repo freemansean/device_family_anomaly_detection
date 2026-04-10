@@ -147,7 +147,7 @@ async def run_family_tshoot(site_id: str, family: str, wlan: str) -> list[dict]:
         return []
 
     try:
-        cache = await get_client_cache(site_id)
+        cache = await get_client_cache() or {}
     except Exception:
         cache = {}
 
@@ -243,21 +243,30 @@ async def evaluate_and_dispatch(
         if not is_any_family_anomaly:
             continue
 
-        # Gate 2: family health score must be below threshold.
-        # For org_scope, use health_score embedded on the finding by score_org_wide().
-        # For site scope, cross-reference against the per-site health dict.
+        # Gate 2: family must be unhealthy by EITHER metric:
+        #   - aggregate health score below threshold, OR
+        #   - at least one service alarm present (>50% of active MACs unhealthy in a service)
+        # For org_scope, both health_score and service_alarms are embedded on the finding
+        # by score_org_wide(). For site scope, cross-reference against the per-site health dict.
         if org_scope:
             health_score = f.get("health_score", 1.0)
             health_components = f.get("health_components", {})
+            service_alarms = f.get("service_alarms", []) or []
+            service_health = f.get("service_health", {}) or {}
         else:
             family_health = health.get(family, {})
             health_score = family_health.get("health_score", 1.0)
             health_components = family_health.get("components", {})
+            service_alarms = family_health.get("service_alarms", []) or []
+            service_health = family_health.get("service_health", {}) or {}
 
-        if health_score >= threshold:
+        unhealthy_by_score = health_score < threshold
+        unhealthy_by_service = len(service_alarms) > 0
+        if not (unhealthy_by_score or unhealthy_by_service):
             log.debug(
                 "[%s] Skipping webhook for [%s]: family anomaly label present but "
-                "health_score=%.3f >= threshold %.3f (if=%s dbscan=%s markov=%s)",
+                "health_score=%.3f >= threshold %.3f and no service alarms "
+                "(if=%s dbscan=%s markov=%s)",
                 wlan, family, health_score, threshold,
                 f.get("is_family_outlier"), f.get("is_family_dbscan_outlier"),
                 f.get("is_family_markov_outlier"),
@@ -280,6 +289,8 @@ async def evaluate_and_dispatch(
             **f,
             "health_score": health_score,
             "health_components": health_components,
+            "service_alarms": service_alarms,
+            "service_health": service_health,
         })
 
     # Track alert history regardless of qualifying count or scope setting.

@@ -27,12 +27,8 @@ _CONFIG_FILE = pathlib.Path(__file__).parent / "config_overrides.json"
 DEFAULTS = {
     # ── General Config ──────────────────────────────────────────────
     "general": {
-        # How often (minutes) to run site-focused detection
-        "site_focus_detection_interval": {"default": 60, "env": "SITE_FOCUS_DETECTION_INTERVAL", "cast": int},
         # How often (hours) to run org-wide cross-site detection
         "org_detection_interval_hours": {"default": 1, "env": "ORG_DETECTION_INTERVAL_HOURS", "cast": int},
-        # Cache-miss count before early client-cache refresh
-        "cache_miss_refresh_threshold": {"default": 10, "env": "CACHE_MISS_REFRESH_THRESHOLD", "cast": int},
         # Minimum events per MAC to be included in ML feature matrix
         "anomaly_min_mac_events": {"default": 5, "env": "ANOMALY_MIN_MAC_EVENTS", "cast": int},
     },
@@ -81,14 +77,21 @@ DEFAULTS = {
         "markov_min_episode_length": {"default": 3, "env": "MARKOV_MIN_EPISODE_LENGTH", "cast": int},
         # Markov: episode anomaly ratio to flag a MAC
         "markov_outlier_episode_ratio": {"default": 0.5, "env": "MARKOV_OUTLIER_EPISODE_RATIO", "cast": float},
-        # Markov: min repeated short episodes to flag
-        "markov_short_episode_min_count": {"default": 3, "env": "MARKOV_SHORT_EPISODE_MIN_COUNT", "cast": int},
         # Markov: min scoreable episodes before analysis runs
         "markov_min_scoreable_episodes": {"default": 2, "env": "MARKOV_MIN_SCOREABLE_EPISODES", "cast": int},
         # Markov: stuck-loop transition dominance threshold
         "markov_stuck_loop_threshold": {"default": 0.4, "env": "MARKOV_STUCK_LOOP_THRESHOLD", "cast": float},
         # Markov: min events before stuck-loop detection runs
         "markov_stuck_loop_min_events": {"default": 20, "env": "MARKOV_STUCK_LOOP_MIN_EVENTS", "cast": int},
+    },
+
+    # ── Service Account Visibility ─────────────────────────────────
+    "service_account": {
+        # Minimum number of distinct client MACs sharing the same normalized
+        # username before that username is treated as a service-account family.
+        # Set higher to suppress small username clusters; set to 0 to disable
+        # service-account family generation entirely.
+        "service_account_min_macs": {"default": 50, "env": "SERVICE_ACCOUNT_MIN_MACS", "cast": int},
     },
 }
 

@@ -1,8 +1,9 @@
 """
 routes.py — FastAPI route definitions.
 
-All reads come from Redis — no real-time Mist API calls in the request path.
-The API is read-only except for the manual refresh POST.
+Events and client cache are read from SQLite; anomaly results, features, health
+scores, findings, and config remain in Redis. No real-time Mist API calls in the
+request path. The API is read-only except for the manual refresh POST.
 
 WLAN scoping: endpoints that return findings, anomalies, or event summaries require a
 ?wlan= query parameter specifying the SSID to scope results to. The parameter is
@@ -32,14 +33,12 @@ from ..anomaly_detector import (
     _org_findings_redis_key,
     get_anomalies,
     get_findings,
-    get_org_findings as _get_org_findings_for_site,
     score,
-    score_org_wide,
 )
-from ..client_cache import get_client_cache, refresh_client_cache
+from ..client_cache import get_client_cache, refresh_client_cache_org
 from ..event_collector import (
     EVENT_CATEGORIES,
-    collect_full,
+    collect_org_full,
     get_event_type_index,
     get_events,
     get_wlans,
@@ -47,9 +46,16 @@ from ..event_collector import (
 )
 from ..feature_engineer import _family_event_counts_redis_key, _features_redis_key, build_features, get_features
 from ..health_scorer import get_health, score_health, _health_redis_key
-from ..markov_analyzer import baseline_exists as markov_baseline_exists
 from ..markov_analyzer import build_and_store_baseline as build_markov_baseline
-from ..scheduler import build_org_pools, run_collect_only, run_detect_only, run_detection_cycle
+from ..scheduler import (
+    _GLOBAL_LOCK_KEY,
+    _LAST_COLLECTION_KEY,
+    _ORG_DETECT_PROGRESS_KEY,
+    _ORG_DETECT_PROGRESS_TTL,
+    get_global_lock_status,
+    get_job_status,
+    run_org_pipeline,
+)
 from .. import alert_tracker
 from ..webhook_dispatcher import evaluate_and_dispatch, run_family_tshoot
 from .auth import require_auth
@@ -59,8 +65,6 @@ log = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1")
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
-SITE_ID = os.getenv("MIST_SITE_ID", "")
-SITE_FOCUS_DETECTION_INTERVAL = int(os.getenv("SITE_FOCUS_DETECTION_INTERVAL", "60"))
 MIST_API_TOKEN = os.getenv("MIST_API_TOKEN", "")
 MIST_CLOUD_HOST = os.getenv("MIST_CLOUD_HOST", "api.mist.com")
 MIST_ORG_ID = os.getenv("MIST_ORG_ID", "")
@@ -103,173 +107,12 @@ def _run_pca(X: np.ndarray) -> tuple[np.ndarray, list[float]]:
     return coords, pca.explained_variance_ratio_.tolist()
 
 
-def _configured_sites() -> list[str]:
-    """Return list of configured site IDs from env."""
-    site = os.getenv("MIST_SITE_ID", "")
-    return [site] if site else []
-
-
 async def _redis_get(key: str):
     client = _get_redis()
     try:
         return await client.get(key)
     finally:
         await client.aclose()
-
-
-async def _run_wlan_detection_bg(site_id: str, redis_client, progress_key: str, wp) -> dict:
-    """
-    Run build_features + score_health + score for each unique WLAN.
-    Used by background detection tasks. Returns summary dict.
-    """
-    wlans = await get_wlans(site_id=site_id)
-    if not wlans:
-        log.info(f"No WLANs detected for site={site_id} — skipping detection")
-        return {"macs_scored": 0, "wlan_scopes": 0}
-
-    total_macs = 0
-
-    # Build any missing Markov baselines before scoring. Mirrors the same fallback
-    # in scheduler._run_wlan_detection so full-discovery runs don't silently skip Markov.
-    try:
-        event_type_index = await get_event_type_index(site_id)
-        for wlan in wlans:
-            if not await markov_baseline_exists(site_id, wlan, redis_client):
-                log.info(
-                    "[bg detection] No Markov baseline for site=%s wlan=%s — building now",
-                    site_id, wlan,
-                )
-                try:
-                    result = await build_markov_baseline(site_id, wlan, event_type_index)
-                    log.info(
-                        "[bg detection] Markov baseline built: site=%s wlan=%s macs=%d events=%d episodes=%d",
-                        site_id, wlan,
-                        result.get("macs", 0),
-                        result.get("events", 0),
-                        result.get("normal_episodes", 0),
-                    )
-                except Exception:
-                    log.exception(
-                        "[bg detection] Failed to build Markov baseline for site=%s wlan=%s",
-                        site_id, wlan,
-                    )
-    except Exception:
-        log.exception("[bg detection] Markov baseline pre-check failed for site=%s — continuing", site_id)
-
-    for wlan in wlans:
-        try:
-            mac_count = await build_features(site_id, wlan)
-            if mac_count == 0:
-                log.info(f"No MACs with enough events for site={site_id} wlan={wlan} — skipping scoring")
-                continue
-            await score_health(site_id, wlan)
-            scored = await score(site_id, wlan)
-            total_macs = max(total_macs, scored)
-            await evaluate_and_dispatch(site_id, wlan=wlan)
-        except Exception:
-            log.exception(f"WLAN detection failed for site={site_id} wlan={wlan}")
-
-    return {"macs_scored": total_macs, "wlan_scopes": len(wlans)}
-
-
-async def _detection_background_task(site_id: str) -> None:
-    """
-    Full 24hr detection pipeline run as a FastAPI background task.
-    Writes phase-by-phase progress to Redis key sasquatch:progress:{site_id}.
-    Runs feature engineering + scoring for each unique WLAN.
-    """
-    lock_key = f"sasquatch:lock:detection:{site_id}"
-    progress_key = f"sasquatch:progress:{site_id}"
-    started = _time.time()
-
-    redis_client = _get_redis()
-
-    async def wp(data: dict) -> None:
-        data["started_at"] = started
-        await redis_client.set(progress_key, json.dumps(data), ex=300)
-
-    acquired = await redis_client.set(lock_key, "1", nx=True, ex=45 * 60)
-    if not acquired:
-        await wp({"phase": "error", "message": "Another detection cycle is already running"})
-        await redis_client.aclose()
-        return
-
-    try:
-        await wp({"phase": "starting", "events_fetched": 0, "total_estimated": None, "pages": 0})
-
-        client_cache = await get_client_cache(site_id)
-        if client_cache is None:
-            log.info(f"Client cache missing for site {site_id} — refreshing before full run")
-            await refresh_client_cache(site_id)
-            client_cache = await get_client_cache(site_id) or {}
-            if client_cache is None:
-                log.warning(f"Client cache still missing after refresh for site {site_id} — skipping")
-                await wp({"phase": "error", "message": f"No clients found for site {site_id} after refresh"})
-                return
-
-        async def on_page(page: int, fetched: int, total: Optional[int]) -> None:
-            await wp({
-                "phase": "collecting",
-                "events_fetched": fetched,
-                "total_estimated": total,
-                "pages": page,
-            })
-
-        event_count = await collect_full(site_id, on_page=on_page)
-
-        if event_count == 0:
-            log.info(f"No events found for site {site_id} — skipping detection")
-            await wp({"phase": "complete", "events_fetched": 0, "total_estimated": 0, "pages": -1, "macs_scored": 0})
-            return
-
-        await wp({"phase": "scoring", "events_fetched": event_count, "total_estimated": event_count, "pages": -1})
-
-        wlan_summary = await _run_wlan_detection_bg(site_id, redis_client, progress_key, wp)
-
-        await wp({
-            "phase": "complete",
-            "events_fetched": event_count,
-            "total_estimated": event_count,
-            "pages": -1,
-            "macs_scored": wlan_summary["macs_scored"],
-            "wlan_scopes": wlan_summary["wlan_scopes"],
-        })
-
-    except Exception as exc:
-        log.exception(f"Background detection failed for site {site_id}")
-        await wp({"phase": "error", "message": str(exc)})
-    finally:
-        await redis_client.delete(lock_key)
-        await redis_client.aclose()
-
-
-@router.get("/focus")
-async def get_focus():
-    """Return the site the scheduler is currently targeting (Redis override or env fallback)."""
-    client = _get_redis()
-    try:
-        override = await client.get("sasquatch:focus_site")
-    finally:
-        await client.aclose()
-    return {
-        "site_id": override if override else SITE_ID,
-        "source": "override" if override else "env",
-    }
-
-
-@router.post("/focus")
-async def set_focus(body: dict):
-    """Redirect the scheduler to poll a different site (stored in Redis)."""
-    site_id = (body.get("site_id") or "").strip()
-    if not site_id:
-        raise HTTPException(status_code=400, detail="site_id is required")
-    client = _get_redis()
-    try:
-        await client.set("sasquatch:focus_site", site_id)
-    finally:
-        await client.aclose()
-    log.info(f"Scheduler focus updated to site {site_id}")
-    return {"site_id": site_id, "source": "override"}
 
 
 @router.get("/org/detection-enabled")
@@ -294,6 +137,225 @@ async def set_org_detection_enabled(body: dict):
     finally:
         await client.aclose()
     log.info(f"Org detection {'enabled' if enabled else 'disabled'} by administrator")
+    return {"enabled": enabled}
+
+
+# ---------------------------------------------------------------------------
+# Org-level event collection (ARCH-3)
+# ---------------------------------------------------------------------------
+
+async def _org_collect_background_task() -> None:
+    """
+    Full 24hr org-level event collection run as a FastAPI background task.
+    Writes phase-by-phase progress to sasquatch:progress:org_collect.
+
+    Phase sequence:
+      1. ``collecting_clients`` — refresh the org-wide client cache so event
+         enrichment sees up-to-date device metadata.
+      2. ``collecting_events`` — stream org-wide client events into SQLite.
+    """
+    progress_key = "sasquatch:progress:org_collect"
+    lock_key = _GLOBAL_LOCK_KEY
+    started = _time.time()
+
+    redis_client = _get_redis()
+
+    async def wp(data: dict) -> None:
+        data["started_at"] = started
+        await redis_client.set(progress_key, json.dumps(data), ex=300)
+
+    acquired = await redis_client.set(
+        lock_key,
+        json.dumps({"operation": "collecting", "started_at": started}),
+        nx=True,
+        ex=2 * 60 * 60,
+    )
+    if not acquired:
+        await wp({"phase": "error", "message": "Another operation is already running"})
+        await redis_client.aclose()
+        return
+
+    try:
+        # ── Phase 1: refresh the org-wide client cache ───────────────────
+        await wp({
+            "phase": "collecting_clients",
+            "pages_fetched": 0,
+            "clients_fetched": 0,
+            "total_clients_estimated": None,
+            "expected_client_pages": None,
+            "status": "Gathering clients...",
+        })
+
+        async def on_client_page(page: int, fetched: int, total: Optional[int]) -> None:
+            # With a 1000-record page size, the total number of pages required
+            # is ceil(total / 1000). Surface both so the frontend can drive the
+            # bar off page/expected_pages rather than a page-count heuristic.
+            expected_pages = (total + 999) // 1000 if total else None
+            if expected_pages:
+                status = (
+                    f"Gathering clients — page {page}/{expected_pages} "
+                    f"({fetched:,}/{total:,})"
+                )
+            else:
+                status = f"Gathering clients — page {page} ({fetched:,} so far)"
+            await wp({
+                "phase": "collecting_clients",
+                "pages_fetched": page,
+                "clients_fetched": fetched,
+                "total_clients_estimated": total,
+                "expected_client_pages": expected_pages,
+                "status": status,
+            })
+
+        try:
+            total_clients = await refresh_client_cache_org(
+                MIST_ORG_ID, on_page=on_client_page
+            )
+            log.info(f"Org client cache refreshed: {total_clients} clients")
+        except Exception:
+            log.exception("Org client cache refresh failed — proceeding with existing cache")
+            total_clients = 0
+
+        # ── Phase 2: stream org-wide client events ──────────────────────
+        await wp({
+            "phase": "collecting_events",
+            "pages_fetched": 0,
+            "events_fetched": 0,
+            "clients_fetched": total_clients,
+            "total_events_estimated": None,
+            "expected_event_pages": None,
+            "status": "Gathering client events...",
+        })
+
+        async def on_page(page: int, fetched: int, total: Optional[int]) -> None:
+            # Mist returns a `total` on the events response (e.g. 171498). At
+            # 1000 events per page that's ceil(171498/1000) = 172 calls; use
+            # that to drive the progress bar off real work instead of a
+            # fixed-step heuristic.
+            expected_pages = (total + 999) // 1000 if total else None
+            if expected_pages:
+                status = (
+                    f"Gathering client events — page {page}/{expected_pages} "
+                    f"({fetched:,}/{total:,})"
+                )
+            else:
+                status = f"Gathering client events — page {page}"
+            await wp({
+                "phase": "collecting_events",
+                "pages_fetched": page,
+                "events_fetched": fetched,
+                "clients_fetched": total_clients,
+                "total_events_estimated": total,
+                "expected_event_pages": expected_pages,
+                "status": status,
+            })
+
+        site_results = await collect_org_full(MIST_ORG_ID, on_page=on_page)
+
+        total_events = sum(site_results.values())
+
+        await redis_client.set(
+            _LAST_COLLECTION_KEY,
+            datetime.now(timezone.utc).isoformat(),
+        )
+
+        # Auto-enable hourly event polling once a successful full collect lands.
+        # The hourly job (org_event_poll_job in scheduler.py) gates on this key,
+        # so flipping it here means subsequent hourly increments will run without
+        # requiring the operator to flip the toggle in the UI.
+        await redis_client.set("sasquatch:event_polling_enabled", "1")
+        log.info("Org event polling auto-enabled after successful full collect")
+
+        await wp({
+            "phase": "complete",
+            "pages_fetched": -1,
+            "events_fetched": total_events,
+            "clients_fetched": total_clients,
+            "site_counts": site_results,
+            "sites_with_events": len(site_results),
+            "status": (
+                f"Complete — {total_clients:,} clients, "
+                f"{total_events:,} events across {len(site_results)} sites"
+            ),
+        })
+
+    except Exception as exc:
+        log.exception("Org-level collection failed")
+        await wp({"phase": "error", "message": str(exc)})
+    finally:
+        await redis_client.delete(lock_key)
+        await redis_client.aclose()
+
+
+@router.post("/org/collect-full")
+async def trigger_org_collect_full(background_tasks: BackgroundTasks):
+    """
+    Trigger a full 24hr org-level event collection via a single Mist API call.
+    Replaces per-site collection loops. Runs in the background.
+    Returns 409 if an operation is already in progress (global mutex).
+    """
+    if not MIST_ORG_ID:
+        raise HTTPException(status_code=400, detail="MIST_ORG_ID not configured")
+    if not MIST_API_TOKEN:
+        raise HTTPException(status_code=400, detail="MIST_API_TOKEN not configured")
+
+    lock_status = await get_global_lock_status()
+    if lock_status:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Another operation is already running: {lock_status.get('operation', 'unknown')}",
+        )
+
+    background_tasks.add_task(_org_collect_background_task)
+    return {"status": "started", "operation": "org_collect_full"}
+
+
+@router.get("/org/collect-progress")
+async def get_org_collect_progress():
+    """Return progress of an ongoing org-level event collection."""
+    redis_client = _get_redis()
+    try:
+        raw = await redis_client.get("sasquatch:progress:org_collect")
+        if raw:
+            return json.loads(raw)
+        return {"phase": "idle"}
+    finally:
+        await redis_client.aclose()
+
+
+@router.get("/org/job-status")
+async def get_org_job_status():
+    """
+    Return the current job state: active operation, polling status, and last
+    collection/detection timestamps. Frontend uses this to disable trigger buttons
+    when an operation is active.
+    """
+    return await get_job_status()
+
+
+@router.get("/org/polling")
+async def get_org_polling_status():
+    """Return whether org-level hourly event polling is enabled."""
+    redis_client = _get_redis()
+    try:
+        val = await redis_client.get("sasquatch:event_polling_enabled")
+    finally:
+        await redis_client.aclose()
+    return {"enabled": val == "1"}
+
+
+@router.post("/org/polling")
+async def set_org_polling(body: dict):
+    """Enable or disable org-level hourly event polling."""
+    enabled = bool(body.get("enabled", True))
+    redis_client = _get_redis()
+    try:
+        await redis_client.set(
+            "sasquatch:event_polling_enabled", "1" if enabled else "0"
+        )
+    finally:
+        await redis_client.aclose()
+    log.info(f"Org event polling {'enabled' if enabled else 'disabled'}")
     return {"enabled": enabled}
 
 
@@ -396,9 +458,7 @@ async def set_general_config(body: dict):
     config: dict = {}
 
     int_bounds = {
-        "site_focus_detection_interval": (1, 1440),
         "org_detection_interval_hours": (1, 168),
-        "cache_miss_refresh_threshold": (1, 1000),
         "anomaly_min_mac_events": (1, 10000),
     }
     for key, (lo, hi) in int_bounds.items():
@@ -452,7 +512,6 @@ async def set_anomaly_config(body: dict):
         "anomaly_centroid_healthy_ref_min": (1, 100),
         "anomaly_finding_min_size": (1, 500),
         "markov_min_episode_length": (1, 100),
-        "markov_short_episode_min_count": (1, 100),
         "markov_min_scoreable_episodes": (1, 100),
         "markov_stuck_loop_min_events": (1, 10000),
     }
@@ -487,12 +546,6 @@ async def get_site_progress(site_id: str):
     if not raw:
         return {"phase": "idle"}
     return json.loads(raw)
-
-
-@router.get("/sites")
-async def list_sites():
-    """List all configured site IDs."""
-    return {"sites": _configured_sites()}
 
 
 @router.get("/wlans")
@@ -593,129 +646,75 @@ async def get_org_summary(wlan: str = Query(..., description="WLAN (SSID) name t
     }
 
 
-@router.post("/org/run")
-async def trigger_org_detection_run(background_tasks: BackgroundTasks):
+async def _org_detect_background_task(site_ids: list[str], site_map: dict[str, str]) -> None:
     """
-    Trigger the full 24hr detection pipeline for every site in the org as background tasks.
-    Returns immediately. Poll GET /org/progress for per-site status.
+    ARCH-5 org detection pipeline run as a FastAPI background task.
+    Writes progress to sasquatch:progress:org_detect.
+    Sequence: build features → org-wide scoring → per-site scoring.
+    """
+    redis_client = _get_redis()
+
+    async def _write_progress(data: dict) -> None:
+        await redis_client.set(
+            _ORG_DETECT_PROGRESS_KEY, json.dumps(data), ex=_ORG_DETECT_PROGRESS_TTL,
+        )
+
+    try:
+        await run_org_pipeline(
+            site_ids=site_ids,
+            site_map=site_map,
+            progress_callback=_write_progress,
+        )
+    except RuntimeError:
+        # Lock already held — progress already written by run_org_pipeline
+        pass
+    except Exception:
+        log.exception("[org detect bg] Pipeline failed")
+    finally:
+        await redis_client.aclose()
+
+
+@router.post("/org/detect")
+async def trigger_org_detect_only(background_tasks: BackgroundTasks):
+    """
+    ARCH-5: Trigger the org detection pipeline as a background task.
+
+    Pipeline sequence:
+      1. Build features + score health for all sites
+      2. Run org-wide anomaly detection → dispatch org webhooks
+      3. Run per-site anomaly detection → dispatch per-site webhooks
+
+    Org findings appear in the UI as soon as phase 2 completes.
+    Per-site findings appear incrementally as each site completes in phase 3.
+
+    Returns 202 immediately. Poll GET /org/detect-progress for status.
+    Returns 409 if an operation is already in progress (global mutex).
     """
     if not MIST_ORG_ID or not MIST_API_TOKEN:
         raise HTTPException(status_code=500, detail="MIST_ORG_ID or MIST_API_TOKEN not configured.")
 
+    lock_status = await get_global_lock_status()
+    if lock_status:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Another operation is already running: {lock_status.get('operation', 'unknown')}",
+        )
+
     redis_client = _get_redis()
     try:
-        site_ids = await _get_org_site_ids(redis_client)
-    except Exception:
-        raise HTTPException(status_code=502, detail="Could not reach Mist API")
+        try:
+            site_map = await _get_org_site_map(redis_client)
+        except Exception:
+            raise HTTPException(status_code=502, detail="Could not reach Mist API")
     finally:
         await redis_client.aclose()
 
-    for sid in site_ids:
-        background_tasks.add_task(_detection_background_task, sid)
+    site_ids = list(site_map.keys())
+    background_tasks.add_task(_org_detect_background_task, site_ids, site_map)
 
     return {
         "status": "started",
         "site_count": len(site_ids),
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    }
-
-
-@router.post("/org/detect")
-async def trigger_org_detect_only():
-    """
-    Re-run feature engineering + org-wide anomaly scoring for every site in the org
-    using events already in Redis. Does not pull new events from Mist.
-
-    Runs in two phases:
-      1. Build features for all sites.
-      2. Pool all site features and run score_org_wide() per WLAN scope so every MAC
-         is scored against the full org population (DBSCAN, Family Centroid IF, and
-         Isolation Forest all operate across all sites combined).
-
-    Results are written to sasquatch:org_findings:{site_id}:{wlan} — the same keys
-    read by GET /org/findings.
-    """
-    if not MIST_ORG_ID or not MIST_API_TOKEN:
-        raise HTTPException(status_code=500, detail="MIST_ORG_ID or MIST_API_TOKEN not configured.")
-
-    redis_client = _get_redis()
-    try:
-        site_ids = await _get_org_site_ids(redis_client)
-    except Exception:
-        raise HTTPException(status_code=502, detail="Could not reach Mist API")
-    finally:
-        await redis_client.aclose()
-
-    # Phase 1 — build features, health scores, and per-site findings for all sites.
-    wlans_by_site: dict[str, list[str]] = {}
-    for sid in site_ids:
-        try:
-            wlans = await get_wlans(site_id=sid)
-            wlans_by_site[sid] = wlans
-            for wlan in wlans:
-                await build_features(sid, wlan)
-                await score_health(sid, wlan)
-                await score(sid, wlan)
-        except Exception:
-            log.exception(f"Org detect: feature build failed for site {sid}")
-            wlans_by_site.setdefault(sid, [])
-
-    # Phase 2 — pool all site features and run org-wide cross-site scoring.
-    all_wlans: set[str] = set()
-    for wlans in wlans_by_site.values():
-        all_wlans.update(wlans)
-
-    total_macs_scored: dict[str, int] = {}
-    for wlan in sorted(all_wlans):
-        features_this_wlan: dict[str, dict] = {}
-        for sid in site_ids:
-            site_features = await get_features(sid, wlan)
-            if site_features:
-                features_this_wlan[sid] = site_features
-
-        if not features_this_wlan:
-            continue
-
-        try:
-            scored = await score_org_wide(features_this_wlan, wlan=wlan)
-            for sid, n in scored.items():
-                total_macs_scored[sid] = total_macs_scored.get(sid, 0) + n
-        except Exception:
-            log.exception(f"Org detect: score_org_wide failed for wlan={wlan}")
-
-    org_findings = []
-    for wlan in all_wlans:
-        org_findings.extend(await _get_org_findings_for_site(wlan))
-
-    # Phase 3 — dispatch webhooks for each site/wlan using the freshly-scored findings.
-    for sid, wlans in wlans_by_site.items():
-        for wlan in wlans:
-            try:
-                await evaluate_and_dispatch(sid, wlan)
-            except Exception:
-                log.exception(f"Org detect: webhook dispatch failed for site {sid} wlan={wlan} (non-fatal)")
-
-    # Dispatch org-wide webhook for each WLAN scope (org findings carry embedded health_score).
-    for wlan in sorted(all_wlans):
-        try:
-            await evaluate_and_dispatch("__org__", wlan=wlan, org_scope=True)
-        except Exception:
-            log.exception(f"Org detect: org-wide webhook dispatch failed for wlan={wlan} (non-fatal)")
-
-    results = [
-        {
-            "site_id": sid,
-            "status": "ok",
-            "macs_scored": total_macs_scored.get(sid, 0),
-        }
-        for sid in site_ids
-    ]
-
-    return {
-        "status": "ok",
-        "site_count": len(site_ids),
-        "finding_count": len(org_findings),
-        "results": results,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -736,15 +735,20 @@ async def flush_org_redis():
     except Exception:
         raise HTTPException(status_code=502, detail="Could not reach Mist API")
 
+    from .. import db as _db
+
     results = []
     total_deleted = 0
     try:
+        # Clients are now stored org-wide (MAC is the unique key across the org),
+        # so delete the entire client cache once before iterating sites.
+        total_deleted += await _db.delete_clients_for_org(MIST_ORG_ID)
         for sid in site_ids:
             deleted = 0
+            # Flush SQLite events for this site (clients handled above, org-wide).
+            deleted += await _db.delete_events_for_site(sid)
+            # Flush remaining Redis keys (unknown_event_types, progress)
             static_keys = [
-                f"sasquatch:events:{sid}",
-                f"sasquatch:wlans:{sid}",
-                f"sasquatch:clients:{sid}",
                 f"sasquatch:unknown_event_types:{sid}",
                 f"sasquatch:progress:{sid}",
             ]
@@ -784,36 +788,23 @@ async def flush_org_redis():
 @router.post("/org/refresh")
 async def trigger_org_client_refresh():
     """
-    Manually trigger a client cache refresh from the Mist API for every site in the org.
-    Runs serially per site (same as the per-site /refresh endpoint).
+    Manually trigger an org-wide client cache refresh from the Mist API.
+    The cache is org-scoped (MAC unique across the org), so a single API call
+    populates the entire cache.
     """
     if not MIST_ORG_ID or not MIST_API_TOKEN:
         raise HTTPException(status_code=500, detail="MIST_ORG_ID or MIST_API_TOKEN not configured.")
 
-    redis_client = _get_redis()
     try:
-        site_ids = await _get_org_site_ids(redis_client)
-    except Exception:
-        raise HTTPException(status_code=502, detail="Could not reach Mist API")
-    finally:
-        await redis_client.aclose()
-
-    results = []
-    total_cached = 0
-    for sid in site_ids:
-        try:
-            count = await refresh_client_cache(sid)
-            total_cached += count
-            results.append({"site_id": sid, "status": "ok", "clients_cached": count})
-        except Exception as exc:
-            log.exception(f"Org client refresh failed for site {sid}")
-            results.append({"site_id": sid, "status": "error", "detail": str(exc)})
+        total_cached = await refresh_client_cache_org(MIST_ORG_ID)
+    except Exception as exc:
+        log.exception("Org client refresh failed")
+        raise HTTPException(status_code=502, detail=f"Org client refresh failed: {exc}")
 
     return {
         "status": "ok",
-        "site_count": len(site_ids),
+        "org_id": MIST_ORG_ID,
         "total_clients_cached": total_cached,
-        "results": results,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -892,6 +883,40 @@ async def get_org_progress():
         "sites_running": sites_running,
         "message": f"{sites_complete}/{sites_total} sites complete",
     }
+
+
+@router.get("/org/detect-progress")
+async def get_org_detect_progress():
+    """
+    ARCH-5: Return progress of the org detection pipeline.
+
+    Response shape:
+    {
+      "phase": "building_features" | "org_scoring" | "site_scoring" | "complete" | "error" | "idle",
+      "current_site": "Building West" | null,
+      "sites_complete": 12,
+      "total_sites": 50,
+      "started_at": 1712678400.0,
+      "org_complete": true
+    }
+    """
+    redis_client = _get_redis()
+    try:
+        raw = await redis_client.get(_ORG_DETECT_PROGRESS_KEY)
+    finally:
+        await redis_client.aclose()
+
+    if not raw:
+        return {
+            "phase": "idle",
+            "current_site": None,
+            "sites_complete": 0,
+            "total_sites": 0,
+            "started_at": None,
+            "org_complete": False,
+        }
+
+    return json.loads(raw)
 
 
 @router.get("/org/findings")
@@ -1239,6 +1264,7 @@ async def get_org_family_insights(wlan: str = Query(..., description="WLAN (SSID
         org_family_dbscan_severity: dict[str, str] = {}
         org_family_markov_ratio: dict[str, float] = {}
         org_family_markov_is_outlier: dict[str, bool] = {}
+        org_family_markov_reason: dict[str, str | None] = {}
         org_family_dbscan_site_count: dict[str, int] = {}
         for f in org_findings_list:
             fam = f.get("device_family")
@@ -1252,6 +1278,9 @@ async def get_org_family_insights(wlan: str = Query(..., description="WLAN (SSID
                 org_family_markov_ratio[fam] = ratio
             if f.get("is_family_markov_outlier"):
                 org_family_markov_is_outlier[fam] = True
+            reason = f.get("markov_family_reason")
+            if reason and fam not in org_family_markov_reason:
+                org_family_markov_reason[fam] = reason
             cnt = f.get("dbscan_outlier_site_count")
             if cnt is not None:
                 org_family_dbscan_site_count[fam] = cnt
@@ -1272,6 +1301,24 @@ async def get_org_family_insights(wlan: str = Query(..., description="WLAN (SSID
         family_health_weighted_sum: dict[str, float] = defaultdict(float)
         family_health_weight_total: dict[str, float] = defaultdict(float)
         family_health_components_sum: dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
+        # Per-service org rollup: sum active/unhealthy MAC counts and active-weighted
+        # health values per family across all sites. Org-level service alarm fires when
+        # the summed unhealthy/active ratio exceeds FAMILY_SERVICE_ALARM_THRESHOLD across
+        # the full device-family scope (matches the user-specified ">50% of clients in
+        # the total device family scope" semantic).
+        from ..health_scorer import (
+            SERVICES as _HSCORE_SERVICES,
+            FAMILY_SERVICE_ALARM_THRESHOLD as _HSCORE_FAMILY_SVC_THRESHOLD,
+        )
+        family_svc_active: dict[str, dict[str, int]] = defaultdict(
+            lambda: {svc: 0 for svc in _HSCORE_SERVICES}
+        )
+        family_svc_unhealthy: dict[str, dict[str, int]] = defaultdict(
+            lambda: {svc: 0 for svc in _HSCORE_SERVICES}
+        )
+        family_svc_health_wsum: dict[str, dict[str, float]] = defaultdict(
+            lambda: {svc: 0.0 for svc in _HSCORE_SERVICES}
+        )
         sites_with_data = 0
 
         for site_id, site_name in site_map.items():
@@ -1316,6 +1363,18 @@ async def get_org_family_insights(wlan: str = Query(..., description="WLAN (SSID
                     family_health_weight_total[fam] += weight
                     for comp, rate in hdata.get("components", {}).items():
                         family_health_components_sum[fam][comp] += rate * weight
+                # Sum service alarm counts and health across sites for org rollup.
+                site_svc_counts = hdata.get("service_alarm_counts", {}) or {}
+                site_svc_health = hdata.get("service_health", {}) or {}
+                for svc in _HSCORE_SERVICES:
+                    info = site_svc_counts.get(svc) or {}
+                    a = int(info.get("active", 0))
+                    u = int(info.get("unhealthy", 0))
+                    family_svc_active[fam][svc] += a
+                    family_svc_unhealthy[fam][svc] += u
+                    sh_val = site_svc_health.get(svc)
+                    if sh_val is not None and a > 0:
+                        family_svc_health_wsum[fam][svc] += float(sh_val) * a
 
             # Collect worst centroid IF score from anomaly records (available even when
             # no finding exists for a family at this site).
@@ -1350,7 +1409,27 @@ async def get_org_family_insights(wlan: str = Query(..., description="WLAN (SSID
                 }
                 if health_weight > 0 else None
             )
+            # Org-wide service rollup: alarm fires when summed unhealthy/active > threshold.
+            svc_active_map = family_svc_active.get(family, {})
+            svc_unhealthy_map = family_svc_unhealthy.get(family, {})
+            svc_health_wsum_map = family_svc_health_wsum.get(family, {})
+            service_health_out: dict[str, float | None] = {}
+            service_alarm_counts_out: dict[str, dict[str, int]] = {}
+            service_alarms_out: list[str] = []
+            for svc in _HSCORE_SERVICES:
+                a = svc_active_map.get(svc, 0)
+                u = svc_unhealthy_map.get(svc, 0)
+                service_alarm_counts_out[svc] = {"active": a, "unhealthy": u}
+                if a > 0:
+                    service_health_out[svc] = round(svc_health_wsum_map.get(svc, 0.0) / a, 4)
+                    if (u / a) > _HSCORE_FAMILY_SVC_THRESHOLD:
+                        service_alarms_out.append(svc)
+                else:
+                    service_health_out[svc] = None
+            is_sa = family.endswith(".service_account")
             families_out[family] = {
+                "family_kind": "service_account" if is_sa else "device_family",
+                "service_account_label": family[: -len(".service_account")] if is_sa else "",
                 "total_events": total,
                 "client_count": family_mac_count[family],
                 "site_count": family_site_count[family],
@@ -1360,11 +1439,15 @@ async def get_org_family_insights(wlan: str = Query(..., description="WLAN (SSID
                 "is_family_outlier_any_site": family_is_family_outlier.get(family, False),
                 "is_family_markov_outlier_any_site": org_family_markov_is_outlier.get(family, False),
                 "worst_markov_ratio": org_family_markov_ratio.get(family),
+                "markov_family_reason": org_family_markov_reason.get(family),
                 "outlier_sites": family_outlier_sites.get(family, []),
                 "worst_centroid_if_score": family_worst_centroid_if_score.get(family),
                 "worst_centroid_top_features": family_worst_centroid_top_features.get(family, []),
                 "health_score": health_score,
                 "health_components": health_components,
+                "service_health": service_health_out,
+                "service_alarm_counts": service_alarm_counts_out,
+                "service_alarms": service_alarms_out,
                 "categories": {
                     cat: {
                         "count": cat_counts.get(cat, 0),
@@ -1391,16 +1474,26 @@ async def get_org_family_insights(wlan: str = Query(..., description="WLAN (SSID
 async def get_org_family_drilldown(family: str, wlan: str = Query(..., description="WLAN (SSID) name to scope results to. Required.")):
     """
     Org-wide per-MAC drilldown for a single device family.
-    Optionally scoped to a specific WLAN via ?wlan=.
+
+    Service-account families ("{label}.service_account") are handled via a
+    separate code path: their underlying events are still tagged with the
+    real device family, so the rows are derived from sa anomaly records and
+    each row carries `primary_device_family` so the GUI can show the mix of
+    underlying device types sharing the username.
     """
     if not MIST_ORG_ID or not MIST_API_TOKEN:
         raise HTTPException(status_code=500, detail="MIST_ORG_ID or MIST_API_TOKEN not configured.")
+
+    is_sa_family = family.endswith(".service_account")
+    family_kind = "service_account" if is_sa_family else "device_family"
+    sa_label = family[: -len(".service_account")] if is_sa_family else ""
 
     redis_client = _get_redis()
     rows: list[dict] = []
     total_if_outliers = 0
     total_dbscan_outliers = 0
     total_markov_outliers = 0
+    sa_member_families: set[str] = set()
 
     try:
         try:
@@ -1408,7 +1501,7 @@ async def get_org_family_drilldown(family: str, wlan: str = Query(..., descripti
         except Exception:
             raise HTTPException(status_code=502, detail="Could not reach Mist API")
 
-        # Load all events once (per-site sorted sets fetched in one pipeline inside get_events()).
+        # Load all events once from SQLite.
         all_events = await get_events()
         events_by_site: dict[str, list[dict]] = defaultdict(list)
         for evt in all_events:
@@ -1416,26 +1509,24 @@ async def get_org_family_drilldown(family: str, wlan: str = Query(..., descripti
             if sid and evt.get("wlan") == wlan:
                 events_by_site[sid].append(evt)
 
-        # Fetch anomalies, client caches, and findings for all sites in one pipeline round trip
+        # Fetch anomalies and findings from Redis, client caches from SQLite
         site_ids_ordered = list(site_map.keys())
         pipe = redis_client.pipeline()
         for sid in site_ids_ordered:
             pipe.get(_anomalies_redis_key(sid, wlan))
-            pipe.get(f"sasquatch:clients:{sid}")
             pipe.get(_findings_redis_key(sid, wlan))
         pipeline_results = await pipe.execute()
         anomalies_by_site = {
-            sid: (json.loads(pipeline_results[i * 3]) if pipeline_results[i * 3] else None)
-            for i, sid in enumerate(site_ids_ordered)
-        }
-        clients_by_site = {
-            sid: (json.loads(pipeline_results[i * 3 + 1]) if pipeline_results[i * 3 + 1] else {})
+            sid: (json.loads(pipeline_results[i * 2]) if pipeline_results[i * 2] else None)
             for i, sid in enumerate(site_ids_ordered)
         }
         findings_by_site = {
-            sid: (json.loads(pipeline_results[i * 3 + 2]) if pipeline_results[i * 3 + 2] else [])
+            sid: (json.loads(pipeline_results[i * 2 + 1]) if pipeline_results[i * 2 + 1] else [])
             for i, sid in enumerate(site_ids_ordered)
         }
+
+        # Client cache is org-wide (MAC unique across the org) — load once.
+        org_client_cache: dict = await get_client_cache() or {}
 
         # Collect worst centroid IF score from anomaly records across sites.
         # Reading from per-MAC anomaly records (not findings) means the score is available
@@ -1466,10 +1557,75 @@ async def get_org_family_drilldown(family: str, wlan: str = Query(..., descripti
                 continue
 
             anomalies: dict = anomalies_raw_data
-            client_cache: dict = clients_by_site.get(site_id, {})
+            client_cache: dict = org_client_cache
 
-            mac_categories: dict[str, Counter] = defaultdict(Counter)
-            mac_total: dict[str, int] = defaultdict(int)
+            if is_sa_family:
+                # Service-account branch: gather sa records (composite "{mac}#sa"
+                # keys whose device_family equals the sa family name). Each sa
+                # record points at a real primary_mac whose events still live
+                # under the primary device_family in events_by_site.
+                site_sa_records: dict[str, dict] = {}  # primary_mac → sa anomaly record
+                for ck, data in anomalies.items():
+                    if data.get("device_family") != family:
+                        continue
+                    if not data.get("is_service_account_record"):
+                        continue
+                    primary_mac = data.get("primary_mac") or ck
+                    site_sa_records[primary_mac] = data
+
+                if not site_sa_records:
+                    continue
+
+                mac_categories: dict[str, Counter] = defaultdict(Counter)
+                mac_total: dict[str, int] = defaultdict(int)
+                for event in events_by_site.get(site_id, []):
+                    mac = (event.get("mac") or "").replace(":", "").lower()
+                    if not mac or mac not in site_sa_records:
+                        continue
+                    mac_categories[mac][event.get("event_category", "OTHER")] += 1
+                    mac_total[mac] += 1
+
+                for primary_mac, data in site_sa_records.items():
+                    is_if_outlier = data.get("is_if_outlier", False)
+                    is_dbscan_outlier = data.get("is_dbscan_outlier", False)
+                    is_markov_outlier = data.get("is_markov_outlier", False)
+                    if is_if_outlier:
+                        total_if_outliers += 1
+                    if is_dbscan_outlier:
+                        total_dbscan_outliers += 1
+                    if is_markov_outlier:
+                        total_markov_outliers += 1
+                    primary_device_family = (
+                        data.get("primary_device_family")
+                        or client_cache.get(primary_mac, {}).get("family", "Unknown")
+                    )
+                    if primary_device_family:
+                        sa_member_families.add(primary_device_family)
+                    rows.append({
+                        "mac": primary_mac,
+                        "site_id": site_id,
+                        "site_name": site_name,
+                        "if_score": data.get("if_score"),
+                        "is_if_outlier": is_if_outlier,
+                        "is_dbscan_outlier": is_dbscan_outlier,
+                        "is_markov_outlier": is_markov_outlier,
+                        "markov_episode_anomaly_ratio": data.get("markov_episode_anomaly_ratio", 0.0),
+                        "markov_scoreable_episodes": data.get("markov_scoreable_episodes", 0),
+                        "markov_anomalous_episodes": data.get("markov_anomalous_episodes", 0),
+                        "markov_reason": data.get("markov_reason"),
+                        "event_count": data.get("event_count", 0),
+                        "random_mac": data.get("random_mac", False),
+                        "client_metadata": client_cache.get(primary_mac, {}),
+                        "categories": {cat: mac_categories[primary_mac].get(cat, 0) for cat in EVENT_CATEGORIES},
+                        "total_events": mac_total.get(primary_mac, data.get("event_count", 0)),
+                        "primary_device_family": primary_device_family,
+                        "last_username": data.get("last_username", ""),
+                        "is_service_account_record": True,
+                    })
+                continue
+
+            mac_categories = defaultdict(Counter)
+            mac_total = defaultdict(int)
             family_macs: set[str] = set()
             for event in events_by_site.get(site_id, []):
                 if event.get("device_family") != family:
@@ -1504,11 +1660,13 @@ async def get_org_family_drilldown(family: str, wlan: str = Query(..., descripti
                     "markov_episode_anomaly_ratio": data.get("markov_episode_anomaly_ratio", 0.0),
                     "markov_scoreable_episodes": data.get("markov_scoreable_episodes", 0),
                     "markov_anomalous_episodes": data.get("markov_anomalous_episodes", 0),
+                    "markov_reason": data.get("markov_reason"),
                     "event_count": data.get("event_count", 0),
                     "random_mac": data.get("random_mac", False),
                     "client_metadata": client_cache.get(mac, {}),
                     "categories": {cat: mac_categories[mac].get(cat, 0) for cat in EVENT_CATEGORIES},
                     "total_events": mac_total.get(mac, data.get("event_count", 0)),
+                    "service_account": data.get("service_account"),
                 })
     finally:
         await redis_client.aclose()
@@ -1520,6 +1678,9 @@ async def get_org_family_drilldown(family: str, wlan: str = Query(..., descripti
 
     return {
         "family": family,
+        "family_kind": family_kind,
+        "service_account_label": sa_label,
+        "service_account_member_families": sorted(sa_member_families),
         "total_count": len(rows),
         "if_outlier_count": total_if_outliers,
         "dbscan_outlier_count": total_dbscan_outliers,
@@ -1649,19 +1810,28 @@ async def get_site_health(site_id: str, wlan: str = Query(..., description="WLAN
 @router.get("/sites/{site_id}/clients")
 async def get_site_clients(site_id: str):
     """
-    Client list with device type breakdown.
-    Returns family summary counts and full MAC → metadata mapping.
-    """
-    client_cache = await get_client_cache(site_id)
-    if not client_cache:
-        raise HTTPException(status_code=404, detail="Client cache not found. Run /refresh first.")
+    Client list with device type breakdown for a specific site.
 
-    family_counts: Counter = Counter(v.get("family", "Unknown") for v in client_cache.values())
+    The client cache is org-scoped (MAC unique across the org), so this endpoint
+    loads the org cache and filters to clients whose ``last_site_id`` matches
+    the requested site. A client's "site" is the most recent site Mist saw it
+    at — the same MAC seen tomorrow at a different site will move to that site.
+    """
+    org_cache = await get_client_cache()
+    if org_cache is None:
+        raise HTTPException(status_code=404, detail="Client cache not found. Run /org/refresh first.")
+
+    site_clients = {
+        mac: meta
+        for mac, meta in org_cache.items()
+        if meta.get("last_site_id") == site_id
+    }
+    family_counts: Counter = Counter(v.get("family", "Unknown") for v in site_clients.values())
     return {
         "site_id": site_id,
-        "total_clients": len(client_cache),
+        "total_clients": len(site_clients),
         "by_family": dict(family_counts),
-        "clients": client_cache,
+        "clients": site_clients,
     }
 
 
@@ -1691,6 +1861,84 @@ async def get_events_summary(site_id: str, wlan: str = Query(..., description="W
         if mac:
             family_macs[family].add(mac)
 
+    # Aggregate per-family Markov stats from anomaly records so SiteOverview can
+    # display Markov results for families that have no finding. Anomaly records
+    # also carry virtual service-account families ({label}.service_account) — we
+    # use the same pass to discover sa family membership, then build synthetic
+    # sa heatmap rows by summing the underlying member MACs' events.
+    family_markov: dict[str, dict] = {}
+    sa_family_members: dict[str, set[str]] = defaultdict(set)
+    sa_member_families_map: dict[str, set[str]] = defaultdict(set)
+    try:
+        anomalies_raw = await get_anomalies(site_id, wlan)
+        if anomalies_raw:
+            fam_evaluatable: dict[str, int] = defaultdict(int)
+            fam_anomalous: dict[str, int] = defaultdict(int)
+            fam_markov_outlier: dict[str, bool] = {}
+            fam_reason_counts: dict[str, Counter] = defaultdict(Counter)
+            for mac_data in anomalies_raw.values():
+                fam = mac_data.get("device_family", "Unknown")
+                scoreable = mac_data.get("markov_scoreable_episodes", 0)
+                is_stuck = mac_data.get("is_stuck_loop", False)
+                is_markov_out = mac_data.get("is_markov_outlier", False)
+                # Evaluatable = enough scoreable episodes OR a stuck-loop signal,
+                # mirroring markov_analyzer.run_markov_analysis().
+                if scoreable > 0 or is_stuck:
+                    fam_evaluatable[fam] += 1
+                    if is_markov_out:
+                        fam_anomalous[fam] += 1
+                if is_markov_out:
+                    fam_markov_outlier[fam] = True
+                    reason = mac_data.get("markov_reason")
+                    if reason:
+                        fam_reason_counts[fam][reason] += 1
+                # Discover sa family membership for synthetic row construction.
+                if mac_data.get("is_service_account_record"):
+                    primary_mac = mac_data.get("primary_mac")
+                    if primary_mac:
+                        sa_family_members[fam].add(primary_mac)
+                    primary_family = mac_data.get("primary_device_family", "")
+                    if primary_family:
+                        sa_member_families_map[fam].add(primary_family)
+            for fam in set(list(fam_evaluatable.keys()) + list(fam_markov_outlier.keys())):
+                evaluatable = fam_evaluatable.get(fam, 0)
+                anomalous = fam_anomalous.get(fam, 0)
+                is_outlier = fam_markov_outlier.get(fam, False)
+                reason: str | None = None
+                if is_outlier:
+                    counts = fam_reason_counts.get(fam, Counter())
+                    repeated_n = counts.get("repeated", 0)
+                    anomaly_n = counts.get("anomaly", 0)
+                    if repeated_n or anomaly_n:
+                        reason = "repeated" if repeated_n >= anomaly_n else "anomaly"
+                family_markov[fam] = {
+                    "markov_evaluatable_count": evaluatable,
+                    "markov_family_anomalous_count": anomalous,
+                    "markov_family_anomaly_ratio": round(anomalous / evaluatable, 4) if evaluatable > 0 else 0.0,
+                    "is_family_markov_outlier": is_outlier,
+                    "markov_family_reason": reason,
+                }
+    except Exception:
+        log.debug("Markov aggregation skipped for events/summary — anomaly data not yet available")
+
+    # Synthesize service-account heatmap rows by summing member MAC events.
+    # The same MAC appears in BOTH its primary device family row AND its sa
+    # family row — by design, dual-family visibility.
+    if sa_family_members:
+        for sa_family, member_macs in sa_family_members.items():
+            sa_counts: Counter = Counter()
+            sa_total = 0
+            for event in events:
+                mac = (event.get("mac") or "").replace(":", "").lower()
+                if mac and mac in member_macs:
+                    sa_counts[event.get("event_category", "OTHER")] += 1
+                    sa_total += 1
+            if sa_total == 0:
+                continue
+            summary[sa_family] = sa_counts
+            family_totals[sa_family] = sa_total
+            family_macs[sa_family] = set(member_macs)
+
     result = {}
     for family, cat_counts in summary.items():
         total = family_totals[family]
@@ -1702,35 +1950,14 @@ async def get_events_summary(site_id: str, wlan: str = Query(..., description="W
             for cat, count in cat_counts.items()
         }
 
-    # Aggregate per-family Markov stats from anomaly records so SiteOverview can
-    # display Markov results for families that have no finding.
-    family_markov: dict[str, dict] = {}
-    try:
-        anomalies_raw = await get_anomalies(site_id, wlan)
-        if anomalies_raw:
-            fam_evaluatable: dict[str, int] = defaultdict(int)
-            fam_anomalous: dict[str, int] = defaultdict(int)
-            fam_markov_outlier: dict[str, bool] = {}
-            for mac_data in anomalies_raw.values():
-                fam = mac_data.get("device_family", "Unknown")
-                scoreable = mac_data.get("markov_scoreable_episodes", 0)
-                if scoreable > 0:
-                    fam_evaluatable[fam] += 1
-                    if mac_data.get("is_markov_outlier", False):
-                        fam_anomalous[fam] += 1
-                if mac_data.get("is_markov_outlier", False):
-                    fam_markov_outlier[fam] = True
-            for fam in set(list(fam_evaluatable.keys()) + list(fam_markov_outlier.keys())):
-                evaluatable = fam_evaluatable.get(fam, 0)
-                anomalous = fam_anomalous.get(fam, 0)
-                family_markov[fam] = {
-                    "markov_evaluatable_count": evaluatable,
-                    "markov_family_anomalous_count": anomalous,
-                    "markov_family_anomaly_ratio": round(anomalous / evaluatable, 4) if evaluatable > 0 else 0.0,
-                    "is_family_markov_outlier": fam_markov_outlier.get(fam, False),
-                }
-    except Exception:
-        log.debug("Markov aggregation skipped for events/summary — anomaly data not yet available")
+    family_metadata = {
+        fam: {
+            "family_kind": "service_account" if fam.endswith(".service_account") else "device_family",
+            "service_account_label": fam[: -len(".service_account")] if fam.endswith(".service_account") else "",
+            "service_account_member_families": sorted(sa_member_families_map.get(fam, set())),
+        }
+        for fam in result.keys()
+    }
 
     return {
         "site_id": site_id,
@@ -1739,6 +1966,7 @@ async def get_events_summary(site_id: str, wlan: str = Query(..., description="W
         "families": result,
         "family_client_counts": {fam: len(macs) for fam, macs in family_macs.items()},
         "family_markov": family_markov,
+        "family_metadata": family_metadata,
         "categories": list(EVENT_CATEGORIES.keys()),
     }
 
@@ -1748,16 +1976,92 @@ async def get_family_if_outliers(site_id: str, family: str, wlan: str = Query(..
     """
     MACs within a device family that triggered an Isolation Forest deviation.
     Used by the Family Drilldown view. Optionally scoped to a WLAN.
+
+    Service-account families ("{label}.service_account") are handled via a
+    separate path: rows are derived from sa anomaly records (composite "{mac}#sa"
+    keys) and each row carries `primary_device_family` so the GUI can show the
+    mix of underlying device types sharing the username.
     """
     anomalies = await get_anomalies(site_id, wlan)
     if not anomalies:
         raise HTTPException(status_code=404, detail="No anomaly data found. Run detection first.")
 
-    client_cache = await get_client_cache(site_id) or {}
+    client_cache = await get_client_cache() or {}
+
+    is_sa_family = family.endswith(".service_account")
+    family_kind = "service_account" if is_sa_family else "device_family"
+    sa_label = family[: -len(".service_account")] if is_sa_family else ""
+    sa_member_families: set[str] = set()
+
+    if is_sa_family:
+        # sa records use composite keys; iterate over all and pick those whose
+        # device_family matches the sa family name. Each row's `mac` is the
+        # primary (real) MAC for drilldown navigation.
+        family_keys = [
+            ck for ck, data in anomalies.items()
+            if data.get("device_family") == family
+            and data.get("is_service_account_record")
+        ]
+        if not family_keys:
+            raise HTTPException(status_code=404, detail=f"No clients found for family '{family}'.")
+
+        all_clients = []
+        for ck in family_keys:
+            data = anomalies[ck]
+            primary_mac = data.get("primary_mac") or ck
+            primary_device_family = (
+                data.get("primary_device_family")
+                or client_cache.get(primary_mac, {}).get("family", "Unknown")
+            )
+            if primary_device_family:
+                sa_member_families.add(primary_device_family)
+            all_clients.append({
+                "mac": primary_mac,
+                "if_score": data.get("if_score"),
+                "is_if_outlier": data.get("is_if_outlier", False),
+                "is_dbscan_outlier": data.get("is_dbscan_outlier", False),
+                "is_markov_outlier": data.get("is_markov_outlier", False),
+                "markov_episode_anomaly_ratio": data.get("markov_episode_anomaly_ratio"),
+                "markov_reason": data.get("markov_reason"),
+                "event_count": data.get("event_count", 0),
+                "random_mac": data.get("random_mac", False),
+                "client_metadata": client_cache.get(primary_mac, {}),
+                "primary_device_family": primary_device_family,
+                "last_username": data.get("last_username", ""),
+                "is_service_account_record": True,
+            })
+
+        all_clients.sort(key=lambda x: (x["if_score"] is None, x["if_score"] or 0))
+        if_outlier_count = sum(1 for c in all_clients if c["is_if_outlier"])
+
+        centroid_if_score = next(
+            (anomalies[k].get("family_centroid_if_score")
+             for k in family_keys
+             if anomalies[k].get("family_centroid_if_score") is not None),
+            None,
+        )
+        findings = await get_findings(site_id, wlan)
+        family_finding = next((f for f in findings if f.get("device_family") == family), None)
+        family_top_features = family_finding.get("top_features", []) if family_finding else []
+
+        return {
+            "site_id": site_id,
+            "family": family,
+            "family_kind": family_kind,
+            "service_account_label": sa_label,
+            "service_account_member_families": sorted(sa_member_families),
+            "wlan": wlan,
+            "total_family_count": len(family_keys),
+            "if_outlier_count": if_outlier_count,
+            "outliers": all_clients,
+            "centroid_if_score": centroid_if_score,
+            "top_features": family_top_features,
+        }
 
     family_macs = [
         mac for mac, data in anomalies.items()
         if data.get("device_family") == family
+        and not data.get("is_service_account_record")
     ]
     if not family_macs:
         raise HTTPException(status_code=404, detail=f"No clients found for family '{family}'.")
@@ -1770,9 +2074,11 @@ async def get_family_if_outliers(site_id: str, family: str, wlan: str = Query(..
             "is_dbscan_outlier": anomalies[mac].get("is_dbscan_outlier", False),
             "is_markov_outlier": anomalies[mac].get("is_markov_outlier", False),
             "markov_episode_anomaly_ratio": anomalies[mac].get("markov_episode_anomaly_ratio"),
+            "markov_reason": anomalies[mac].get("markov_reason"),
             "event_count": anomalies[mac].get("event_count", 0),
             "random_mac": anomalies[mac].get("random_mac", False),
             "client_metadata": client_cache.get(mac, {}),
+            "service_account": anomalies[mac].get("service_account"),
         }
         for mac in family_macs
     ]
@@ -1796,6 +2102,9 @@ async def get_family_if_outliers(site_id: str, family: str, wlan: str = Query(..
     return {
         "site_id": site_id,
         "family": family,
+        "family_kind": family_kind,
+        "service_account_label": sa_label,
+        "service_account_member_families": [],
         "wlan": wlan,
         "total_family_count": len(family_macs),
         "if_outlier_count": if_outlier_count,
@@ -1850,6 +2159,10 @@ async def get_family_event_counts(site_id: str, family: str, wlan: str = Query(.
     """
     Per-MAC event category counts for all clients in a device family.
     Used by the Family Drilldown Event Counts view. Optionally scoped to a WLAN.
+
+    Service-account families select MACs by sa membership (from anomaly records)
+    rather than by event device_family — events are tagged with the underlying
+    primary family, not the sa family.
     """
     events = await get_events(
         site_id=site_id,
@@ -1858,18 +2171,36 @@ async def get_family_event_counts(site_id: str, family: str, wlan: str = Query(.
     if not events:
         raise HTTPException(status_code=404, detail="No events found for site.")
 
-    client_cache = await get_client_cache(site_id) or {}
+    client_cache = await get_client_cache() or {}
+
+    is_sa_family = family.endswith(".service_account")
+    sa_member_macs: set[str] = set()
+    if is_sa_family:
+        anomalies = await get_anomalies(site_id, wlan)
+        for ck, data in (anomalies or {}).items():
+            if data.get("device_family") != family:
+                continue
+            if not data.get("is_service_account_record"):
+                continue
+            primary_mac = data.get("primary_mac") or ck
+            sa_member_macs.add(primary_mac)
+        if not sa_member_macs:
+            raise HTTPException(status_code=404, detail=f"No clients found for family '{family}'.")
 
     mac_counts: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
     mac_total: dict[str, int] = defaultdict(int)
     family_macs: set[str] = set()
 
     for event in events:
-        if event.get("device_family") != family:
-            continue
         mac = (event.get("mac") or "").replace(":", "").lower()
         if not mac:
             continue
+        if is_sa_family:
+            if mac not in sa_member_macs:
+                continue
+        else:
+            if event.get("device_family") != family:
+                continue
         category = event.get("event_category", "OTHER")
         mac_counts[mac][category] += 1
         mac_total[mac] += 1
@@ -1924,7 +2255,7 @@ async def get_mac_anomaly(site_id: str, mac: str, wlan: str = Query(..., descrip
     ]
     mac_events.sort(key=lambda e: e.get("timestamp", 0))
 
-    client_cache = await get_client_cache(site_id) or {}
+    client_cache = await get_client_cache() or {}
     client_meta = client_cache.get(mac_normalized, {})
 
     # Compute per-MAC Shapley features: top feature deviations vs family mean
@@ -1953,6 +2284,24 @@ async def get_mac_anomaly(site_id: str, mac: str, wlan: str = Query(..., descrip
                 for i in top_indices
             ]
 
+    # Per-MAC health: aggregate score, per-service health, and any service alarms.
+    # Computed on demand from the MAC's feature vector — no separate Redis key needed.
+    from ..health_scorer import (
+        _mac_health_score,
+        mac_service_health,
+        mac_service_alarms,
+    )
+    if mac_vec:
+        mac_health_score, mac_health_components = _mac_health_score(mac_vec)
+        mac_health_score = round(mac_health_score, 4)
+        mac_service_health_out = mac_service_health(mac_vec)
+        mac_service_alarms_out = mac_service_alarms(mac_vec)
+    else:
+        mac_health_score = None
+        mac_health_components = {}
+        mac_service_health_out = {}
+        mac_service_alarms_out = []
+
     return {
         "mac": mac_normalized,
         "site_id": site_id,
@@ -1961,25 +2310,13 @@ async def get_mac_anomaly(site_id: str, mac: str, wlan: str = Query(..., descrip
         "anomaly_scores": mac_scores,
         "feature_vector": mac_features.get("vector", {}),
         "shapley_features": shapley_features,
+        "health_score": mac_health_score,
+        "health_components": mac_health_components,
+        "service_health": mac_service_health_out,
+        "service_alarms": mac_service_alarms_out,
         "event_count": len(mac_events),
         "events": mac_events,
     }
-
-
-@router.post("/sites/{site_id}/refresh")
-async def trigger_client_refresh(site_id: str):
-    """Manually trigger a client cache refresh from the Mist API."""
-    try:
-        count = await refresh_client_cache(site_id)
-        return {
-            "site_id": site_id,
-            "status": "ok",
-            "clients_cached": count,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }
-    except Exception as exc:
-        log.exception(f"Manual client refresh failed for site {site_id}")
-        raise HTTPException(status_code=500, detail=str(exc))
 
 
 @router.post("/sites/{site_id}/markov-baseline")
@@ -2014,18 +2351,20 @@ async def trigger_markov_baseline(site_id: str):
 @router.post("/sites/{site_id}/flush")
 async def flush_site_redis(site_id: str):
     """
-    Delete all sasquatch Redis state for a site.
-    Removes the per-site event sorted set and WLAN set, and deletes all
-    per-site per-WLAN feature/anomaly/finding keys via pattern scan.
+    Delete all sasquatch state for a site (SQLite events + per-site Redis keys).
+    The org-scoped client cache is preserved — use POST /org/flush to clear it.
     """
+    from .. import db as _db
+
     client = _get_redis()
     deleted = 0
     try:
-        # Delete the per-site event sorted set and WLAN set directly
+        # Delete SQLite events for this site. Clients are org-scoped now —
+        # the per-site flush leaves them in place; use POST /org/flush to wipe
+        # the org-wide client cache.
+        deleted += await _db.delete_events_for_site(site_id)
+        # Delete remaining Redis keys (unknown_event_types, progress)
         static_keys = [
-            f"sasquatch:events:{site_id}",
-            f"sasquatch:wlans:{site_id}",
-            f"sasquatch:clients:{site_id}",
             f"sasquatch:unknown_event_types:{site_id}",
             f"sasquatch:progress:{site_id}",
         ]
@@ -2059,103 +2398,16 @@ async def flush_site_redis(site_id: str):
     }
 
 
-@router.post("/sites/{site_id}/run")
-async def trigger_full_detection_run(site_id: str, background_tasks: BackgroundTasks):
-    """
-    Start the full 24hr detection pipeline as a background task.
-    Returns immediately with status "started". Poll GET /progress for live updates.
-    Returns 409 if a cycle is already in progress.
-    """
+@router.post("/unlock")
+async def unlock_global_operation():
+    """Force-release the global operation lock."""
     client = _get_redis()
     try:
-        locked = await client.exists(f"sasquatch:lock:detection:{site_id}")
-    finally:
-        await client.aclose()
-
-    if locked:
-        raise HTTPException(status_code=409, detail="Detection cycle already running for this site")
-
-    background_tasks.add_task(_detection_background_task, site_id)
-    return {"status": "started", "site_id": site_id, "timestamp": datetime.now(timezone.utc).isoformat()}
-
-
-@router.post("/sites/{site_id}/unlock")
-async def unlock_detection(site_id: str):
-    """Force-release the detection lock for a site."""
-    client = _get_redis()
-    try:
-        deleted = await client.delete(f"sasquatch:lock:detection:{site_id}")
+        deleted = await client.delete(_GLOBAL_LOCK_KEY)
     finally:
         await client.aclose()
     return {
-        "site_id": site_id,
         "status": "ok" if deleted else "no_lock",
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    }
-
-
-@router.post("/sites/{site_id}/collect")
-async def trigger_event_collection(site_id: str):
-    """
-    Pull 24hr events from Mist and store in the global Redis sorted set.
-    Does not run anomaly detection. Returns 409 if a cycle is already in progress.
-    """
-    try:
-        summary = await run_collect_only(site_id)
-    except RuntimeError as exc:
-        raise HTTPException(status_code=409, detail=str(exc))
-    except Exception as exc:
-        log.exception(f"Event collection failed for site {site_id}")
-        raise HTTPException(status_code=500, detail=str(exc))
-
-    return {
-        "site_id": site_id,
-        "status": "ok",
-        "events_collected": summary["events"],
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    }
-
-
-@router.post("/sites/{site_id}/detect")
-async def trigger_anomaly_detection(site_id: str):
-    """
-    Run feature engineering + anomaly scoring on events already in Redis.
-    Rebuilds the Markov Chain baseline before scoring so Markov scores reflect
-    the current event window. Runs for each unique WLAN in the event data.
-    Does not pull new events from Mist — use /collect first.
-    Returns 409 if a cycle is already in progress, 404 if no events in Redis.
-    """
-    # Rebuild Markov baseline before scoring so the detection cycle always has
-    # an up-to-date baseline. Failures are logged but do not block detection.
-    try:
-        event_type_index = await get_event_type_index(site_id)
-        wlans = await get_wlans(site_id=site_id)
-        for wlan in wlans:
-            await build_markov_baseline(site_id, wlan, event_type_index)
-    except Exception:
-        log.exception(f"Markov baseline rebuild failed for site {site_id} — continuing with detection")
-
-    try:
-        summary = await run_detect_only(site_id)
-    except RuntimeError as exc:
-        raise HTTPException(status_code=409, detail=str(exc))
-    except ValueError as exc:
-        raise HTTPException(status_code=404, detail=str(exc))
-    except Exception as exc:
-        log.exception(f"Anomaly detection failed for site {site_id}")
-        raise HTTPException(status_code=500, detail=str(exc))
-
-    wlans = await get_wlans(site_id=site_id)
-    all_findings = []
-    for wlan in wlans:
-        all_findings.extend(await get_findings(site_id, wlan))
-    return {
-        "site_id": site_id,
-        "status": "ok",
-        "macs_with_features": summary["macs_with_features"],
-        "macs_scored": summary["macs_scored"],
-        "wlan_scopes": summary.get("wlan_scopes", 1),
-        "findings_generated": len(all_findings),
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -2209,10 +2461,11 @@ async def get_cluster_viz(site_id: str, wlan: str = Query(..., description="WLAN
 
 @router.get("/sites/{site_id}/status")
 async def get_site_status(site_id: str, wlan: str = Query(..., description="WLAN (SSID) name to scope results to. Required.")):
-    """Last run metadata: event count, finding count, Redis key TTLs."""
+    """Last run metadata: event count, finding count, key TTLs."""
+    from .. import db as _db
+
     client = _get_redis()
     try:
-        clients_ttl = await client.ttl(f"sasquatch:clients:{site_id}")
         features_ttl = await client.ttl(_features_redis_key(site_id, wlan))
         anomalies_ttl = await client.ttl(_anomalies_redis_key(site_id, wlan))
         findings_ttl = await client.ttl(_findings_redis_key(site_id, wlan))
@@ -2224,17 +2477,17 @@ async def get_site_status(site_id: str, wlan: str = Query(..., description="WLAN
     finally:
         await client.aclose()
 
-    # Event count from global sorted set
-    site_events = await get_events(site_id=site_id, wlan=wlan)
+    # Event count from SQLite (lightweight count query — no full JSON load)
+    event_count = await _db.get_event_count(site_id=site_id, wlan=wlan)
+    clients_present = await _db.has_org_client_cache(MIST_ORG_ID) if MIST_ORG_ID else False
 
     return {
         "site_id": site_id,
         "wlan": wlan,
-        "event_count": len(site_events),
+        "event_count": event_count,
         "finding_count": finding_count,
-        "detection_interval_minutes": SITE_FOCUS_DETECTION_INTERVAL,
         "redis_ttls": {
-            "clients": clients_ttl,
+            "clients": 1 if clients_present else -2,  # 1 = exists, -2 = missing (compat)
             "features": features_ttl,
             "anomalies": anomalies_ttl,
             "findings": findings_ttl,

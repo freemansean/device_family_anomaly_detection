@@ -56,8 +56,12 @@ from . import config
 from .event_collector import get_events, sanitize_wlan_key
 from .feature_engineer import (
     FEATURE_KEYS,
+    SERVICE_ACCOUNT_SUFFIX,
     build_posthoc_features,
     get_features,
+    is_sa_record_key,
+    is_service_account_family,
+    underlying_mac,
 )
 from .health_scorer import _mac_health_score
 from .markov_analyzer import run_markov_analysis
@@ -589,11 +593,26 @@ async def score(
             if mac:
                 mac_raw_events[mac].append(evt)
 
-        # Build family groups
+        # Build family groups (full — includes service-account virtual families
+        # whose keys are composite "{mac}#sa" entries pointing at duplicate vectors).
         family_groups: dict[str, list[str]] = defaultdict(list)
         for mac, record in features.items():
             family = record.get("device_family", "Unknown")
             family_groups[family].append(mac)
+
+        # Service-account dual records are exact-vector copies of their primary
+        # MAC and share that MAC's raw event stream. They must be EXCLUDED from
+        # passes that operate on raw events or vector density:
+        #   - Markov analysis (mac_raw_events is keyed by real MAC, not the composite)
+        #   - DBSCAN (duplicate vectors would inflate cluster density and pull in
+        #     distant points that wouldn't normally cluster)
+        # They participate normally in centroid detection, per-family IF, and
+        # finding rollup, where each sa family stands as a first-class peer.
+        real_macs_only: set[str] = {k for k in features if not is_sa_record_key(k)}
+        real_family_groups: dict[str, list[str]] = defaultdict(list)
+        for mac in real_macs_only:
+            family = features[mac].get("device_family", "Unknown")
+            real_family_groups[family].append(mac)
 
         # --- Stage 4: Markov Chain episode analysis ---
         # Requires a pre-built 24hr baseline; skipped silently if absent.
@@ -604,19 +623,66 @@ async def score(
             site_id=site_id,
             wlan=wlan,
             mac_raw_events=dict(mac_raw_events),
-            family_groups=dict(family_groups),
+            family_groups=dict(real_family_groups),
             redis_client=redis_client,
             event_type_index=event_type_index,
         )
         markov_family_flags: dict[str, dict] = markov_results.pop("__family_markov__", {})
 
-        # --- Stage 1: DBSCAN across all MACs in WLAN scope ---
+        # Propagate per-MAC Markov results onto sa records so the merge step
+        # below can populate anomaly entries for both keys with consistent flags.
+        for key in features:
+            if is_sa_record_key(key):
+                markov_results[key] = markov_results.get(underlying_mac(key), {})
+
+        # Build per-sa-family Markov rollup from the propagated per-MAC results.
+        # This mirrors markov_analyzer's family rollup but operates on sa families
+        # (which were filtered out of the call above).
+        markov_min_scoreable = _cfg("markov_min_scoreable_episodes")
+        markov_family_ratio_threshold = _cfg("markov_family_outlier_ratio")
+        for sa_family, sa_macs in family_groups.items():
+            if not is_service_account_family(sa_family):
+                continue
+            evaluatable_recs = []
+            anomalous_recs = []
+            for k in sa_macs:
+                rec = markov_results.get(underlying_mac(k), {})
+                if (
+                    rec.get("markov_scoreable_episodes", 0) >= markov_min_scoreable
+                    or rec.get("is_stuck_loop")
+                ):
+                    evaluatable_recs.append(rec)
+                    if rec.get("is_markov_outlier"):
+                        anomalous_recs.append(rec)
+            evaluatable = len(evaluatable_recs)
+            anomalous = len(anomalous_recs)
+            ratio = anomalous / evaluatable if evaluatable else 0.0
+            is_outlier = ratio >= markov_family_ratio_threshold
+            sa_family_reason: str | None = None
+            if is_outlier and anomalous_recs:
+                repeated_n = sum(
+                    1 for r in anomalous_recs if r.get("markov_reason") == "repeated"
+                )
+                anomaly_n = sum(
+                    1 for r in anomalous_recs if r.get("markov_reason") == "anomaly"
+                )
+                sa_family_reason = "repeated" if repeated_n >= anomaly_n else "anomaly"
+            markov_family_flags[sa_family] = {
+                "is_family_markov_outlier": is_outlier,
+                "markov_family_reason": sa_family_reason,
+                "markov_family_anomaly_ratio": round(ratio, 4),
+                "markov_evaluatable_count": evaluatable,
+                "markov_family_anomalous_count": anomalous,
+            }
+
+        # --- Stage 1: DBSCAN across real MACs in WLAN scope ---
         # Only include MACs from families large enough to contribute meaningful signal.
+        # sa records are excluded — see real_family_groups comment above.
         dbscan_eligible_macs = [
-            mac for mac in features
-            if len(family_groups.get(features[mac].get("device_family", "Unknown"), [])) >= _cfg("anomaly_dbscan_min_family_size")
+            mac for mac in real_macs_only
+            if len(real_family_groups.get(features[mac].get("device_family", "Unknown"), [])) >= _cfg("anomaly_dbscan_min_family_size")
         ]
-        excluded_from_dbscan = set(features.keys()) - set(dbscan_eligible_macs)
+        excluded_from_dbscan = real_macs_only - set(dbscan_eligible_macs)
 
         dbscan_eligible_records = [features[m] for m in dbscan_eligible_macs]
         dbscan_results_eligible = _run_dbscan(dbscan_eligible_macs, dbscan_eligible_records)
@@ -624,6 +690,19 @@ async def score(
         dbscan_results: dict[str, dict] = {**dbscan_results_eligible}
         for mac in excluded_from_dbscan:
             dbscan_results[mac] = {"dbscan_label": None, "is_dbscan_outlier": False}
+
+        # Copy each primary MAC's DBSCAN result onto its sa record so the merge
+        # step has something to read for sa keys. sa records inherit their
+        # device's site-wide cluster membership — they ARE the same physical device.
+        for key in features:
+            if is_sa_record_key(key):
+                primary = underlying_mac(key)
+                dbscan_results[key] = dict(
+                    dbscan_results.get(
+                        primary,
+                        {"dbscan_label": None, "is_dbscan_outlier": False},
+                    )
+                )
 
         if excluded_from_dbscan:
             excluded_families = {features[m].get("device_family", "Unknown") for m in excluded_from_dbscan}
@@ -634,9 +713,24 @@ async def score(
 
         # Compute DBSCAN noise ratio per family (stored on anomaly records and used
         # by the frontend). No longer used to populate flagged_families.
+        # For sa families, every member is a composite key and never appears in
+        # dbscan_results_eligible — fall back to the underlying primary MACs so
+        # the family-level signal still reflects DBSCAN cluster behavior.
         family_dbscan_noise_ratio: dict[str, float] = {}
         for family, family_macs in family_groups.items():
             eligible = [m for m in family_macs if m in dbscan_results_eligible]
+            if not eligible and is_service_account_family(family):
+                primaries = [underlying_mac(m) for m in family_macs]
+                primary_eligible = [m for m in primaries if m in dbscan_results_eligible]
+                if primary_eligible:
+                    noise_count = sum(
+                        1 for m in primary_eligible
+                        if dbscan_results_eligible[m]["is_dbscan_outlier"]
+                    )
+                    family_dbscan_noise_ratio[family] = noise_count / len(primary_eligible)
+                else:
+                    family_dbscan_noise_ratio[family] = 0.0
+                continue
             if not eligible:
                 family_dbscan_noise_ratio[family] = 0.0
                 continue
@@ -710,6 +804,10 @@ async def score(
             if_results.update(results)
 
         # --- Merge per-MAC results ---
+        # Both primary and sa keys flow through this loop. The two entries share
+        # the same DBSCAN/Markov flags (sa records inherit from their primary)
+        # but carry independent IF scores and family-level flags, since they were
+        # scored in different family contexts.
         anomalies: dict[str, dict] = {}
         for mac in features:
             is_if = if_results[mac]["is_if_outlier"]
@@ -730,15 +828,11 @@ async def score(
                 "dbscan_family_noise_ratio": round(family_dbscan_noise_ratio.get(family, 0.0), 4),
                 # Markov Chain fields
                 "is_markov_outlier": is_markov,
+                "markov_reason": markov_rec.get("markov_reason"),
                 "markov_total_episodes": markov_rec.get("markov_total_episodes", 0),
                 "markov_scoreable_episodes": markov_rec.get("markov_scoreable_episodes", 0),
                 "markov_anomalous_episodes": markov_rec.get("markov_anomalous_episodes", 0),
                 "markov_episode_anomaly_ratio": markov_rec.get("markov_episode_anomaly_ratio", 0.0),
-                "markov_short_episodes": markov_rec.get("markov_short_episodes", 0),
-                "markov_short_episode_ratio": markov_rec.get("markov_short_episode_ratio", 0.0),
-                "has_repeated_short_episodes": markov_rec.get("has_repeated_short_episodes", False),
-                "short_episode_dominant_pattern": markov_rec.get("short_episode_dominant_pattern"),
-                "markov_episode_seq_score": markov_rec.get("markov_episode_seq_score", 0.0),
                 "is_stuck_loop": markov_rec.get("is_stuck_loop", False),
                 "stuck_loop_pair": markov_rec.get("stuck_loop_pair"),
                 "stuck_loop_fraction": markov_rec.get("stuck_loop_fraction", 0.0),
@@ -747,6 +841,32 @@ async def score(
                 "event_count": features[mac].get("event_count", 0),
                 "random_mac": features[mac].get("random_mac", False),
                 "volume_concentration_weight": features[mac].get("volume_concentration_weight", 1.0),
+                "last_username": features[mac].get("last_username", ""),
+            }
+            if is_sa_record_key(mac):
+                anomalies[mac]["is_service_account_record"] = True
+                anomalies[mac]["primary_mac"] = features[mac].get("primary_mac", underlying_mac(mac))
+                anomalies[mac]["primary_device_family"] = features[mac].get("primary_device_family", "")
+
+        # Surface a compact service-account summary on each PRIMARY anomaly entry
+        # so the per-MAC drilldown endpoint (which queries by real MAC) can show
+        # "this MAC also belongs to {label}.service_account, scored as
+        # {is_family_outlier}" without an extra Redis lookup.
+        for mac in list(anomalies):
+            if is_sa_record_key(mac):
+                continue
+            sa_key = f"{mac}#sa"
+            sa_entry = anomalies.get(sa_key)
+            if not sa_entry:
+                continue
+            anomalies[mac]["service_account"] = {
+                "family": features[mac].get("service_account_family", ""),
+                "last_username": features[mac].get("last_username", ""),
+                "is_family_outlier": sa_entry["is_family_outlier"],
+                "is_if_outlier": sa_entry["is_if_outlier"],
+                "if_score": sa_entry["if_score"],
+                "centroid_if_score": sa_entry.get("family_centroid_if_score"),
+                "centroid_dist_score": sa_entry.get("family_centroid_dist_score"),
             }
 
         key_anomalies = _anomalies_redis_key(site_id, wlan)
@@ -781,6 +901,7 @@ async def score(
             # is below the finding threshold.
             fam_markov = markov_family_flags.get(family, {})
             is_family_markov_outlier = fam_markov.get("is_family_markov_outlier", False)
+            markov_family_reason = fam_markov.get("markov_family_reason")
             markov_family_anomaly_ratio = fam_markov.get("markov_family_anomaly_ratio", 0.0)
             markov_evaluatable_count = fam_markov.get("markov_evaluatable_count", 0)
             markov_family_anomalous_count = fam_markov.get("markov_family_anomalous_count", 0)
@@ -815,8 +936,11 @@ async def score(
 
             top_features = _top_contributing_features(outlier_vecs, normal_vecs)
 
-            # Post-hoc pattern classification
+            # Post-hoc pattern classification.
+            # For sa families, mac_raw_events is keyed by REAL MAC, so strip
+            # the sa suffix from each composite outlier key before looking up events.
             is_family_level_outlier = family in flagged_families
+            family_kind = "service_account" if is_service_account_family(family) else "device_family"
             if is_family_level_outlier:
                 probable_pattern = "family_behavioral_outlier"
             else:
@@ -825,7 +949,7 @@ async def score(
                     combined_events = [
                         evt
                         for mac in outlier_macs
-                        for evt in mac_raw_events.get(mac, [])
+                        for evt in mac_raw_events.get(underlying_mac(mac), [])
                     ]
                     if combined_events:
                         posthoc = build_posthoc_features(combined_events)
@@ -835,6 +959,7 @@ async def score(
             # Worst-health MACs: top 3 across all family MACs by health score (ascending).
             # Used by alert cards in the UI and webhook payload to surface the specific
             # devices experiencing the most failures — independent of outlier scoring.
+            # The displayed `mac` is always the real MAC, even for sa families.
             mac_health_scores = {
                 m: _mac_health_score(features[m]["vector"])
                 for m in family_macs
@@ -842,7 +967,7 @@ async def score(
             worst_health_macs = sorted(
                 [
                     {
-                        "mac": m,
+                        "mac": underlying_mac(m),
                         "health_score": round(score, 4),
                         "health_components": {
                             k: round(v, 4) for k, v in comps.items() if v > 0
@@ -862,8 +987,23 @@ async def score(
                 family_dbscan_noise_ratio.get(family, 0.0) >= dbscan_noise_thresh
             )
 
+            # For sa findings, surface the human-readable username label and the
+            # set of underlying device families this service-account spans, so the
+            # GUI can render "srv_Apple_EP.service_account (15 MacBooks, 3 Windows)".
+            sa_label = ""
+            sa_member_families: list[str] = []
+            if family_kind == "service_account":
+                sa_label = family[: -len(SERVICE_ACCOUNT_SUFFIX)]
+                sa_member_families = sorted({
+                    features[m].get("primary_device_family", "Unknown")
+                    for m in family_macs
+                })
+
             finding = {
                 "device_family": family,
+                "family_kind": family_kind,
+                "service_account_label": sa_label,
+                "service_account_member_families": sa_member_families,
                 "wlan": wlan,
                 "severity": _severity(outlier_ratio),
                 "outlier_ratio": round(outlier_ratio, 4),
@@ -873,6 +1013,7 @@ async def score(
                 "is_family_outlier": is_family_level_outlier,
                 "is_family_dbscan_outlier": is_family_dbscan_outlier,
                 "is_family_markov_outlier": is_family_markov_outlier,
+                "markov_family_reason": markov_family_reason,
                 "centroid_if_score": centroid_if_scores.get(family),
                 "centroid_dist_score": centroid_dist_scores.get(family),
                 "centroid_detection_method": centroid_method,
@@ -880,23 +1021,25 @@ async def score(
                 "dbscan_severity": _severity(dbscan_outlier_ratio) if dbscan_outlier_count > 0 else None,
                 "dbscan_outlier_ratio": round(dbscan_outlier_ratio, 4),
                 "dbscan_outlier_count": dbscan_outlier_count,
-                "if_outlier_macs": if_outlier_macs,
+                "if_outlier_macs": [underlying_mac(m) for m in if_outlier_macs],
                 "if_outlier_count": len(if_outlier_macs),
                 "markov_family_anomaly_ratio": round(markov_family_anomaly_ratio, 4),
                 "markov_evaluatable_count": markov_evaluatable_count,
                 "markov_family_anomalous_count": markov_family_anomalous_count,
-                "example_macs": sorted(
-                    outlier_macs,
-                    key=lambda m: anomalies[m]["volume_concentration_weight"],
-                    reverse=True,
-                )[:5],
+                "example_macs": [
+                    underlying_mac(m) for m in sorted(
+                        outlier_macs,
+                        key=lambda m: anomalies[m]["volume_concentration_weight"],
+                        reverse=True,
+                    )[:5]
+                ],
                 "worst_health_macs": worst_health_macs,
                 "top_features": top_features,
                 "probable_pattern": probable_pattern,
             }
             findings.append(finding)
             log.info(
-                f"Finding [{wlan}] [{family}]: {outlier_count}/{total} outliers "
+                f"Finding [{wlan}] [{family}] ({family_kind}): {outlier_count}/{total} outliers "
                 f"({outlier_ratio:.1%}) → {finding['severity']} / {probable_pattern}"
             )
 
@@ -961,20 +1104,32 @@ async def score_org_wide(
         f"{len(all_features_by_site)} sites"
     )
 
-    # Build org-wide family groups (keyed by composite MAC)
+    # Build org-wide family groups (keyed by composite MAC).
+    # `org_family_groups` is the FULL set including service-account virtual
+    # families whose composite keys carry the "#sa" suffix and point at
+    # duplicate per-MAC vectors. `real_org_family_groups` excludes those sa
+    # keys for passes that operate on raw events or vector density (DBSCAN
+    # would inflate cluster density on identical vectors).
     org_family_groups: dict[str, list[str]] = defaultdict(list)
     for key in composite_macs:
         family = composite_features[key].get("device_family", "Unknown")
         org_family_groups[family].append(key)
 
-    # --- Stage 1: DBSCAN across all org MACs ---
+    real_composite_macs: set[str] = {k for k in composite_macs if not is_sa_record_key(k)}
+    real_org_family_groups: dict[str, list[str]] = defaultdict(list)
+    for key in real_composite_macs:
+        family = composite_features[key].get("device_family", "Unknown")
+        real_org_family_groups[family].append(key)
+
+    # --- Stage 1: DBSCAN across all real org MACs ---
+    # sa composite keys are filtered out — see real_org_family_groups comment.
     dbscan_eligible_keys = [
-        k for k in composite_macs
-        if len(org_family_groups.get(
+        k for k in real_composite_macs
+        if len(real_org_family_groups.get(
             composite_features[k].get("device_family", "Unknown"), []
         )) >= _cfg("anomaly_dbscan_min_family_size")
     ]
-    excluded_from_dbscan = set(composite_macs) - set(dbscan_eligible_keys)
+    excluded_from_dbscan = real_composite_macs - set(dbscan_eligible_keys)
 
     dbscan_results_eligible = _run_dbscan(
         dbscan_eligible_keys,
@@ -984,6 +1139,21 @@ async def score_org_wide(
     dbscan_results: dict[str, dict] = {**dbscan_results_eligible}
     for key in excluded_from_dbscan:
         dbscan_results[key] = {"dbscan_label": None, "is_dbscan_outlier": False}
+
+    # Copy each primary composite MAC's DBSCAN result onto its sa composite
+    # key so the merge step has a consistent value to read for sa entries.
+    # The sa record represents the same physical device — it inherits its
+    # primary's site-wide cluster membership.
+    for key in composite_macs:
+        if not is_sa_record_key(key):
+            continue
+        primary_ck = key[: -len("#sa")]
+        dbscan_results[key] = dict(
+            dbscan_results.get(
+                primary_ck,
+                {"dbscan_label": None, "is_dbscan_outlier": False},
+            )
+        )
 
     if excluded_from_dbscan:
         excluded_families = {
@@ -995,10 +1165,26 @@ async def score_org_wide(
             f"from {len(excluded_families)} small families: {excluded_families}"
         )
 
-    # DBSCAN noise ratio per family (stored on anomaly records)
+    # DBSCAN noise ratio per family (stored on anomaly records).
+    # For sa families every member is a composite sa key that never appears
+    # in dbscan_results_eligible — fall back to the underlying primary
+    # composite keys so the family-level signal still reflects DBSCAN
+    # cluster behavior.
     family_dbscan_noise_ratio: dict[str, float] = {}
     for family, family_keys in org_family_groups.items():
         eligible = [k for k in family_keys if k in dbscan_results_eligible]
+        if not eligible and is_service_account_family(family):
+            primaries = [k[: -len("#sa")] for k in family_keys if is_sa_record_key(k)]
+            primary_eligible = [p for p in primaries if p in dbscan_results_eligible]
+            if primary_eligible:
+                noise_count = sum(
+                    1 for p in primary_eligible
+                    if dbscan_results_eligible[p]["is_dbscan_outlier"]
+                )
+                family_dbscan_noise_ratio[family] = noise_count / len(primary_eligible)
+            else:
+                family_dbscan_noise_ratio[family] = 0.0
+            continue
         if not eligible:
             family_dbscan_noise_ratio[family] = 0.0
             continue
@@ -1052,6 +1238,10 @@ async def score_org_wide(
         if_results.update(results)
 
     # --- Merge per-composite-key results ---
+    # Both primary and sa composite keys flow through this loop. sa entries
+    # share their primary's DBSCAN/Markov flags (inherited above) but carry
+    # independent IF scores and family-level flags since they were scored in
+    # different family contexts.
     org_anomalies_flat: dict[str, dict] = {}
     for key in composite_macs:
         family = composite_features[key].get("device_family", "Unknown")
@@ -1067,6 +1257,7 @@ async def score_org_wide(
             "dbscan_family_noise_ratio": round(family_dbscan_noise_ratio.get(family, 0.0), 4),
             # Markov fields populated below from per-site anomaly records
             "is_markov_outlier": False,
+            "markov_reason": None,
             "is_outlier": if_results[key]["is_if_outlier"]
                 or dbscan_results[key]["is_dbscan_outlier"]
                 or (family in flagged_families),
@@ -1076,7 +1267,16 @@ async def score_org_wide(
             "volume_concentration_weight": composite_features[key].get(
                 "volume_concentration_weight", 1.0
             ),
+            "last_username": composite_features[key].get("last_username", ""),
         }
+        if is_sa_record_key(key):
+            org_anomalies_flat[key]["is_service_account_record"] = True
+            org_anomalies_flat[key]["primary_mac"] = composite_features[key].get(
+                "primary_mac", underlying_mac(composite_to_mac[key])
+            )
+            org_anomalies_flat[key]["primary_device_family"] = composite_features[key].get(
+                "primary_device_family", ""
+            )
 
     # --- Merge per-site Markov anomaly data into org_anomalies_flat ---
     # Per-site anomaly records (sasquatch:anomalies:{site_id}:{wlan_key}) contain
@@ -1099,6 +1299,7 @@ async def score_org_wide(
                 ck = f"{site_id_m}:{mac_m}"
                 if ck in org_anomalies_flat and rec.get("is_markov_outlier"):
                     org_anomalies_flat[ck]["is_markov_outlier"] = True
+                    org_anomalies_flat[ck]["markov_reason"] = rec.get("markov_reason")
                     # Update composite is_outlier to reflect Markov
                     org_anomalies_flat[ck]["is_outlier"] = (
                         org_anomalies_flat[ck]["is_outlier"] or True
@@ -1106,23 +1307,59 @@ async def score_org_wide(
     finally:
         await _org_markov_redis.aclose()
 
-    # Org-wide family Markov rollup — derived from merged MAC-level is_markov_outlier
+    # Org-wide family Markov rollup — derived from merged MAC-level is_markov_outlier.
+    # The dominant per-MAC markov_reason among the flagged MACs sets the family reason
+    # ("repeated" wins ties to match per-MAC priority).
     org_family_markov_flags: dict[str, bool] = {}
     org_family_markov_ratio: dict[str, float] = {}
+    org_family_markov_reason: dict[str, str | None] = {}
     for family, family_cks in org_family_groups.items():
-        # Only count MACs that had any Markov data (is_markov_outlier is explicitly set)
-        # As a proxy for "evaluatable", we count all composite keys — if the per-site
-        # anomaly record was absent, is_markov_outlier defaulted to False, so this is
-        # a conservative estimate.
         total_cks = len(family_cks)
         if total_cks == 0:
             org_family_markov_flags[family] = False
             org_family_markov_ratio[family] = 0.0
+            org_family_markov_reason[family] = None
             continue
         markov_outlier_cks = [k for k in family_cks if org_anomalies_flat[k].get("is_markov_outlier")]
         ratio = len(markov_outlier_cks) / total_cks
-        org_family_markov_flags[family] = ratio >= _cfg("markov_family_outlier_ratio")
+        is_outlier = ratio >= _cfg("markov_family_outlier_ratio")
+        org_family_markov_flags[family] = is_outlier
         org_family_markov_ratio[family] = ratio
+        if is_outlier and markov_outlier_cks:
+            repeated_n = sum(
+                1 for k in markov_outlier_cks
+                if org_anomalies_flat[k].get("markov_reason") == "repeated"
+            )
+            anomaly_n = sum(
+                1 for k in markov_outlier_cks
+                if org_anomalies_flat[k].get("markov_reason") == "anomaly"
+            )
+            org_family_markov_reason[family] = (
+                "repeated" if repeated_n >= anomaly_n else "anomaly"
+            )
+        else:
+            org_family_markov_reason[family] = None
+
+    # Surface a compact service-account summary on each PRIMARY org anomaly
+    # entry so the per-MAC drilldown endpoint (which queries by real MAC at
+    # a given site) can show "this MAC also belongs to {label}.service_account,
+    # scored as {is_family_outlier}" without an extra Redis lookup.
+    for ck in list(org_anomalies_flat):
+        if is_sa_record_key(ck):
+            continue
+        sa_ck = f"{ck}#sa"
+        sa_entry = org_anomalies_flat.get(sa_ck)
+        if not sa_entry:
+            continue
+        org_anomalies_flat[ck]["service_account"] = {
+            "family": composite_features[ck].get("service_account_family", ""),
+            "last_username": composite_features[ck].get("last_username", ""),
+            "is_family_outlier": sa_entry["is_family_outlier"],
+            "is_if_outlier": sa_entry["is_if_outlier"],
+            "if_score": sa_entry["if_score"],
+            "centroid_if_score": sa_entry.get("family_centroid_if_score"),
+            "centroid_dist_score": sa_entry.get("family_centroid_dist_score"),
+        }
 
     # Raw events cache for post-hoc explainer — loaded once per site on demand
     raw_events_cache: dict[str, dict[str, list[dict]]] = {}
@@ -1230,36 +1467,64 @@ async def score_org_wide(
 
             # Example MACs: top 5 by weight, each carrying its site_id so the UI
             # can route MAC drilldown clicks to the correct site.
+            # For sa families the composite mac string carries the "#sa" suffix —
+            # strip it via underlying_mac so the GUI displays a clean MAC.
             example_cks = sorted(
                 outlier_cks,
                 key=lambda k: org_anomalies_flat[k]["volume_concentration_weight"],
                 reverse=True,
             )[:5]
             example_macs = [
-                {"mac": composite_to_mac[k], "site_id": composite_to_site[k]}
+                {
+                    "mac": underlying_mac(composite_to_mac[k]),
+                    "site_id": composite_to_site[k],
+                }
                 for k in example_cks
             ]
 
-            # Post-hoc pattern: aggregate raw events from ALL outlier MACs across all sites
+            # Post-hoc pattern: aggregate raw events from ALL outlier MACs across
+            # all sites. mac_raw events are keyed by REAL MAC, so strip the "#sa"
+            # suffix from sa composite mac strings before lookup.
             is_family_level_outlier = family in flagged_families
+            family_kind = "service_account" if is_service_account_family(family) else "device_family"
             combined_events: list[dict] = []
             if is_family_level_outlier:
                 probable_pattern = "family_behavioral_outlier"
                 for ck in outlier_cks:
                     site_evts = await _load_site_events(composite_to_site[ck])
-                    combined_events.extend(site_evts.get(composite_to_mac[ck], []))
+                    combined_events.extend(
+                        site_evts.get(underlying_mac(composite_to_mac[ck]), [])
+                    )
             else:
                 probable_pattern = "behavioral_outlier"
                 for ck in outlier_cks:
                     site_evts = await _load_site_events(composite_to_site[ck])
-                    combined_events.extend(site_evts.get(composite_to_mac[ck], []))
+                    combined_events.extend(
+                        site_evts.get(underlying_mac(composite_to_mac[ck]), [])
+                    )
                 if combined_events:
                     posthoc = build_posthoc_features(combined_events)
                     posthoc["event_count"] = len(combined_events)
                     probable_pattern = _classify_probable_pattern(posthoc)
 
+            # For sa findings, surface the human-readable username label and
+            # the set of underlying device families this service-account spans
+            # so the GUI can render "srv_Apple_EP.service_account
+            # (15 MacBooks, 3 Windows)".
+            sa_label = ""
+            sa_member_families: list[str] = []
+            if family_kind == "service_account":
+                sa_label = family[: -len(SERVICE_ACCOUNT_SUFFIX)]
+                sa_member_families = sorted({
+                    composite_features[k].get("primary_device_family", "Unknown")
+                    for k in family_cks
+                })
+
             finding = {
                 "device_family": family,
+                "family_kind": family_kind,
+                "service_account_label": sa_label,
+                "service_account_member_families": sa_member_families,
                 "wlan": wlan,
                 "severity": _severity(outlier_ratio),
                 "outlier_ratio": round(outlier_ratio, 4),
@@ -1272,6 +1537,7 @@ async def score_org_wide(
                 "is_family_outlier": is_family_level_outlier,
                 "is_family_dbscan_outlier": is_family_dbscan_outlier,
                 "is_family_markov_outlier": is_family_markov_outlier,
+                "markov_family_reason": org_family_markov_reason.get(family),
                 "markov_family_anomaly_ratio": round(org_family_markov_ratio.get(family, 0.0), 4),
                 "centroid_if_score": centroid_if_scores.get(family),
                 "centroid_dist_score": centroid_dist_scores.get(family),
@@ -1290,9 +1556,9 @@ async def score_org_wide(
             }
             org_findings.append(finding)
             log.info(
-                f"[org finding] wlan={wlan} [{family}]: {outlier_count}/{total} outliers "
-                f"({outlier_ratio:.1%}) across {len(sites_affected)} sites "
-                f"→ {finding['severity']} / {probable_pattern}"
+                f"[org finding] wlan={wlan} [{family}] ({family_kind}): "
+                f"{outlier_count}/{total} outliers ({outlier_ratio:.1%}) across "
+                f"{len(sites_affected)} sites → {finding['severity']} / {probable_pattern}"
             )
 
         # Attach volume-weighted org health_score to each finding before storing.
@@ -1311,12 +1577,21 @@ async def score_org_wide(
                         site_health_map[_sid] = json.loads(_raw)
                     except Exception:
                         pass
+            from .health_scorer import (
+                SERVICES as _HSCORE_SERVICES,
+                FAMILY_SERVICE_ALARM_THRESHOLD as _HSCORE_FAMILY_SVC_THRESHOLD,
+            )
             for _f in org_findings:
                 _family = _f["device_family"]
                 _wsum = 0.0
                 _wcount = 0
                 _comp_wsum: dict[str, float] = {}
                 _comp_wcount: dict[str, float] = {}
+                # Per-service org rollup: sum active/unhealthy MAC counts across sites
+                # so the org-level alarm threshold applies to the full device-family scope.
+                _svc_active: dict[str, int] = {svc: 0 for svc in _HSCORE_SERVICES}
+                _svc_unhealthy: dict[str, int] = {svc: 0 for svc in _HSCORE_SERVICES}
+                _svc_health_wsum: dict[str, float] = {svc: 0.0 for svc in _HSCORE_SERVICES}
                 for _sh in site_health_map.values():
                     _fh = _sh.get(_family)
                     if not _fh:
@@ -1327,6 +1602,17 @@ async def score_org_wide(
                     for _cat, _val in _fh.get("components", {}).items():
                         _comp_wsum[_cat] = _comp_wsum.get(_cat, 0.0) + _val * _n
                         _comp_wcount[_cat] = _comp_wcount.get(_cat, 0.0) + _n
+                    _site_svc_counts = _fh.get("service_alarm_counts", {}) or {}
+                    _site_svc_health = _fh.get("service_health", {}) or {}
+                    for _svc in _HSCORE_SERVICES:
+                        _info = _site_svc_counts.get(_svc) or {}
+                        _a = int(_info.get("active", 0))
+                        _u = int(_info.get("unhealthy", 0))
+                        _svc_active[_svc] += _a
+                        _svc_unhealthy[_svc] += _u
+                        _sh_val = _site_svc_health.get(_svc)
+                        if _sh_val is not None and _a > 0:
+                            _svc_health_wsum[_svc] += float(_sh_val) * _a
                 if _wcount > 0:
                     _f["health_score"] = round(_wsum / _wcount, 4)
                     _f["health_components"] = {
@@ -1336,6 +1622,23 @@ async def score_org_wide(
                 else:
                     _f["health_score"] = 1.0
                     _f["health_components"] = {}
+
+                _service_health: dict[str, float | None] = {}
+                _service_alarm_counts: dict[str, dict[str, int]] = {}
+                _service_alarms: list[str] = []
+                for _svc in _HSCORE_SERVICES:
+                    _a = _svc_active[_svc]
+                    _u = _svc_unhealthy[_svc]
+                    _service_alarm_counts[_svc] = {"active": _a, "unhealthy": _u}
+                    if _a > 0:
+                        _service_health[_svc] = round(_svc_health_wsum[_svc] / _a, 4)
+                        if (_u / _a) > _HSCORE_FAMILY_SVC_THRESHOLD:
+                            _service_alarms.append(_svc)
+                    else:
+                        _service_health[_svc] = None
+                _f["service_health"] = _service_health
+                _f["service_alarm_counts"] = _service_alarm_counts
+                _f["service_alarms"] = _service_alarms
 
         severity_order = {"significant": 0, "moderate": 1, "minimal": 2}
         org_findings.sort(
