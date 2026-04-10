@@ -13,6 +13,11 @@ env/
 
 # Environment — never commit secrets
 .env
+# Vite per-machine overrides for the frontend (loaded in addition to .env.production).
+# The committed sasquatch/frontend/.env.production is the fresh-clone default;
+# anything machine-specific (e.g. a LAN IP for the backend) belongs in one of these.
+sasquatch/frontend/.env.local
+sasquatch/frontend/.env.production.local
 
 # Node
 node_modules/

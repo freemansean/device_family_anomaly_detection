@@ -105,16 +105,6 @@ function AlertCard({ finding, onFamilyClick }) {
           }}>
             ALERT
           </span>
-          <span style={{
-            background: ANOMALY_COLOR[sev] + "33",
-            color: ANOMALY_COLOR[sev],
-            padding: "2px 8px",
-            borderRadius: "3px",
-            fontSize: "11px",
-            border: `1px solid ${ANOMALY_COLOR[sev]}55`,
-          }}>
-            {sev}
-          </span>
           <button
             onClick={onFamilyClick}
             style={{ fontWeight: "bold", fontSize: "14px", color: "#7ec8e3", background: "none", border: "none", cursor: "pointer", padding: 0, textDecoration: "underline", textDecorationColor: "#7ec8e344" }}
@@ -138,11 +128,6 @@ function AlertCard({ finding, onFamilyClick }) {
           <span style={{ color: "#666", fontSize: "12px" }}>
             {PATTERN_LABELS[finding.probable_pattern] || finding.probable_pattern}
           </span>
-          {finding.wlan && (
-            <span style={{ background: "#1a2a1a", color: "#7aaa7a", border: "1px solid #3a6a3a", borderRadius: "3px", padding: "2px 7px", fontSize: "10px" }}>
-              {finding.wlan}
-            </span>
-          )}
           {finding.is_family_outlier && (
             <span style={{ background: "#2a1a3a", color: "#b06ad4", border: "1px solid #6a3a8a", borderRadius: "3px", padding: "2px 7px", fontSize: "10px" }}
               title="Centroid IF/distance: whole family's collective behavior differs from other families">
@@ -164,13 +149,10 @@ function AlertCard({ finding, onFamilyClick }) {
         </div>
         <div style={{ textAlign: "right", fontSize: "12px", marginLeft: "10px", flexShrink: 0 }}>
           <div style={{ whiteSpace: "nowrap" }}>
-            <span style={{ color: ANOMALY_COLOR[sev], fontWeight: "bold" }}>
-              {(finding.outlier_ratio * 100).toFixed(0)}%
+            <span style={{ color: "#ccc", fontWeight: "bold" }}>
+              {finding.affected_mac_count}/{finding.total_mac_count}
             </span>
-            <span style={{ color: "#555" }}> outlier</span>
-            <span style={{ color: "#555", marginLeft: "8px" }}>
-              {finding.affected_mac_count}/{finding.total_mac_count} devices
-            </span>
+            <span style={{ color: "#555" }}> devices</span>
           </div>
           {hs != null && (
             <div style={{ whiteSpace: "nowrap", marginTop: "3px" }}>
@@ -277,6 +259,9 @@ export default function OrgAlerts({ apiBase, onMacSiteSelect, refreshToken, wlan
   const [loading, setLoading]         = useState(true);
   const [error, setError]             = useState(null);
   const [history, setHistory]         = useState(null);
+  // Site Alerts section is collapsed by default. State is kept in this component
+  // so 30s auto-refreshes preserve the user's expanded/collapsed choice.
+  const [siteAlertsExpanded, setSiteAlertsExpanded] = useState(false);
   // selectedFamily: { family, siteId } — siteId null means org-wide drilldown
   const [selectedFamily, setSelectedFamily] = useState(null);
 
@@ -297,8 +282,6 @@ export default function OrgAlerts({ apiBase, onMacSiteSelect, refreshToken, wlan
 
   useEffect(() => {
     load();
-    const interval = setInterval(load, 30_000);
-    return () => clearInterval(interval);
   }, [load, refreshToken]);
 
   if (selectedFamily) {
@@ -365,6 +348,23 @@ export default function OrgAlerts({ apiBase, onMacSiteSelect, refreshToken, wlan
         </h2>
       </div>
 
+      {orgAlerts.length === 0 && (
+        <div style={{
+          background: "#12241a",
+          border: "1px solid #2d7a4f",
+          borderLeft: "3px solid #2d7a4f",
+          color: "#7dd49c",
+          borderRadius: "4px",
+          padding: "10px 14px",
+          marginTop: "10px",
+          marginBottom: "6px",
+          fontSize: "13px",
+          fontWeight: "bold",
+        }}>
+          No Org Alarms active
+        </div>
+      )}
+
       {/* Org-wide alerts */}
       {orgAlerts.length > 0 && (
         <div>
@@ -388,15 +388,20 @@ export default function OrgAlerts({ apiBase, onMacSiteSelect, refreshToken, wlan
       {/* Per-site alerts */}
       {siteAlerts.length > 0 && (
         <div>
-          <div style={{
-            display: "flex",
-            alignItems: "center",
-            gap: "10px",
-            marginBottom: "10px",
-            marginTop: "24px",
-            paddingBottom: "6px",
-            borderBottom: `1px solid ${ALERT_COLOR}33`,
-          }}>
+          <div
+            onClick={() => setSiteAlertsExpanded(e => !e)}
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: "10px",
+              marginBottom: siteAlertsExpanded ? "10px" : 0,
+              marginTop: "24px",
+              paddingBottom: "6px",
+              borderBottom: `1px solid ${ALERT_COLOR}33`,
+              cursor: "pointer",
+              userSelect: "none",
+            }}
+          >
             <span style={{
               background: ALERT_COLOR + "22",
               color: ALERT_COLOR,
@@ -407,22 +412,27 @@ export default function OrgAlerts({ apiBase, onMacSiteSelect, refreshToken, wlan
               letterSpacing: "0.08em",
               border: `1px solid ${ALERT_COLOR}44`,
             }}>
-              SITE ALERTS
+              SITE ALERTS ({totalSiteAlertFamilies})
             </span>
             <span style={{ color: "#444", fontSize: "11px" }}>
               {siteAlerts.length} {siteAlerts.length === 1 ? "site" : "sites"} · {totalSiteAlertFamilies} {totalSiteAlertFamilies === 1 ? "family" : "families"}
             </span>
             <span style={{ color: "#333", fontSize: "11px" }}>· device families anomalous and unhealthy at a specific site</span>
+            <span style={{ color: "#444", fontSize: "11px", marginLeft: "auto" }}>
+              {siteAlertsExpanded ? "▲" : "▼"}
+            </span>
           </div>
-          <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
-            {siteAlerts.map(siteAlert => (
-              <SiteAlertGroup
-                key={siteAlert.site_id}
-                siteAlert={siteAlert}
-                onFamilyClick={(family, siteId) => setSelectedFamily({ family, siteId })}
-              />
-            ))}
-          </div>
+          {siteAlertsExpanded && (
+            <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
+              {siteAlerts.map(siteAlert => (
+                <SiteAlertGroup
+                  key={siteAlert.site_id}
+                  siteAlert={siteAlert}
+                  onFamilyClick={(family, siteId) => setSelectedFamily({ family, siteId })}
+                />
+              ))}
+            </div>
+          )}
         </div>
       )}
 
@@ -440,7 +450,7 @@ const HIST_COLOR = "#888";
 const RESOLVED_COLOR = "#2d7a4f";
 
 function AlertHistory({ history }) {
-  const [expanded, setExpanded] = useState(true);
+  const [expanded, setExpanded] = useState(false);
 
   const days = history?.days ?? [];
   if (days.length === 0) return null;

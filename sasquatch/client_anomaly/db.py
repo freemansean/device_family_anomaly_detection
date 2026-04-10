@@ -20,6 +20,7 @@ import json
 import logging
 import os
 import pathlib
+import re
 import time
 from typing import Optional
 
@@ -114,7 +115,8 @@ CREATE TABLE IF NOT EXISTS clients (
 CREATE INDEX IF NOT EXISTS idx_clients_org ON clients(org_id);
 CREATE INDEX IF NOT EXISTS idx_clients_family ON clients(family);
 CREATE INDEX IF NOT EXISTS idx_clients_last_site ON clients(last_site_id);
-CREATE INDEX IF NOT EXISTS idx_clients_username_norm ON clients(org_id, last_username_norm);
+-- idx_clients_username_norm is created in _migrate_clients_add_last_username
+-- after the ALTER TABLE adds the column, to keep init safe on legacy DBs.
 
 CREATE TABLE IF NOT EXISTS client_refresh_log (
     org_id TEXT PRIMARY KEY,
@@ -163,6 +165,10 @@ async def _migrate_clients_add_last_username(conn: aiosqlite.Connection) -> None
     if "last_username_norm" not in col_names:
         log.info("Adding last_username_norm column to clients table")
         await conn.execute("ALTER TABLE clients ADD COLUMN last_username_norm TEXT")
+    await conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_clients_username_norm "
+        "ON clients(org_id, last_username_norm)"
+    )
     await conn.commit()
 
 
@@ -535,6 +541,130 @@ async def get_service_account_usernames(
         label = max(variants.items(), key=lambda kv: kv[1])[0]
         result[norm] = {"label": label, "mac_count": total}
     return result
+
+
+async def search_clients_by_mac_prefix(
+    mac_prefix: str,
+    org_id: Optional[str] = None,
+    limit: int = 50,
+) -> list[dict]:
+    """
+    Prefix-match against the clients table by MAC address, then enrich each hit
+    with the most-recent event site_id / wlan / timestamp from the events table.
+
+    The search is deliberately prefix-only (``LIKE 'prefix%'``) because:
+
+    - ``clients.mac`` is the PRIMARY KEY, so a leading-anchored LIKE uses the PK
+      index for a range scan -- O(log n + results) instead of a full table scan.
+    - ``events.idx_events_mac`` covers the per-result recency lookup in O(log n).
+
+    The caller is responsible for normalising the input (stripping colons /
+    hyphens / whitespace and lowercasing); this helper normalises defensively
+    but expects canonical hex already.
+
+    Args:
+      mac_prefix: normalised MAC fragment (hex-only, lowercase). Must be
+        non-empty -- an empty prefix would scan every row and is rejected.
+      org_id: when set, restrict results to a specific org. When omitted, all
+        orgs in the table are searched (single-org deployments are the common
+        case, so this is usually unnecessary).
+      limit: maximum number of rows returned from the clients table. The
+        per-result events lookup runs once per row returned, so the effective
+        cost is O((log n) * limit).
+
+    Returns:
+      List of dicts sorted by most-recent event first (rows with no events in
+      the retention window sort to the end). Each dict carries::
+
+        {
+          "mac": "aabbccddee01",
+          "family": "MacBook",
+          "manufacturer": "Apple",
+          "last_username": "srv_Apple_EP",
+          "last_site_id": "abc-123",        # from clients (daily refresh)
+          "last_event_site_id": "abc-123",  # from events (retention window)
+          "last_event_wlan": "Corp-WiFi",
+          "last_event_ts": 1775014952.642,
+          "event_count": 142,
+        }
+    """
+    # Defensive normalisation — canonical hex only, max 12 chars (full MAC).
+    norm = re.sub(r"[^0-9a-f]", "", (mac_prefix or "").lower())
+    if not norm:
+        return []
+    norm = norm[:12]
+
+    conn = await get_connection()
+
+    # Primary lookup — leading-anchored LIKE uses the clients.mac PRIMARY KEY.
+    like_pattern = f"{norm}%"
+    if org_id:
+        rows = await conn.execute_fetchall(
+            """SELECT mac, family, manufacturer, last_username, last_site_id
+               FROM clients
+               WHERE org_id = ? AND mac LIKE ?
+               ORDER BY mac
+               LIMIT ?""",
+            (org_id, like_pattern, int(limit)),
+        )
+    else:
+        rows = await conn.execute_fetchall(
+            """SELECT mac, family, manufacturer, last_username, last_site_id
+               FROM clients
+               WHERE mac LIKE ?
+               ORDER BY mac
+               LIMIT ?""",
+            (like_pattern, int(limit)),
+        )
+
+    if not rows:
+        return []
+
+    # Per-row enrichment — most-recent event site/wlan/ts and count in window.
+    cutoff = time.time() - EVENTS_RETENTION_SECONDS
+    results: list[dict] = []
+    for row in rows:
+        mac = row[0]
+        recent = await conn.execute_fetchall(
+            """SELECT site_id, wlan, timestamp
+               FROM events
+               WHERE mac = ? AND timestamp >= ?
+               ORDER BY timestamp DESC
+               LIMIT 1""",
+            (mac, cutoff),
+        )
+        count_row = await conn.execute_fetchall(
+            "SELECT COUNT(*) FROM events WHERE mac = ? AND timestamp >= ?",
+            (mac, cutoff),
+        )
+        event_count = int(count_row[0][0]) if count_row else 0
+
+        if recent:
+            last_event_site_id = recent[0][0] or ""
+            last_event_wlan = recent[0][1] or ""
+            last_event_ts = float(recent[0][2]) if recent[0][2] is not None else None
+        else:
+            last_event_site_id = ""
+            last_event_wlan = ""
+            last_event_ts = None
+
+        results.append({
+            "mac": mac,
+            "family": row[1] or "",
+            "manufacturer": row[2] or "",
+            "last_username": row[3] or "",
+            "last_site_id": row[4] or "",
+            "last_event_site_id": last_event_site_id,
+            "last_event_wlan": last_event_wlan,
+            "last_event_ts": last_event_ts,
+            "event_count": event_count,
+        })
+
+    # Sort: most-recent event first; rows with no events in the window go last.
+    results.sort(
+        key=lambda r: (r["last_event_ts"] is None, -(r["last_event_ts"] or 0.0))
+    )
+    return results
 
 
 async def delete_clients_for_org(org_id: str) -> int:

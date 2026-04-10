@@ -17,7 +17,7 @@ Detects anomalous client behavior at a Juniper Mist site by:
 3. Engineering per-MAC behavioral feature vectors
 4. Running a four-stage ML detection pipeline (see `anomaly_detector.py`):
    - **Stage 1 — DBSCAN** (site-wide): flags MACs that don't cluster with any site peer group
-   - **Stage 1b — Family Centroid IF**: flags entire device families behaving differently from all other families
+   - **Stage 1b — Family Centroid Distance**: flags entire device families whose L2-normalized centroid sits far (cosine distance) from a healthy-family reference centroid
    - **Stage 2 — Isolation Forest** (per device family): flags individual MACs anomalous within their family
    - **Stage 4 — Markov Chain** (see `markov_analyzer.py`): scores event-transition sequences within episodes against a 24hr site baseline and runs a baseline-independent stuck-loop detector. Per-MAC `markov_reason` collapses to two states: `anomaly` (anomalous connection-chain transitions) or `repeated` (stuck failure loop). Families are flagged when ≥ `MARKOV_FAMILY_OUTLIER_RATIO` of clients carry either reason; the dominant reason is rolled up as `markov_family_reason`.
 5. Computing a separate per-family **Health Score** (see `health_scorer.py`): mean of per-MAC
@@ -41,8 +41,7 @@ to catch things SLEs miss, such as:
 - A device type (e.g., all HP printers at a site) silently failing DNS
 - A specific client model with a firmware bug causing repeated SAE auth failures
 
-The detection strategy: an iPhone behaving nothing like other iPhones at the same site
-is the signal. Device type peer comparison is the core insight.
+The detection strategy: we need to detect anomalies between device groups and flag if a small-yet-critical subset of the client population is unhappy. We don't want to alert for a full failure - the dashboard already handles that - but we need to flag device anomalies using health scores and unsupervised learning techniques.
 
 ---
 
@@ -376,6 +375,18 @@ If MAC is not in client cache, attempt OUI lookup from the first 3 octets of the
 to get manufacturer. Set `device_family = "Unknown"`, `device_model = "Unknown"`.
 Do not drop events for unknown MACs — they still contribute to site-wide DBSCAN.
 
+**RSSI filter on failure events:** During enrichment, `_enrich_batch` drops any event
+whose `rssi` is below `ANOMALY_RSSI_MIN_THRESHOLD` (default `-87`) **and** whose event
+type is in the failure-only allowlist (`AUTH_FAILURE` + `ROAM_FAILURE` +
+`CLIENT_ASSOCIATION_FAILURE` categories — 11 types total). Successful events and
+non-auth event types (DHCP, DNS, ARP, captive portal, disassoc) always pass through
+regardless of signal strength — if they happened, the RF link was good enough.
+A previous implementation blanket-dropped every event with `rssi < threshold`,
+which was over-aggressive. The filter is threaded through a `filter_stats` dict
+and a single INFO summary at end of collect reports `weak_signal_skipped` counts.
+Set `ANOMALY_RSSI_MIN_THRESHOLD=-120` (below the noise floor) to effectively disable
+the filter.
+
 **Event type reference:** The complete known Mist client event taxonomy (sourced from
 `GET /api/v1/const/client_events`) contains 59 event types. Store this list at service
 startup — it defines the dimensions of the frequency vector used for ML input.
@@ -623,7 +634,7 @@ a reminder that it applies to both timing features and the frequency vector.
 anomaly scores and roll up to device type findings. Does NOT compute health scores —
 that is handled separately by `health_scorer.py`.
 
-**Stage 1 — DBSCAN (site-wide) + Family Centroid IF:**
+**Stage 1 — DBSCAN (site-wide) + Family Centroid Distance:**
 
 DBSCAN runs per-MAC across all MACs in the WLAN scope:
 
@@ -644,38 +655,45 @@ DBSCAN sets `dbscan_label`, `is_dbscan_outlier`, and `dbscan_family_noise_ratio`
 each MAC record. These values are stored on anomaly records and used by the frontend,
 but DBSCAN noise ratio no longer determines which families are flagged at the family level.
 
-**`is_family_outlier` is set by the inter-family centroid detection step (separate from Stage 2):**
+**`is_family_outlier` is set by the inter-family cosine-distance detection step (separate from Stage 2):**
 
 After DBSCAN, a centroid detection pass runs across family-level centroids. For each device
 family with ≥ 2 MACs, a dual-representation row is built: element-wise median of all per-MAC
-feature vectors concatenated with the component-wise maximum. This is then fed into one of
-two methods depending on how many qualifying families are present:
+feature vectors concatenated with the component-wise maximum. Each family row is then
+L2-normalized to a unit vector before computing distances. (Cosine distance is scale-invariant
+but requires non-zero-magnitude vectors — StandardScaler is NOT used here because it makes
+rows zero-mean and causes the median reference to approach the zero vector, producing
+spuriously high distances everywhere.)
 
-- **N < `ANOMALY_CENTROID_IF_MIN_FAMILIES` (default 3):** Step skipped entirely. `is_family_outlier` remains False.
-- **`ANOMALY_CENTROID_IF_MIN_FAMILIES` ≤ N ≤ `ANOMALY_CENTROID_DIST_MAX_FAMILIES` (default 10):** Cosine-distance fallback. Each family row is L2-normalized to a unit vector before computing distances (cosine distance is scale-invariant but requires non-zero-magnitude vectors — do NOT use StandardScaler here as it makes rows zero-mean and causes the median reference to approach the zero vector, producing spuriously high distances everywhere). The element-wise median of L2-normalized rows is re-normalized to a unit vector and used as the population reference. Each family's cosine distance from that reference is computed. Families exceeding `ANOMALY_CENTROID_DIST_THRESHOLD` (default 0.55) are flagged.
-- **N > `ANOMALY_CENTROID_DIST_MAX_FAMILIES`:** Full `IsolationForest` run across all family centroid rows. Families with `decision_function < 0` are flagged.
+A reference centroid is built as the element-wise median of the L2-normalized rows (re-normalized
+to a unit vector), and each family's cosine distance from that reference is computed. Families
+exceeding `ANOMALY_CENTROID_DIST_THRESHOLD` (default 0.35) are flagged as `is_family_outlier`.
 
-**Healthy-only reference centroid:** Both the distance and IF paths support a health-aware
-reference mode. Before centroid detection runs, `score()` / `score_org_wide()` computes
-per-family mean health scores from the feature vectors. Families with mean health >=
-`ANOMALY_CENTROID_HEALTHY_REF_THRESHOLD` (default 0.75) form the "healthy reference pool":
+Requires at least 2 qualifying families (≥ 2 MACs each). Below that, the step is skipped
+entirely and no families are flagged at the family level. Isolation Forest is **no longer
+used at the inter-family (centroid) level** — the centroid-IF path was removed because IF
+is statistically unreliable at small N (5–8 family rows): contamination-derived thresholds
+carry little statistical meaning and scores are noisy between cycles. Cosine distance is
+simpler, more stable, and produces interpretable scores. IF remains in use for **intra-family**
+MAC outlier detection (Stage 2).
 
-- **Distance path:** The reference centroid (element-wise median) is built from healthy
-  families only. All families — including unhealthy ones — are measured against this
-  healthy reference. This prevents a group of failing families from hiding behind each
-  other: even if Awair, Raspberry Pi, and Texas Instruments all share the same auth-failure
-  behavioral signature (and thus look "normal" relative to each other), their centroids
-  point far from the healthy reference and get flagged.
-- **IF path:** The IsolationForest is fitted on healthy family rows only, then all family
-  rows are scored via `decision_function`. Families that don't resemble the healthy model
-  score as anomalous.
-- **Fallback:** If fewer than `ANOMALY_CENTROID_HEALTHY_REF_MIN` (default 2) families are
-  healthy, both paths fall back to the standard all-family reference. The log line reports
-  which mode ran each cycle.
+**Healthy-only reference centroid:** Before centroid detection runs, `score()` /
+`score_org_wide()` computes per-family mean health scores from the feature vectors. Families
+with mean health >= `ANOMALY_CENTROID_HEALTHY_REF_THRESHOLD` (default 0.75) form the
+"healthy reference pool": the reference centroid (element-wise median) is built from
+healthy families only. All families — including unhealthy ones — are measured against
+this healthy reference. This prevents a group of failing families from hiding behind
+each other: even if Awair, Raspberry Pi, and Texas Instruments all share the same
+auth-failure behavioral signature (and thus look "normal" relative to each other), their
+centroids point far from the healthy reference and get flagged.
 
-The cosine-distance path exists because IF is statistically unreliable at small N (5–8 rows): contamination-derived thresholds carry little statistical meaning and scores can be noisy between cycles. The distance approach is simpler, more stable, and produces interpretable scores that can be logged and monitored.
+If fewer than `ANOMALY_CENTROID_HEALTHY_REF_MIN` (default 2) families are healthy, the
+detector falls back to the standard all-family reference. The log line reports which
+mode ran each cycle.
 
-Both paths populate `centroid_if_score` / `centroid_dist_score` and `centroid_detection_method` on anomaly records and findings so the method used is always observable.
+Anomaly records and findings carry `centroid_dist_score` (higher = more anomalous) so
+the distance value is always observable. There is no `centroid_detection_method` field
+anymore — the method is always cosine distance.
 
 **Stage 2 — Isolation Forest (per device family):**
 
@@ -869,9 +887,9 @@ collides between the two perspectives.
 They generate findings, contribute to `org_findings`, and pass through the dual
 alert gate exactly like hardware families. The `service_account` summary block on
 each primary anomaly record (set in `score()`) carries `family`, `last_username`,
-`is_family_outlier`, `is_if_outlier`, `if_score`, `centroid_if_score`, and
-`centroid_dist_score` so the per-MAC drilldown can show "this device is also part
-of `srv_Apple_EP.service_account`, which scored X".
+`is_family_outlier`, `is_if_outlier`, `if_score`, and `centroid_dist_score` so
+the per-MAC drilldown can show "this device is also part of
+`srv_Apple_EP.service_account`, which scored X".
 
 **Webhook gating:** Same dual gate as hardware families. A service-account family
 fires the webhook when `is_family_outlier == True` AND `health_score < threshold`.
@@ -899,17 +917,25 @@ render each row correctly without re-deriving the suffix logic.
 
 ### `webhook_dispatcher.py`
 
-**Purpose:** Apply the dual alert gate and POST qualifying findings to the webhook URL.
+**Purpose:** Apply the alert gates and POST qualifying findings to the webhook URL.
 
-**Dual alert gate — both conditions must be true to fire the webhook:**
-1. `finding["is_family_outlier"] == True` — the centroid IF flagged the whole family as
-   behaviorally different from all other device types. Single-device IF or DBSCAN outliers
-   are visible in the UI but never trigger the webhook.
+**Alert gates — all conditions must be true to fire the webhook:**
+1. `finding["is_family_outlier"] == True` — the centroid distance detector flagged the
+   whole family as behaviorally different from the healthy reference. Single-device IF or
+   DBSCAN outliers are visible in the UI but never trigger the webhook.
 2. `family health_score < ANOMALY_HEALTH_SCORE_THRESHOLD` — the family is also measurably
    failing, not just behaviorally unusual.
+3. `finding["total_mac_count"] >= ALARM_MIN_FAMILY_SIZE` — the family is large enough to
+   be worth alerting on. Default `1` (i.e. no suppression); operators raise this via the
+   General Config tab to mute small-population families. Findings below the floor still
+   appear in the UI; only the webhook + org/site alert feeds suppress them. The same
+   floor is applied in `get_org_alerts` and `get_org_summary` so UI alert badges stay in
+   sync with webhook dispatch.
 
-Finding severity (`minimal` / `moderate` / `significant`) is informational — it is stored
-on findings and displayed in the UI, but does not gate webhook dispatch.
+Finding severity (`minimal` / `moderate` / `significant`) is computed and stored on
+findings for the UI, but is **not** emitted in the webhook payload — downstream
+consumers tune their own alert thresholds via the dual gate above rather than relying
+on the Sasquatch severity classification.
 
 **Marvis TSHOOT enrichment:** After findings pass the dual gate but before the payload is
 POSTed, the dispatcher calls the Mist Marvis TSHOOT API for each of the top three worst-health
@@ -927,34 +953,41 @@ MACs return an empty `tshoot_results` list rather than blocking the webhook. If 
 or `MIST_API_TOKEN` are not configured, the enrichment step is skipped and `marvis_tshoot`
 is omitted from the payload.
 
-**Webhook payload:**
+**Webhook payload:** The outbound payload is intentionally slim — only fields a downstream
+alerting consumer actually needs to route and triage. Internal detector metrics
+(centroid distances, DBSCAN counts, outlier ratios, IF scores, Markov ratios/counts,
+severity, legacy example_macs, top_features) are **not** emitted. The slim projection
+is performed by `_slim_finding_for_webhook()` in `webhook_dispatcher.py` — edit that
+helper if the shape needs to change.
+
+**Site-scope payload:**
 ```json
 {
   "source": "sasquatch_client_anomaly",
+  "scope": "site",
   "site_id": "04edb3ac-542a-4d1d-ad90-b1e2fd682a67",
-  "timestamp": "2025-01-15T14:32:00Z",
-  "finding_count": 1,
+  "wlan": "Corp-WiFi",
+  "timestamp": "2026-04-10T14:32:00Z",
   "findings": [
     {
       "device_family": "iPhone",
-      "severity": "significant",
-      "wlan": "Corp-WiFi",
-      "outlier_ratio": 0.72,
+      "family_kind": "device_family",
       "affected_mac_count": 18,
+      "total_mac_count": 25,
       "is_family_outlier": true,
+      "is_family_dbscan_outlier": false,
+      "is_family_markov_outlier": true,
+      "markov_family_reason": "repeated",
+      "probable_pattern": "auth_failure_terminal",
       "health_score": 0.61,
       "health_components": {"auth": 0.42, "roam": 0.08, "dhcp": 0.02, "dns": 0.01, "arp": 0.0},
-      "example_macs": ["aa:bb:cc:dd:ee:ff", "11:22:33:44:55:66"],
+      "service_alarms": ["auth"],
+      "service_health": {"auth": 0.55, "roam": 0.92, "dhcp": 0.98, "dns": 0.99, "arp": 1.0},
       "worst_health_macs": [
         {"mac": "aabbccddee01", "health_score": 0.21, "health_components": {"auth": 0.42}},
         {"mac": "aabbccddee02", "health_score": 0.34, "health_components": {"roam": 0.28}},
         {"mac": "aabbccddee03", "health_score": 0.41, "health_components": {"dhcp": 0.19}}
       ],
-      "top_features": [
-        {"feature": "AUTH_FAILURE", "outlier_mean": 0.38, "baseline_mean": 0.03},
-        {"feature": "AUTH_SUCCESS", "outlier_mean": 0.12, "baseline_mean": 0.41}
-      ],
-      "probable_pattern": "auth_failure_terminal",
       "marvis_tshoot": [
         {
           "mac": "aabbccddee01",
@@ -974,13 +1007,25 @@ is omitted from the payload.
             }
           ]
         },
-        {"mac": "aabbccddee02", "tshoot_results": [...]},
-        {"mac": "aabbccddee03", "tshoot_results": [...]}
+        {"mac": "aabbccddee02", "tshoot_results": []},
+        {"mac": "aabbccddee03", "tshoot_results": []}
       ]
     }
   ]
 }
 ```
+
+**Org-scope payload** differs in three ways:
+- `"scope": "org"`, `"site_id": null`
+- Each finding adds `"site_count"` and `"sites_affected": [...]`
+- `worst_health_macs` and `marvis_tshoot` are **omitted** (org-wide scoring doesn't compute
+  per-MAC worst-health lists; TSHOOT only enriches site-scope findings).
+
+**Service-account family findings** add two conditional fields when
+`family_kind == "service_account"`:
+- `"service_account_label"`: the bare username (suffix stripped), e.g. `"srv_Apple_EP"`
+- `"service_account_member_families"`: sorted list of underlying hardware families the
+  username spans, e.g. `["MacBook", "Windows"]`
 
 **`probable_pattern` field:** Derive from top contributing features using rule-based
 lookup — NO LLM (rule-based only, no network calls). Evaluated in priority order (first match wins):
@@ -1051,9 +1096,14 @@ detection cycle. Must not raise — failures are logged and swallowed.
 # Daily at 00:00 — refresh the org-wide client cache
 scheduler.add_job(client_refresh_job, 'cron', hour=0, minute=0)
 
-# Daily at 00:30 + once at startup — rebuild the Markov baseline
-scheduler.add_job(markov_baseline_job, 'cron', hour=0, minute=30,
-                  next_run_time=datetime.now(timezone.utc))
+# Daily at 00:30 — unconditional Markov baseline rebuild
+scheduler.add_job(markov_baseline_job, 'cron', hour=0, minute=30)
+
+# Once at startup — only rebuilds baselines that are missing/expired in Redis
+# (baselines carry a 48hr TTL, so restarts inside that window are near-instant)
+scheduler.add_job(markov_baseline_job, 'date',
+                  run_date=datetime.now(timezone.utc),
+                  kwargs={"skip_existing": True})
 
 # Daily at 03:00 — purge SQLite events older than the 7-day retention window
 scheduler.add_job(sqlite_retention_job, 'cron', hour=3, minute=0)
@@ -1062,10 +1112,13 @@ scheduler.add_job(sqlite_retention_job, 'cron', hour=3, minute=0)
 scheduler.add_job(org_event_poll_job, 'interval', hours=1)
 ```
 
-**ARCH-4: Anomaly detection is no longer scheduled.** Detection runs only on
-manual trigger via `POST /api/v1/org/detect`, which schedules
-`_org_detect_background_task` → `run_org_pipeline()` (defined in
-`scheduler.py`).
+**ARCH-4: Anomaly detection is no longer scheduled.** Detection runs on manual
+trigger via `POST /api/v1/org/detect`, and automatically chains after a
+successful collect (full or hourly) when the auto-detect flag is on.
+`_org_detect_background_task` invokes `run_org_pipeline()` (defined in
+`scheduler.py`); the auto-chain paths invoke `_run_org_pipeline_body()`
+directly so the collect's background task runs detect in the same task under
+the same mutex without releasing and re-acquiring.
 
 `run_org_pipeline()` walks each site and each WLAN scope (`__all__` + each
 unique SSID per site) through this sequence:
@@ -1078,6 +1131,18 @@ unique SSID per site) through this sequence:
 Any code path that calls `build_features` + `score` must also call `score_health`
 in between, so health data is never stale relative to anomaly data.
 
+**Auto-detect chaining:** The Redis flag `sasquatch:auto_detect_enabled`
+(default `"1"` — missing key counts as enabled) controls whether detection
+automatically runs after a successful collect. When on, `_org_collect_background_task`
+calls `_run_org_pipeline_body()` inline after `collect_org_full()`, and
+`org_event_poll_job` does the same after its hourly event pull. The global
+mutex is handed off from `collecting` → `detecting` in place via
+`_transfer_global_lock()` so a competing manual trigger cannot sneak in
+between the two phases. `get_auto_detect_enabled()` / `set_auto_detect_enabled()`
+helpers live in `scheduler.py`; the admin toggles it via
+`GET/POST /api/v1/org/auto-detect` (exposed in the UI action bar next to the
+Event Polling button).
+
 **`org_event_poll_job` — hourly event-only top-up:**
 - Gated by the Redis key `sasquatch:event_polling_enabled` (set to `"1"` to enable).
 - `_org_collect_background_task` sets that key to `"1"` automatically when a manual
@@ -1085,9 +1150,12 @@ in between, so health data is never stale relative to anomaly data.
   the operator does not have to flip the toggle separately.
 - The job calls `collect_org(MIST_ORG_ID)`, which streams the trailing 1 hour by
   Unix timestamp and flushes to SQLite every `_ORG_HOURLY_FLUSH_BATCH_SIZE` (25k)
-  events. It does NOT run detection — anomaly scoring stays manual.
+  events. When `sasquatch:auto_detect_enabled` is on, detection is chained
+  in-place after the events land; otherwise the job stops at collection.
 - The job acquires the global mutex (`_acquire_global_lock("collecting")`) so it
   cannot overlap with a manual collect or detection run.
+- Writes progress to `sasquatch:progress:org_hourly_poll` (5-minute TTL) so the
+  frontend can display a status bar via `GET /api/v1/org/hourly-progress`.
 
 If any step raises, log the error and skip remaining steps for that cycle. Do not
 let one bad cycle corrupt Redis state from the previous good cycle.
@@ -1126,11 +1194,19 @@ POST /api/v1/org/collect-full                        → trigger a full org-wide
                                                        sasquatch:event_polling_enabled = "1" so the hourly
                                                        org_event_poll_job starts topping up automatically
 GET  /api/v1/org/collect-progress                    → phase/page/event counters for an in-flight collect
+GET  /api/v1/org/hourly-progress                     → phase/page/event counters for an in-flight hourly poll
+                                                       (mirrors collect-progress schema, no clients phase)
 GET  /api/v1/org/polling                             → {enabled: bool} — current state of the hourly poll flag
 POST /api/v1/org/polling                             → {enabled: bool} — manually toggle the hourly poll flag
+GET  /api/v1/org/auto-detect                         → {enabled: bool} — current state of the auto-detect flag
+                                                       (default enabled; controls whether detection chains
+                                                       after a successful collect)
+POST /api/v1/org/auto-detect                         → {enabled: bool} — manually toggle the auto-detect flag
 POST /api/v1/org/detect                              → re-runs build_features + score_health + score (per-site) for all
                                                        sites, then score_org_wide; updates both per-site findings
                                                        (sasquatch:findings:{site_id}:{wlan}) and org findings
+GET  /api/v1/org/clients/search?mac=                 → prefix search over the clients SQLite PK; returns metadata
+                                                       + most-recent (site_id, wlan, timestamp) per hit via events idx
 GET  /api/v1/org/alerts                              → org-wide alerts + per-site alerts in one response;
                                                        org_alerts = org findings with health_score < 0.75;
                                                        site_alerts = per-site findings × per-site health, grouped by site
@@ -1275,11 +1351,9 @@ ANOMALY_DBSCAN_MIN_FAMILY_SIZE=5
 ANOMALY_FINDING_THRESHOLD=0.2
 ANOMALY_MIN_PEERS=5
 ANOMALY_MIN_MAC_EVENTS=20
-ANOMALY_CENTROID_IF_MIN_FAMILIES=3
-ANOMALY_CENTROID_DIST_MAX_FAMILIES=10  # sites with ≤ this many families use cosine-distance; above uses IF
-ANOMALY_CENTROID_DIST_THRESHOLD=0.55   # cosine distance (L2-normalized unit vectors) above which a family centroid is flagged
-ANOMALY_CENTROID_HEALTHY_REF_THRESHOLD=0.75  # families below this health excluded from centroid reference population
-ANOMALY_CENTROID_HEALTHY_REF_MIN=2     # minimum healthy families to activate healthy-only reference; otherwise all-family
+ANOMALY_CENTROID_DIST_THRESHOLD=0.35   # cosine distance (L2-normalized unit vectors) above which a family centroid is flagged as is_family_outlier
+ANOMALY_CENTROID_HEALTHY_REF_THRESHOLD=0.75  # families below this health are excluded from the centroid reference pool
+ANOMALY_CENTROID_HEALTHY_REF_MIN=2     # minimum healthy families to activate healthy-only reference; otherwise falls back to all-family reference
 
 # Markov Chain stuck-loop detector (markov_analyzer.py)
 MARKOV_STUCK_LOOP_THRESHOLD=0.4        # fraction of transitions dominated by one failure pair to flag stuck-loop
@@ -1290,7 +1364,18 @@ MARKOV_STUCK_LOOP_MIN_EVENTS=20        # minimum events before stuck-loop detect
 # Range: 0.0 (all failing) to 1.0 (no failures). Tune down if too noisy.
 ANOMALY_HEALTH_SCORE_THRESHOLD=0.75
 
-# Webhook — dual gate: is_family_outlier AND health_score < threshold.
+# Alarm suppression — skip findings whose total family MAC count is below this floor.
+# Applies to webhook dispatch AND UI alert feeds (/org/alerts, /org/summary).
+# Set to 1 to disable suppression (default). Findings below the floor still appear in
+# the main findings UI — only alerting is muted.
+ALARM_MIN_FAMILY_SIZE=1
+
+# Event collector — drop failure events whose RSSI is below this floor (dBm).
+# Only applies to auth/roam/association failure event types; successful events and
+# non-auth types pass through regardless. Set to -120 (below noise floor) to disable.
+ANOMALY_RSSI_MIN_THRESHOLD=-87
+
+# Webhook — gates: is_family_outlier AND health_score < threshold AND total_mac_count >= ALARM_MIN_FAMILY_SIZE.
 # Any severity triggers dispatch — severity is informational only.
 ANOMALY_WEBHOOK_URL=https://project-sasquatch-production.up.railway.app/webhook/anomaly
 

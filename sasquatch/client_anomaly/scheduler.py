@@ -4,7 +4,7 @@ scheduler.py — APScheduler job definitions and global mutex.
 Scheduled jobs:
 - client_refresh_job: Daily at 00:00 — refresh client device cache.
 - markov_baseline_job: Daily at 00:30 — rebuild Markov baselines.
-- org_event_poll_job: Hourly (optional) — collection only, no detection.
+- org_event_poll_job: Every `general.org_detection_interval_hours` hours (optional) — collection only, no detection.
 - sqlite_retention_job: Daily at 03:00 — purge expired events.
 
 Anomaly detection is triggered only (not scheduled) — via POST /api/v1/org/detect
@@ -18,6 +18,7 @@ import os
 import time as _time
 from datetime import datetime, timezone
 
+import httpx
 import redis.asyncio as aioredis
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
@@ -30,12 +31,14 @@ from .markov_analyzer import baseline_exists as markov_baseline_exists
 from .markov_analyzer import build_and_store_baseline as build_markov_baseline
 from .webhook_dispatcher import evaluate_and_dispatch
 
+from . import config as _config_mod
 from . import db
 
 log = logging.getLogger(__name__)
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 MIST_API_TOKEN = os.getenv("MIST_API_TOKEN", "")
+MIST_CLOUD_HOST = os.getenv("MIST_CLOUD_HOST", "api.mist.com")
 MIST_ORG_ID = os.getenv("MIST_ORG_ID", "")
 
 # Global mutex: only one operation (collecting or detecting) at a time.
@@ -45,6 +48,14 @@ _GLOBAL_LOCK_TTL_SECONDS = 2 * 60 * 60  # 2 hours
 # Redis keys for tracking last operation timestamps
 _LAST_COLLECTION_KEY = "sasquatch:last_collection"
 _LAST_DETECTION_KEY = "sasquatch:last_detection"
+
+# Auto-chain detection after collects (manual full-collect and hourly poll).
+# Default: enabled (value missing → "1"). Toggled via /api/v1/org/auto-detect.
+_AUTO_DETECT_ENABLED_KEY = "sasquatch:auto_detect_enabled"
+
+# Shared cache key for the org site map (also read by api/routes.py).
+_ORG_SITES_CACHE_KEY = "sasquatch:org_sites_map"
+_ORG_SITES_CACHE_TTL = 300  # 5 minutes
 
 
 async def _acquire_global_lock(operation: str) -> tuple[aioredis.Redis, bool]:
@@ -68,6 +79,93 @@ async def _release_global_lock(redis_client: aioredis.Redis) -> None:
         await redis_client.delete(_GLOBAL_LOCK_KEY)
     finally:
         await redis_client.aclose()
+
+
+async def clear_stale_global_lock() -> None:
+    """
+    Unconditionally delete the global operation lock at process startup.
+
+    The lock carries a 2-hour TTL, so a crash/restart of the backend mid-job
+    leaves a ghost lock behind that blocks every subsequent collect/detect
+    trigger with 409 until the TTL expires. A freshly-started process cannot
+    possibly be mid-flight on any background task, so clearing the key on
+    startup is always safe.
+    """
+    client = aioredis.from_url(REDIS_URL, decode_responses=True)
+    try:
+        raw = await client.get(_GLOBAL_LOCK_KEY)
+        if raw:
+            log.warning(
+                "Clearing stale global lock at startup: %s", raw
+            )
+            await client.delete(_GLOBAL_LOCK_KEY)
+    finally:
+        await client.aclose()
+
+
+async def _transfer_global_lock(redis_client: aioredis.Redis, to_op: str) -> None:
+    """
+    Atomically rewrite the in-flight global lock value to a new operation name
+    without releasing it. Used by the collect→detect auto-chain so no competing
+    operation can grab the mutex during the handoff window.
+
+    Caller must already hold the lock. TTL is refreshed to the standard duration.
+    """
+    await redis_client.set(
+        _GLOBAL_LOCK_KEY,
+        json.dumps({"operation": to_op, "started_at": _time.time()}),
+        ex=_GLOBAL_LOCK_TTL_SECONDS,
+    )
+
+
+async def get_auto_detect_enabled() -> bool:
+    """
+    Return whether collect→detect auto-chain is enabled.
+
+    Default is enabled: a missing key counts as on. Only the explicit string
+    "0" disables it. This matches the operator expectation that a fresh deploy
+    runs detection automatically after every collect.
+    """
+    client = aioredis.from_url(REDIS_URL, decode_responses=True)
+    try:
+        val = await client.get(_AUTO_DETECT_ENABLED_KEY)
+    finally:
+        await client.aclose()
+    return val != "0"
+
+
+async def set_auto_detect_enabled(enabled: bool) -> None:
+    """Persist the auto-detect toggle. Writes "1" or "0" (no TTL)."""
+    client = aioredis.from_url(REDIS_URL, decode_responses=True)
+    try:
+        await client.set(_AUTO_DETECT_ENABLED_KEY, "1" if enabled else "0")
+    finally:
+        await client.aclose()
+
+
+async def _get_cached_site_map(redis_client: aioredis.Redis) -> dict[str, str]:
+    """
+    Return the {site_id: site_name} map, preferring the Redis cache (5-minute
+    TTL shared with api/routes.py). Falls back to a direct Mist API call and
+    re-populates the cache on miss.
+
+    Used by the auto-chain path so the scheduler job does not depend on the
+    routes module. Raises on API failure — the caller decides how to degrade.
+    """
+    cached = await redis_client.get(_ORG_SITES_CACHE_KEY)
+    if cached:
+        return json.loads(cached)
+
+    url = f"https://{MIST_CLOUD_HOST}/api/v1/orgs/{MIST_ORG_ID}/sites"
+    headers = {"Authorization": f"Token {MIST_API_TOKEN}"}
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.get(url, headers=headers)
+        resp.raise_for_status()
+    site_map = {s["id"]: s.get("name", s["id"]) for s in resp.json() if "id" in s}
+    await redis_client.set(
+        _ORG_SITES_CACHE_KEY, json.dumps(site_map), ex=_ORG_SITES_CACHE_TTL
+    )
+    return site_map
 
 
 async def get_global_lock_status() -> dict | None:
@@ -124,6 +222,13 @@ async def _record_last_timestamp(key: str) -> None:
 _ORG_DETECT_PROGRESS_KEY = "sasquatch:progress:org_detect"
 _ORG_DETECT_PROGRESS_TTL = 300  # 5 minutes
 
+# Hourly poll progress — mirrors the full-collect progress schema in
+# _org_collect_background_task (api/routes.py) so the frontend can reuse the
+# same status-bar component. Key auto-expires so the bar clears itself after a
+# run completes, and disabled / skipped cycles leave no residual state.
+_ORG_HOURLY_POLL_PROGRESS_KEY = "sasquatch:progress:org_hourly_poll"
+_ORG_HOURLY_POLL_PROGRESS_TTL = 300  # 5 minutes
+
 
 async def run_org_pipeline(
     site_ids: list[str],
@@ -133,27 +238,48 @@ async def run_org_pipeline(
     """
     ARCH-5 org detection pipeline — org-first, then per-site, with progress.
 
-    Sequence:
-      1. Acquire global mutex
-      2. Build features + score health for all sites/WLANs
-      3. Run org-wide anomaly detection → write org findings → dispatch org webhook
-      4. Run per-site anomaly detection (iterate each site) → dispatch per-site webhooks
-      5. Release global mutex
+    Acquires the global mutex as ``detecting``, runs the body, releases the
+    mutex. Raises RuntimeError if the lock is already held.
 
-    Org findings appear in Redis as soon as phase 3 completes (frontend auto-refreshes).
-    Per-site findings appear incrementally as each site completes in phase 4.
-    If the pipeline fails mid-site, previously completed sites retain their results.
-
-    progress_callback: optional async callable(dict) to write progress updates.
-    site_map: {site_id: site_name} for progress messages.
-
-    Returns summary dict; raises RuntimeError if the lock is already held.
+    See ``_run_org_pipeline_body`` for the detailed phase sequence.
     """
     redis_client, acquired = await _acquire_global_lock("detecting")
     if not acquired:
         await redis_client.aclose()
         raise RuntimeError("Another operation is already running — skipping")
 
+    try:
+        return await _run_org_pipeline_body(
+            site_ids=site_ids,
+            site_map=site_map,
+            progress_callback=progress_callback,
+        )
+    finally:
+        await _release_global_lock(redis_client)
+
+
+async def _run_org_pipeline_body(
+    site_ids: list[str],
+    site_map: dict[str, str],
+    progress_callback=None,
+) -> dict:
+    """
+    Pipeline body shared by the public ``run_org_pipeline`` wrapper and the
+    collect→detect auto-chain paths. The caller is responsible for holding the
+    global mutex — this function does NOT acquire or release it.
+
+    Sequence:
+      1. Build features + score health for all sites/WLANs
+      2. Run org-wide anomaly detection → write org findings → dispatch org webhook
+      3. Run per-site anomaly detection (iterate each site) → dispatch per-site webhooks
+
+    Org findings appear in Redis as soon as phase 2 completes (frontend auto-refreshes).
+    Per-site findings appear incrementally as each site completes in phase 3.
+    If the pipeline fails mid-site, previously completed sites retain their results.
+
+    progress_callback: optional async callable(dict) to write progress updates.
+    site_map: {site_id: site_name} for progress messages.
+    """
     started = _time.time()
 
     async def _progress(data: dict) -> None:
@@ -259,6 +385,17 @@ async def run_org_pipeline(
         })
 
         # ── Phase 4: Per-site anomaly detection (sequential) ─────────────
+        # Counters for the end-of-phase summary. A (site, wlan) combo lands in
+        # exactly one bucket: scored (score() returned > 0), skipped_empty_features
+        # (score() returned 0 — features key exists but dict is empty, see
+        # anomaly_detector.score() skip path), or failed (score() raised). Tracked
+        # so the silent-skip gap between features keys and anomalies keys is
+        # observable at a glance (see TODO Phase 4 investigation).
+        phase4_wlans_scored = 0
+        phase4_wlans_skipped_empty_features = 0
+        phase4_wlans_failed = 0
+        phase4_sites_with_any_scored: set[str] = set()
+
         for i, sid in enumerate(site_ids):
             site_name = site_map.get(sid, sid[:8])
             await _progress({
@@ -272,10 +409,26 @@ async def run_org_pipeline(
             wlans = wlans_by_site.get(sid, [])
             for wlan in wlans:
                 try:
-                    await score(sid, wlan)
+                    n_scored = await score(sid, wlan)
+                    if n_scored > 0:
+                        phase4_wlans_scored += 1
+                        phase4_sites_with_any_scored.add(sid)
+                    else:
+                        phase4_wlans_skipped_empty_features += 1
                     await evaluate_and_dispatch(sid, wlan=wlan)
                 except Exception:
+                    phase4_wlans_failed += 1
                     log.exception(f"[org pipeline] Per-site scoring failed for site={sid} wlan={wlan}")
+
+        total_wlans = phase4_wlans_scored + phase4_wlans_skipped_empty_features + phase4_wlans_failed
+        log.info(
+            "[org pipeline] Phase 4 summary: sites_scored=%d/%d wlans_scored=%d/%d "
+            "wlans_skipped_empty_features=%d wlans_failed=%d",
+            len(phase4_sites_with_any_scored), total_sites,
+            phase4_wlans_scored, total_wlans,
+            phase4_wlans_skipped_empty_features,
+            phase4_wlans_failed,
+        )
 
         # ── Done ─────────────────────────────────────────────────────────
         await _record_last_timestamp(_LAST_DETECTION_KEY)
@@ -305,8 +458,6 @@ async def run_org_pipeline(
             "message": "Pipeline failed — check server logs",
         })
         raise
-    finally:
-        await _release_global_lock(redis_client)
 
 
 async def client_refresh_job():
@@ -346,7 +497,7 @@ async def client_refresh_job():
             log.exception(f"client_refresh_job: re-enrichment failed for site {sid}")
 
 
-async def markov_baseline_job() -> None:
+async def markov_baseline_job(skip_existing: bool = False) -> None:
     """
     Daily job: build Markov Chain transition matrix baselines for every site/WLAN
     pair that has events in SQLite.
@@ -362,6 +513,12 @@ async def markov_baseline_job() -> None:
     Stored at sasquatch:markov_baseline:{site_id}:{wlan_key} with 48hr TTL.
     On first deploy (no events yet) the iteration is empty — the next daily run
     after events accumulate populates the baselines.
+
+    When ``skip_existing=True``, each (site, wlan) pair is checked against Redis
+    and skipped if a baseline key is already present. Used by the one-shot
+    startup invocation so a restart within the 48hr TTL does not redundantly
+    rebuild every site×wlan pair. The nightly cron invocation uses the default
+    (rebuild everything).
     """
     site_ids = await db.get_site_ids_with_events()
     if not site_ids:
@@ -371,24 +528,41 @@ async def markov_baseline_job() -> None:
     redis_client = aioredis.from_url(REDIS_URL, decode_responses=True)
     try:
         event_type_index = await ensure_event_type_index(redis_client)
+
+        built = 0
+        skipped = 0
+        for sid in site_ids:
+            try:
+                wlans = await get_wlans(site_id=sid)
+                for wlan in wlans:
+                    if skip_existing and await markov_baseline_exists(
+                        sid, wlan, redis_client
+                    ):
+                        skipped += 1
+                        continue
+                    result = await build_markov_baseline(
+                        sid, wlan, event_type_index
+                    )
+                    built += 1
+                    log.info(
+                        "[markov baseline] site=%s wlan=%s: %d MACs, %d events, "
+                        "%d normal episodes",
+                        sid, wlan,
+                        result.get("macs", 0),
+                        result.get("events", 0),
+                        result.get("normal_episodes", 0),
+                    )
+            except Exception:
+                log.exception("[markov baseline] Failed for site=%s", sid)
+
+        if skip_existing:
+            log.info(
+                "[markov baseline] Startup check complete: built %d, "
+                "skipped %d (already present in Redis)",
+                built, skipped,
+            )
     finally:
         await redis_client.aclose()
-
-    for sid in site_ids:
-        try:
-            wlans = await get_wlans(site_id=sid)
-            for wlan in wlans:
-                result = await build_markov_baseline(sid, wlan, event_type_index)
-                log.info(
-                    "[markov baseline] site=%s wlan=%s: %d MACs, %d events, "
-                    "%d normal episodes",
-                    sid, wlan,
-                    result.get("macs", 0),
-                    result.get("events", 0),
-                    result.get("normal_episodes", 0),
-                )
-        except Exception:
-            log.exception("[markov baseline] Failed for site=%s", sid)
 
 
 async def org_event_poll_job() -> None:
@@ -399,6 +573,14 @@ async def org_event_poll_job() -> None:
     POST /api/v1/org/polling. When disabled (default), this job exits immediately.
 
     Acquires the global mutex to prevent overlap with detection operations.
+
+    Writes phase-by-phase progress to `sasquatch:progress:org_hourly_poll`
+    mirroring the full-collect schema in `_org_collect_background_task`
+    (api/routes.py) so the frontend progress bar can be reused. Only the
+    `collecting_events` / `complete` / `error` phases are emitted — the
+    hourly poll does not refresh the client cache, so there is no
+    `collecting_clients` phase. Disabled / skipped cycles intentionally
+    write nothing so the status bar stays idle.
     """
     if not MIST_ORG_ID or not MIST_API_TOKEN:
         log.debug("[org-poll] MIST_ORG_ID or MIST_API_TOKEN not configured — skipping")
@@ -420,17 +602,102 @@ async def org_event_poll_job() -> None:
         log.warning("[org-poll] Global lock held — skipping this poll cycle")
         return
 
+    started = _time.time()
+
+    async def wp(data: dict) -> None:
+        data["started_at"] = started
+        await lock_client.set(
+            _ORG_HOURLY_POLL_PROGRESS_KEY,
+            json.dumps(data),
+            ex=_ORG_HOURLY_POLL_PROGRESS_TTL,
+        )
+
+    async def on_page(page: int, fetched: int, total) -> None:
+        expected_pages = (total + 999) // 1000 if total else None
+        if expected_pages:
+            status = (
+                f"Hourly poll — page {page}/{expected_pages} "
+                f"({fetched:,}/{total:,})"
+            )
+        else:
+            status = f"Hourly poll — page {page} ({fetched:,} so far)"
+        await wp({
+            "phase": "collecting_events",
+            "pages_fetched": page,
+            "events_fetched": fetched,
+            "total_events_estimated": total,
+            "expected_event_pages": expected_pages,
+            "status": status,
+        })
+
     try:
         log.info("[org-poll] Starting hourly org-level event collection")
-        site_counts = await collect_org(MIST_ORG_ID, duration="1h")
+        await wp({
+            "phase": "collecting_events",
+            "pages_fetched": 0,
+            "events_fetched": 0,
+            "total_events_estimated": None,
+            "expected_event_pages": None,
+            "status": "Hourly poll — gathering client events...",
+        })
+
+        site_counts = await collect_org(MIST_ORG_ID, duration="1h", on_page=on_page)
         total = sum(site_counts.values())
         log.info(
             f"[org-poll] Collection complete: {total} events "
             f"across {len(site_counts)} sites"
         )
         await _record_last_timestamp(_LAST_COLLECTION_KEY)
-    except Exception:
+
+        await wp({
+            "phase": "complete",
+            "pages_fetched": -1,
+            "events_fetched": total,
+            "site_counts": site_counts,
+            "sites_with_events": len(site_counts),
+            "status": (
+                f"Hourly poll complete — {total:,} events "
+                f"across {len(site_counts)} sites"
+            ),
+        })
+
+        # ── Auto-chain: detect after collect ─────────────────────────────
+        # Keep the global mutex throughout the handoff — rewrite its value
+        # from "collecting" → "detecting" in place so no manual trigger can
+        # sneak in between collect and detect.
+        if await get_auto_detect_enabled():
+            log.info("[org-poll] Auto-detect enabled — chaining to detection pipeline")
+            await _transfer_global_lock(lock_client, "detecting")
+            try:
+                site_map = await _get_cached_site_map(lock_client)
+            except Exception:
+                log.exception("[org-poll] Auto-detect: failed to fetch site map — skipping detect")
+            else:
+                site_ids = list(site_map.keys())
+
+                async def _write_detect_progress(data: dict) -> None:
+                    await lock_client.set(
+                        _ORG_DETECT_PROGRESS_KEY,
+                        json.dumps(data),
+                        ex=_ORG_DETECT_PROGRESS_TTL,
+                    )
+
+                try:
+                    await _run_org_pipeline_body(
+                        site_ids=site_ids,
+                        site_map=site_map,
+                        progress_callback=_write_detect_progress,
+                    )
+                except Exception:
+                    log.exception("[org-poll] Auto-detect chain failed")
+        else:
+            log.debug("[org-poll] Auto-detect disabled — skipping chained detection")
+    except Exception as exc:
         log.exception("[org-poll] Event collection failed")
+        try:
+            await wp({"phase": "error", "message": str(exc)})
+        except Exception:
+            log.exception("[org-poll] Failed to write error progress")
     finally:
         await _release_global_lock(lock_client)
 
@@ -469,10 +736,7 @@ def create_scheduler() -> AsyncIOScheduler:
     )
 
     # Daily at 00:30 — Markov baseline rebuild (after client cache refresh).
-    # Also runs immediately at startup so the baseline is available without
-    # waiting up to 24 hours after a fresh deployment or service restart.
-    # If no events are in Redis yet, the job exits early without writing anything
-    # and the nightly run will populate the baseline once events accumulate.
+    # Unconditional nightly rebuild using the trailing 24hr of events.
     scheduler.add_job(
         markov_baseline_job,
         "cron",
@@ -480,21 +744,41 @@ def create_scheduler() -> AsyncIOScheduler:
         minute=30,
         id="markov_baseline",
         name="Markov Chain Baseline Rebuild",
-        next_run_time=datetime.now(timezone.utc),
+    )
+
+    # One-shot startup rebuild: only fills in baselines that are missing or
+    # expired in Redis. Baselines carry a 48hr TTL, so a restart within that
+    # window no longer triggers a redundant per-site-per-WLAN rebuild of
+    # hundreds of baselines at boot. If no events are in SQLite yet the job
+    # exits early and the nightly cron will populate them once events
+    # accumulate.
+    scheduler.add_job(
+        markov_baseline_job,
+        "date",
+        run_date=datetime.now(timezone.utc),
+        id="markov_baseline_startup",
+        name="Markov Chain Baseline Startup Check",
+        kwargs={"skip_existing": True},
     )
 
     # ARCH-4: Scheduled detection jobs removed. Anomaly detection is now triggered
     # only via POST /api/v1/org/detect or the UI "Re-detect" button.
 
-    # Optional hourly org-level event polling (collection only, no detection).
-    # Disabled by default — toggled via POST /api/v1/org/polling.
+    # Optional org-level event polling (collection only — detection auto-chains
+    # when sasquatch:auto_detect_enabled is "1"). Disabled by default; toggled
+    # via POST /api/v1/org/polling. Interval is driven by the
+    # `org_detection_interval_hours` general-config control so operators can
+    # slow or speed up the poll from the GUI. Value is read at startup — a
+    # service restart is required for the new interval to take effect.
     if MIST_ORG_ID:
+        poll_hours = int(_config_mod.get("general", "org_detection_interval_hours"))
         scheduler.add_job(
             org_event_poll_job,
             "interval",
-            hours=1,
+            hours=poll_hours,
             id="org_event_poll",
             name="Org-Level Event Poll",
         )
+        log.info("Org event poll scheduled every %d hour(s)", poll_hours)
 
     return scheduler

@@ -5,77 +5,6 @@ const SEVERITY_COLOR = { significant: "#e05555", moderate: "#e0a835", minimal: "
 const SA_COLOR = "#d4a06a";
 const SA_BG    = "#2a1f15";
 
-function shapleyScoreFromIfScore(ifScore) {
-  if (ifScore == null) return null;
-  return Math.max(0, Math.min(100, Math.round((0.5 - ifScore) / 1.0 * 100)));
-}
-
-function shapleyColor(score) {
-  if (score >= 60) return "#e05555";
-  if (score >= 35) return "#e0a835";
-  return "#4ea8c4";
-}
-
-function ShapleyBlock({ label, score, features, description }) {
-  const color = score != null ? shapleyColor(score) : "#666";
-  return (
-    <div style={{
-      background: "#0e0e0e",
-      border: `1px solid ${color}33`,
-      borderLeft: `3px solid ${color}`,
-      borderRadius: "3px",
-      padding: "10px 12px",
-      marginBottom: "14px",
-    }}>
-      <div style={{ display: "flex", alignItems: "center", gap: "12px", marginBottom: "6px" }}>
-        <span style={{ fontSize: "11px", color: "#666", textTransform: "uppercase", letterSpacing: "0.06em" }}>
-          {label}
-        </span>
-        {score != null && (
-          <div style={{ display: "flex", alignItems: "center", gap: "8px", flex: 1 }}>
-            <div style={{ flex: 1, height: "6px", background: "#1a1a1a", borderRadius: "3px", overflow: "hidden" }}>
-              <div style={{ width: `${score}%`, height: "100%", background: color, borderRadius: "3px" }} />
-            </div>
-            <span style={{ fontSize: "13px", fontWeight: "bold", color, minWidth: "36px", textAlign: "right" }}>
-              {score}<span style={{ fontSize: "10px", color: "#555" }}>/100</span>
-            </span>
-          </div>
-        )}
-        {score == null && (
-          <span style={{ fontSize: "11px", color: "#444" }}>score unavailable</span>
-        )}
-      </div>
-      {description && (
-        <div style={{ fontSize: "11px", color: "#555", marginBottom: features?.length > 0 ? "6px" : 0 }}>
-          {description}
-        </div>
-      )}
-      {features?.length > 0 && (
-        <div style={{ display: "flex", flexDirection: "column", gap: "3px" }}>
-          {features.slice(0, 4).map((f, i) => {
-            const delta = Math.abs(f.outlier_mean - f.baseline_mean);
-            const barWidth = Math.min(delta * 400, 100);
-            return (
-              <div key={i} style={{ display: "flex", alignItems: "center", gap: "8px" }}>
-                <span style={{ fontSize: "10px", color: "#777", width: "220px", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flexShrink: 0 }}
-                  title={f.feature}>
-                  {f.feature}
-                </span>
-                <div style={{ flex: 1, height: "5px", background: "#1a1a1a", borderRadius: "2px", overflow: "hidden" }}>
-                  <div style={{ width: `${barWidth}%`, height: "100%", background: color + "99", borderRadius: "2px" }} />
-                </div>
-                <span style={{ fontSize: "10px", color, minWidth: "42px", textAlign: "right" }}>
-                  +{delta.toFixed(3)}
-                </span>
-              </div>
-            );
-          })}
-        </div>
-      )}
-    </div>
-  );
-}
-
 const CATEGORY_LABELS = {
   DHCP_SUCCESS:   "DHCP ✓",
   DHCP_FAILURE:   "DHCP ✗",
@@ -323,16 +252,6 @@ export default function OrgFamilyDrilldown({ family, apiBase, onMacSiteSelect, o
 
       {!loading && data && (
         <>
-          <ShapleyBlock
-            label="Device Family Behavior Explanation"
-            score={shapleyScoreFromIfScore(data.worst_centroid_if_score)}
-            features={data.worst_centroid_top_features}
-            description={
-              data.worst_centroid_if_score != null
-                ? `Worst centroid IF score ${data.worst_centroid_if_score.toFixed(4)} across all sites — measures how distinctly this family's collective behavior differs from all other families at its most anomalous site.`
-                : "No centroid IF score available — fewer than 3 qualifying families at all sites, or this family has fewer than 2 members at every site."
-            }
-          />
           <div style={{ fontSize: "12px", color: "#666", marginBottom: "12px" }}>
             {data.total_count} clients across all sites.{" "}
             <span style={{ color: "#e05555" }}>{data.if_outlier_count} flagged</span> by Isolation Forest.{" "}

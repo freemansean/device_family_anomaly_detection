@@ -133,8 +133,8 @@ export default function SiteOverview({ siteId, apiBase, onMacSelect, onFamilySel
   }, [load]);
 
   if (loading && !summary) {
-    // Skeleton: 6 fixed cols (Family, IF, DB, Markov, Health, Service Alarm) + 15 CATEGORIES = 21 columns
-    const skeletonColWidths = [110, 44, 62, 62, 80, 100, ...Array(15).fill(18)];
+    // Skeleton: 7 fixed cols (Family, IF, DB, Markov, Health, Service Alarm, Count) + 15 CATEGORIES = 22 columns
+    const skeletonColWidths = [110, 44, 62, 62, 80, 100, 44, ...Array(15).fill(18)];
     const shimmer = "sq-site-shimmer 1.5s ease-in-out infinite";
     return (
       <div>
@@ -241,6 +241,12 @@ export default function SiteOverview({ siteId, apiBase, onMacSelect, onFamilySel
     } else if (sortKey === "health") {
       va = health[a]?.health_score ?? -1;
       vb = health[b]?.health_score ?? -1;
+    } else if (sortKey === "service_alarm") {
+      va = (health[a]?.service_alarms ?? []).length;
+      vb = (health[b]?.service_alarms ?? []).length;
+    } else if (sortKey === "count") {
+      va = summary.family_client_counts?.[a] ?? 0;
+      vb = summary.family_client_counts?.[b] ?? 0;
     } else {
       // category column — sort by ratio (matches cell color coding)
       va = summary.families[a]?.[sortKey]?.ratio ?? 0;
@@ -248,6 +254,12 @@ export default function SiteOverview({ siteId, apiBase, onMacSelect, onFamilySel
     }
     if (va < vb) return sortDir === "asc" ? -1 : 1;
     if (va > vb) return sortDir === "asc" ? 1 : -1;
+    // Tiebreak for service_alarm: worse health first (ascending health score)
+    if (sortKey === "service_alarm") {
+      const ha = health[a]?.health_score ?? 1;
+      const hb = health[b]?.health_score ?? 1;
+      if (ha !== hb) return ha - hb;
+    }
     // tiebreak: client count desc
     return (summary.family_client_counts?.[b] ?? 0) - (summary.family_client_counts?.[a] ?? 0);
   });
@@ -268,6 +280,13 @@ export default function SiteOverview({ siteId, apiBase, onMacSelect, onFamilySel
         <table style={{ borderCollapse: "collapse", fontSize: "12px" }}>
           <thead>
             <tr>
+              <th
+                style={{ ...thStyle, whiteSpace: "nowrap", cursor: "pointer", userSelect: "none" }}
+                title="Count — total MACs in this device family at this site."
+                onClick={() => handleSort("count")}
+              >
+                Count<SortIndicator active={sortKey === "count"} dir={sortDir} />
+              </th>
               <th
                 style={{ ...thStyle, cursor: "pointer", userSelect: "none" }}
                 onClick={() => handleSort("family")}
@@ -303,10 +322,11 @@ export default function SiteOverview({ siteId, apiBase, onMacSelect, onFamilySel
                 Health<SortIndicator active={sortKey === "health"} dir={sortDir} />
               </th>
               <th
-                style={{ ...thStyle, whiteSpace: "nowrap", minWidth: "100px" }}
-                title="Service Alarm — services where >50% of active MACs in this family are individually below 50% health."
+                style={{ ...thStyle, whiteSpace: "nowrap", minWidth: "100px", cursor: "pointer", userSelect: "none" }}
+                title="Service Alarm — services where >50% of active MACs in this family are individually below 50% health. Sort by alarm count (ties broken by worst health)."
+                onClick={() => handleSort("service_alarm")}
               >
-                Service Alarm
+                Service Alarm<SortIndicator active={sortKey === "service_alarm"} dir={sortDir} />
               </th>
               {CATEGORIES.map((c) => (
                 <th
@@ -364,6 +384,13 @@ export default function SiteOverview({ siteId, apiBase, onMacSelect, onFamilySel
               const rowBg = isSaFamily ? SA_BG : undefined;
               return (
                 <tr key={family} style={rowBg ? { background: rowBg } : undefined}>
+                  {/* Count — MACs in this family at this site */}
+                  <td
+                    style={{ ...tdStyle, textAlign: "right", color: "#aaa", fontSize: "11px", fontVariantNumeric: "tabular-nums" }}
+                    title={`${clientCount} MAC${clientCount === 1 ? "" : "s"} in ${family} at this site`}
+                  >
+                    {clientCount}
+                  </td>
                   <td style={{ ...tdStyle, whiteSpace: "nowrap" }}>
                     <span style={{
                       display: "inline-block", width: 8, height: 8,
@@ -390,11 +417,6 @@ export default function SiteOverview({ siteId, apiBase, onMacSelect, onFamilySel
                         title={saMembers.length ? `Spans ${saMembers.length} device families: ${saMembers.join(", ")}` : "Service account"}
                       >
                         SVC ACCT
-                      </span>
-                    )}
-                    {clientCount > 0 && (
-                      <span style={{ color: "#aaa", fontSize: "11px", marginLeft: "6px" }}>
-                        ({clientCount})
                       </span>
                     )}
                   </td>
@@ -528,6 +550,9 @@ export default function SiteOverview({ siteId, apiBase, onMacSelect, onFamilySel
             })}
             {showOtherRow && (
               <tr style={{ borderTop: "1px solid #2a2a2a" }}>
+                <td style={{ ...tdStyle, textAlign: "right", color: "#888", fontSize: "11px", fontVariantNumeric: "tabular-nums" }}>
+                  {otherClientCount}
+                </td>
                 <td style={{ ...tdStyle, whiteSpace: "nowrap", color: "#aaa", fontStyle: "italic" }}>
                   <span style={{
                     display: "inline-block", width: 8, height: 8,
@@ -538,6 +563,9 @@ export default function SiteOverview({ siteId, apiBase, onMacSelect, onFamilySel
                   <span style={{ color: "#888", fontSize: "11px", marginLeft: "6px" }}>
                     ({otherClientCount} clients, {otherFamilies.length} types)
                   </span>
+                </td>
+                <td style={{ ...tdStyle, textAlign: "center" }}>
+                  <span style={{ color: "#888", fontSize: "10px" }}>—</span>
                 </td>
                 <td style={{ ...tdStyle, textAlign: "center" }}>
                   <span style={{ color: "#888", fontSize: "10px" }}>—</span>
