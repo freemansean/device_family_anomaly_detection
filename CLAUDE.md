@@ -128,6 +128,14 @@ sasquatch/
 | `sasquatch:alert_active:{site_id}:{wlan_key}` | none (managed explicitly) | Hash: family → `{first_seen, last_seen}` for currently-active alert sessions |
 | `sasquatch:alert_sessions` | none (pruned on write) | Sorted set: session keys scored by `first_seen` unix timestamp; entries older than 8 days are pruned each cycle |
 | `sasquatch:alert_session:{session_key}` | 8 days | JSON: `{site_id, family, wlan, first_seen, last_seen, resolved_at, status}` for one alert session |
+| `sasquatch:summary:org_summary:{wlan_key}` | 2hr | Pre-computed `/org/summary` response (see `summary_cache.py`) |
+| `sasquatch:summary:org_findings:{wlan_key}` | 2hr | Pre-computed `/org/findings` response |
+| `sasquatch:summary:org_alerts:{wlan_key}` | 2hr | Pre-computed `/org/alerts` response |
+| `sasquatch:summary:org_alerts_full` | 2hr | Pre-computed `/org/alerts-full` response (cross-WLAN, no wlan dimension) |
+| `sasquatch:summary:org_family_insights:{wlan_key}` | 2hr | Pre-computed `/org/family-insights` response |
+| `sasquatch:summary:site_findings:{site_id}:{wlan_key}` | 2hr | Pre-computed `/sites/{id}/findings` response |
+| `sasquatch:summary:site_health:{site_id}:{wlan_key}` | 2hr | Pre-computed `/sites/{id}/health` response |
+| `sasquatch:summary:site_events_summary:{site_id}:{wlan_key}` | 2hr | Pre-computed `/sites/{id}/events/summary` response |
 
 **TTL note:** Events are 7 days in SQLite (purged by `db.purge_old_events`). The
 client cache has no TTL — it lives in SQLite under the `clients` table and is
@@ -194,32 +202,42 @@ async def fetch_all_clients_org(org_id: str, on_page=None) -> list[dict]:
   run, `{}` if it ran but the org has zero clients, or the populated map.
   Reads `MIST_ORG_ID` from the environment — no per-site variant exists.
 
-**Device family classification:** The client record fields `model`, `device`, and `os`
-are ALL arrays (can be empty lists). Use this fallback hierarchy to determine family:
+**Device family classification:** Families are built from a unique combination of
+Manufacturer → Model → OS (major-version) when Mist provides the fingerprint, joined
+with ` | `. Field count is preserved so 2-field composites stay distinct from 3-field
+ones (e.g. `"Apple | MacBook Pro | macOS 14"` is a different family from
+`"Apple | MacBook Pro"`). There are NO hardcoded patterns (`iPhone`, `MacBook`, etc.)
+— those collapsed devices with different model revisions into a single family and
+masked the per-revision signal the detector exists to find.
 
 ```python
 def classify_family(client: dict) -> str:
-    model   = (client.get("last_model") or "").strip()
-    device  = (client.get("last_device") or "").strip()
-    os_str  = (client.get("last_os") or "").strip()
-    mfg     = (client.get("mfg") or "").strip()
+    mfg    = _clean_token(client.get("mfg") or "")           # strips Inc/Ltd/Corp/...
+    model  = _clean_token(client.get("last_model") or "")
+    os_str = _os_major(client.get("last_os") or "")          # iOS 17.2.1 -> iOS 17
+    if not model:
+        model = _clean_token(client.get("last_device") or "")  # coarse type fallback
 
-    # Prefer last_* scalar fields over array fields for classification
-    combined = f"{model} {device} {os_str} {mfg}".lower()
-
-    if "iphone" in combined:                          return "iPhone"
-    if "ipad" in combined:                            return "iPad"
-    if "mac" in combined and "apple" in combined:     return "MacBook"
-    if "apple" in combined:                           return "Apple"          # catch-all
-    if "android" in combined and "tablet" in combined: return "Android Tablet"
-    if "android" in combined:                         return "Android Phone"
-    if "windows" in combined:                         return "Windows"
-    if "chrome" in combined:                          return "Chromebook"
-    if "linux" in combined:                           return "Linux"
-    if "printer" in combined or "print" in combined:  return "Printer"
-    if mfg and model == "" and os_str == "":          return f"IoT ({mfg})"
-    return "Unknown"
+    parts = [p for p in (mfg, model, os_str) if p]
+    return " | ".join(parts) if parts else "Unknown"
 ```
+
+`_clean_token()` strips corporate suffixes (`Inc`, `Ltd`, `Corp`, `GmbH`, `LLC`,
+`Technologies`, `Electronics`, `Company`, `Holdings`, `Systems`, etc.) so
+`"Apple, Inc."`, `"Apple Inc"`, and `"Apple"` all collapse to `"Apple"`. It also
+discards Mist placeholder tokens (`unknown`, `private`, `iot`, `embedded`, `other`,
+`n/a`) so they never contaminate the family key.
+
+`_os_major()` collapses OS strings to major-version granularity:
+`"iOS 17.2.1"` → `"iOS 17"`, `"Windows 11.0.22631"` → `"Windows 11"`,
+`"macOS 14.4"` → `"macOS 14"`. OS strings without a numeric version (`"iPadOS"`)
+pass through unchanged.
+
+**OUI fallback:** When Mist returns no manufacturer (or only a placeholder),
+`_build_client_record()` runs an OUI lookup on the MAC's first 3 octets and injects
+the result back into the client dict as `mfg` before `classify_family()` runs. So
+OUI-derived devices land as single-token families (e.g. `"Awair"`) and Mist-fingerprinted
+devices land as 2- or 3-field composites — both flow through the same code path.
 
 **Output:** SQLite `clients` table, one row per MAC across the org. The shape
 returned by `get_client_cache()` is:
@@ -636,24 +654,29 @@ that is handled separately by `health_scorer.py`.
 
 **Stage 1 — DBSCAN (site-wide) + Family Centroid Distance:**
 
-DBSCAN runs per-MAC across all MACs in the WLAN scope:
+DBSCAN runs per-MAC across all MACs in the WLAN scope. Both `min_samples` and
+`eps` are auto-tuned per run from population size:
 
 ```python
 from sklearn.cluster import DBSCAN
 
-db = DBSCAN(
-    eps=float(os.getenv("ANOMALY_DBSCAN_EPS", "0.5")),
-    min_samples=int(os.getenv("ANOMALY_DBSCAN_MIN_SAMPLES", "5"))
-)
+# min_samples = max(3, int(n_clients * pct))    # pct admin-tunable, 0.01–0.10
+# eps         = k-distance elbow on PCA-reduced vectors
+db = DBSCAN(eps=eps, min_samples=min_samples)
 labels = db.fit_predict(full_feature_matrix)  # -1 = noise/outlier
 ```
 
-DBSCAN label -1 means the MAC doesn't fit any cluster — a site-wide behavioral outlier
-regardless of device type. Families with fewer than `ANOMALY_DBSCAN_MIN_FAMILY_SIZE`
-(default 2) MACs are excluded from DBSCAN (too small to form a meaningful cluster).
-DBSCAN sets `dbscan_label`, `is_dbscan_outlier`, and `dbscan_family_noise_ratio` on
-each MAC record. These values are stored on anomaly records and used by the frontend,
-but DBSCAN noise ratio no longer determines which families are flagged at the family level.
+DBSCAN label -1 means the MAC doesn't fit any cluster — a site-wide behavioral
+outlier regardless of device type. The min_samples percentage is the only
+admin-tunable input (`anomaly_dbscan_min_samples_pct`, integer 1–10 mapped to
+0.01–0.10, default 3 → 3%); eps is selected each run by the k-distance elbow
+("knee") method and is not exposed in the GUI. There is no min_family_size
+pre-filter — every real MAC participates in DBSCAN, and small-family
+suppression is the job of the Finding Threshold downstream. DBSCAN sets
+`dbscan_label`, `is_dbscan_outlier`, and `dbscan_family_noise_ratio` on each
+MAC record. These values are stored on anomaly records and used by the
+frontend, but DBSCAN noise ratio no longer determines which families are
+flagged at the family level.
 
 **`is_family_outlier` is set by the inter-family cosine-distance detection step (separate from Stage 2):**
 
@@ -767,13 +790,9 @@ After all stages, roll up to device family findings:
 - Top contributing features: mean comparison of outlier MACs vs non-outlier MACs in
   the same family. For family-wide outliers (all MACs flagged), compares against all
   other families at the site.
-- **`predominant_wlan`**: when `wlan == "__all__"`, the finding includes a `predominant_wlan`
-  field — the SSID that accounts for the majority of events across the outlier MACs,
-  determined by counting `wlan` values in `mac_raw_events` for each outlier MAC. Set to
-  `null` for scoped WLAN queries (where `finding.wlan` is already the exact SSID).
-  In `score_org_wide()`, events are loaded from per-site Redis sets to compute the tally
-  (loaded anyway for pattern classification in the non-family-outlier path; loaded
-  additionally for the family-outlier path when in `__all__` mode).
+- **`predominant_wlan`**: detection always runs scoped to a specific SSID, so
+  `finding.wlan` is the exact SSID and `predominant_wlan` is set to `null`. The
+  field is retained for backwards compatibility with downstream consumers.
 
 **Finding severity:**
 - `minimal`: outlier_ratio 0–0.3
@@ -1090,6 +1109,65 @@ detection cycle. Must not raise — failures are logged and swallowed.
 
 ---
 
+### `summary_cache.py`
+
+**Purpose:** Pre-computed dashboard aggregates so the GUI's Site Overview,
+Device Family Overview, Findings, and Alerts pages serve out of a single
+Redis GET between detection cycles. Polling cadence on those pages is 30–60s;
+detection runs hourly; without this layer the same expensive aggregation
+runs ~60–120 times per real data change.
+
+**Cached endpoints** (covered by 8 corresponding `build_*` functions in
+`api/routes.py`):
+- `/org/summary`, `/org/findings`, `/org/alerts`, `/org/alerts-full`,
+  `/org/family-insights`
+- `/sites/{id}/findings`, `/sites/{id}/health`, `/sites/{id}/events/summary`
+
+**Excluded by design** — drilldowns are infrequent and need fresh per-row
+state, so they bypass this layer:
+- `/sites/{id}/anomalies/{mac}`
+- `/sites/{id}/families/{family}/if-outliers`
+- `/org/families/{family}/drilldown`
+
+**Architecture:**
+1. Each cached endpoint has a `build_*(redis_client, …)` aggregator (pure,
+   no `HTTPException`, no Mist API calls) and a thin route handler that does
+   `cache_get → on miss build_*() + cache_set`.
+2. `_run_org_pipeline_body` calls every builder in a Phase 5 tail block
+   (after per-site scoring completes, inside the global mutex) and writes
+   the results to the corresponding `sasquatch:summary:*` key. Lazy import
+   of `api.routes` from `scheduler.py` breaks the circular dependency.
+3. Phase 5 is best-effort: each builder is wrapped in its own try/except so
+   a single cache failure cannot fail detection. The next read falls
+   through to the live recompute path and self-heals the cache.
+
+**Cache invalidation:**
+- **Pipeline tail (writer):** overwrites every key after detection. Same
+  key, new value — no DEL needed.
+- **Read-side self-heal:** every route handler calls `cache_set` after a
+  live build, so cold starts and individual missing keys repopulate without
+  waiting for the next detection cycle.
+- **`POST /org/flush`** calls `flush_org_summary_cache()` to drop every
+  `sasquatch:summary:*` key.
+- **`POST /sites/{id}/flush`** calls `flush_site_summary_cache(site_id)` to
+  drop site-scoped keys AND every org-level key (org views aggregate per-site
+  contributions, so they go stale when one site is flushed).
+- **2-hour safety TTL** (`SUMMARY_CACHE_TTL = 7200`): a backstop in case a
+  writer is skipped (detection failure), short enough to bound staleness
+  but longer than the 1-hour detection cycle so a single missed cycle
+  still serves cached data.
+
+**Anomaly-config writes do NOT invalidate the cache.** Threshold changes
+(e.g. `health_score_threshold`, `alarm_min_family_size`) only take effect
+on the next detection cycle, when the pipeline tail rebuilds the cache
+with the new thresholds. The GUI surfaces this expectation to the user.
+
+**Built-at stamp:** every cache payload carries an `_built_at` ISO-8601
+timestamp from `cache_set`, available for the frontend to surface data
+freshness if desired.
+
+---
+
 ### `scheduler.py`
 
 **APScheduler jobs:**
@@ -1122,8 +1200,8 @@ successful collect (full or hourly) when the auto-detect flag is on.
 directly so the collect's background task runs detect in the same task under
 the same mutex without releasing and re-acquiring.
 
-`run_org_pipeline()` walks each site and each WLAN scope (`__all__` + each
-unique SSID per site) through this sequence:
+`run_org_pipeline()` walks each site and each unique SSID per site through
+this sequence:
 1. `feature_engineer.build_features(site_id, wlan)`
 2. `health_scorer.score_health(site_id, wlan)`   ← must run before webhook dispatch
 3. `anomaly_detector.score_org_wide(...)` once per WLAN over the org-wide
@@ -1212,7 +1290,7 @@ GET  /api/v1/org/clients/search?mac=                 → prefix search over the 
 GET  /api/v1/org/alerts                              → org-wide alerts + per-site alerts in one response;
                                                        org_alerts = org findings with health_score < 0.75;
                                                        site_alerts = per-site findings × per-site health, grouped by site
-GET  /api/v1/org/alert-history?days=7&wlan=__all__   → alert session history grouped by UTC day; sessions spanning
+GET  /api/v1/org/alert-history?days=7&wlan={ssid}    → alert session history grouped by UTC day; sessions spanning
                                                        multiple days appear in each day with window clipped to day
                                                        boundaries; response: {days: [{date, label, alarms: [...]}]}
 GET  /api/v1/org/findings                            → org-wide findings (cross-site scoring)
@@ -1287,7 +1365,7 @@ computed as a mac_count-weighted average of per-site health scores across all si
 - Two sections rendered top-to-bottom: **ORG-WIDE ALERTS** → **SITE ALERTS**
   - **ORG-WIDE ALERTS**: org findings (from `sasquatch:org_findings:{wlan}`, cross-site scoring) where `health_score < 0.75`. Each card shows severity, outlier ratio, device count, health score, failure category breakdown, pattern label, and top contributing features. Family name is a clickable link that opens `OrgFamilyDrilldown` in-place.
   - **SITE ALERTS**: per-site findings cross-referenced with per-site health, grouped by site. Only sites with ≥ 1 alert are shown. Family name opens `FamilyDrilldown` (site-scoped) in-place.
-- Each alert card shows a **WLAN/SSID badge** (green pill) after the pattern label. For scoped WLAN queries the badge shows `finding.wlan`; for `__all__` scope it shows `finding.predominant_wlan` — the SSID carrying the majority of outlier MAC events, computed at finding-rollup time from raw event WLAN counts.
+- Each alert card shows a **WLAN/SSID badge** (green pill) after the pattern label, sourced from `finding.wlan` (detection always runs scoped to a specific SSID).
 - WLAN dropdown scopes both sections via `?wlan=` query param.
 - No example MACs on cards — click the family name to drilldown instead.
 - Auto-refreshes every 30s. Data source: `GET /api/v1/org/alerts?wlan=`
@@ -1347,9 +1425,11 @@ REDIS_URL=redis://localhost:6379
 
 # ML Tuning — Isolation Forest + DBSCAN
 ANOMALY_IF_CONTAMINATION=0.05
-ANOMALY_DBSCAN_EPS=2.5
-ANOMALY_DBSCAN_MIN_SAMPLES=5
-ANOMALY_DBSCAN_MIN_FAMILY_SIZE=5
+# DBSCAN min_samples and eps are auto-tuned per run from the population.
+# Only the percentage knob is operator-tunable: integer 1–10 → 0.01–0.10.
+# min_samples = max(3, int(n_clients * pct))
+# eps         = k-distance elbow per run (no env var)
+ANOMALY_DBSCAN_MIN_SAMPLES_PCT=3
 ANOMALY_FINDING_THRESHOLD=0.2
 ANOMALY_MIN_PEERS=5
 ANOMALY_MIN_MAC_EVENTS=20

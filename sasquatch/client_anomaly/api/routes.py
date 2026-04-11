@@ -43,11 +43,11 @@ from ..event_collector import (
     get_event_type_index,
     get_events,
     get_wlans,
-    sanitize_wlan_key,
 )
 from ..feature_engineer import _family_event_counts_redis_key, _features_redis_key, build_features, get_features
 from ..health_scorer import get_health, score_health, _health_redis_key
 from ..markov_analyzer import build_and_store_baseline as build_markov_baseline
+from .. import summary_cache
 from ..scheduler import (
     _GLOBAL_LOCK_KEY,
     _LAST_COLLECTION_KEY,
@@ -591,7 +591,6 @@ async def set_anomaly_config(body: dict):
     float_bounds = {
         "anomaly_if_contamination": (0.01, 0.5),
         "anomaly_dbscan_pca_variance": (0.5, 1.0),
-        "anomaly_dbscan_eps": (0.01, 100.0),
         "anomaly_dbscan_family_noise_threshold": (0.0, 1.0),
         "anomaly_finding_threshold": (0.0, 1.0),
         "anomaly_centroid_dist_threshold": (0.0, 2.0),
@@ -604,8 +603,9 @@ async def set_anomaly_config(body: dict):
         "anomaly_if_n_estimators": (10, 1000),
         "anomaly_random_state": (-1, 999999),
         "anomaly_min_peers": (1, 500),
-        "anomaly_dbscan_min_samples": (1, 500),
-        "anomaly_dbscan_min_family_size": (1, 500),
+        # Integer 1–10, mapped at runtime to 0.01–0.10. Used to derive
+        # DBSCAN min_samples = max(3, int(n_clients * pct)) per run.
+        "anomaly_dbscan_min_samples_pct": (1, 10),
         "anomaly_centroid_healthy_ref_min": (1, 100),
         "anomaly_finding_min_size": (1, 500),
         "markov_min_episode_length": (1, 100),
@@ -655,90 +655,96 @@ async def list_wlans(site_id: Optional[str] = Query(None)):
     return {"wlans": wlans, "site_id": site_id}
 
 
-@router.get("/org/summary")
-async def get_org_summary(wlan: str = Query(..., description="WLAN (SSID) name to scope results to. Required.")):
+async def build_org_summary(redis_client, site_map: dict[str, str], wlan: str) -> dict:
     """
-    Per-site findings and event counts for the org overview.
-    Reads from Redis — no real-time Mist API calls for the data itself.
+    Compute the /org/summary response from Redis state. Pure aggregator — no
+    Mist API calls, no HTTPException raises. Called by both the route handler
+    (cache miss path) and the pipeline writer (post-detection cache fill).
     """
-    if not MIST_ORG_ID:
-        raise HTTPException(status_code=500, detail="MIST_ORG_ID not configured.")
-    if not MIST_API_TOKEN:
-        raise HTTPException(status_code=500, detail="MIST_API_TOKEN not configured.")
+    # Load all events once, counting per site. Per-site sorted sets are fetched
+    # in a single pipeline inside get_events().
+    all_events = await get_events()
+    events_per_site: Counter = Counter(
+        e["site_id"]
+        for e in all_events
+        if e.get("site_id") and e.get("wlan") == wlan
+    )
 
-    redis_client = _get_redis()
-    try:
-        try:
-            site_map = await _get_org_site_map(redis_client)
-        except Exception:
-            raise HTTPException(status_code=502, detail="Could not reach Mist API")
+    sites_sorted = sorted(site_map.items(), key=lambda x: x[1].lower())
+    pipe = redis_client.pipeline()
+    for sid, _ in sites_sorted:
+        pipe.get(_findings_redis_key(sid, wlan))
+        pipe.get(_health_redis_key(sid, wlan))
+    pipe.get(_org_findings_redis_key(wlan))
+    pipeline_results = await pipe.execute()
 
-        # Load all events once, counting per site. Per-site sorted sets are fetched
-        # in a single pipeline inside get_events().
-        all_events = await get_events()
-        events_per_site: Counter = Counter(
-            e["site_id"]
-            for e in all_events
-            if e.get("site_id") and e.get("wlan") == wlan
-        )
+    n = len(sites_sorted)
+    findings_by_site = {
+        sid: (json.loads(pipeline_results[i * 2]) if pipeline_results[i * 2] else [])
+        for i, (sid, _) in enumerate(sites_sorted)
+    }
+    health_by_site = {
+        sid: (json.loads(pipeline_results[i * 2 + 1]) if pipeline_results[i * 2 + 1] else {})
+        for i, (sid, _) in enumerate(sites_sorted)
+    }
+    raw_org = pipeline_results[n * 2]
+    org_findings = json.loads(raw_org) if raw_org else []
 
-        # Fetch per-site findings, per-site health, and org-wide findings in one pipeline round trip
-        sites_sorted = sorted(site_map.items(), key=lambda x: x[1].lower())
-        pipe = redis_client.pipeline()
-        for sid, _ in sites_sorted:
-            pipe.get(_findings_redis_key(sid, wlan))
-            pipe.get(_health_redis_key(sid, wlan))
-        pipe.get(_org_findings_redis_key(wlan))
-        pipeline_results = await pipe.execute()
+    from ..webhook_dispatcher import get_alarm_min_family_size, get_health_score_threshold
+    _SUMMARY_HEALTH_THRESHOLD = get_health_score_threshold()
+    _SUMMARY_MIN_FAMILY_SIZE = int(get_alarm_min_family_size())
 
-        n = len(sites_sorted)
-        findings_by_site = {
-            sid: (json.loads(pipeline_results[i * 2]) if pipeline_results[i * 2] else [])
-            for i, (sid, _) in enumerate(sites_sorted)
+    result = []
+    for sid, site_name in sites_sorted:
+        findings = findings_by_site[sid]
+        health = health_by_site[sid]
+        event_count = events_per_site.get(sid, 0)
+        # alert_count: families that are both anomalous (in findings) AND unhealthy.
+        # "Unhealthy" matches the webhook dispatch gate: health_score below
+        # threshold OR at least one service_alarms entry present. Tiny families
+        # below alarm_min_family_size are suppressed to stay in sync with
+        # webhook dispatch and the OrgAlerts feed.
+        def _is_alert(f: dict) -> bool:
+            fam_health = health.get(f.get("device_family"), {})
+            score_bad = fam_health.get("health_score", 1.0) < _SUMMARY_HEALTH_THRESHOLD
+            service_bad = len(fam_health.get("service_alarms") or []) > 0
+            return (
+                (score_bad or service_bad)
+                and (f.get("total_mac_count", 0) or 0) >= _SUMMARY_MIN_FAMILY_SIZE
+            )
+        alert_count = sum(1 for f in findings if _is_alert(f))
+        # A family counts as "impacted" only when at least one anomaly
+        # detector flag is actually set on the finding — either a family-
+        # level flag (centroid, DBSCAN, Markov) or at least one per-MAC
+        # Isolation-Forest outlier. Findings that exist purely because of
+        # a Markov bypass but carry no set flag should not inflate the
+        # card badge, and a family must not be counted twice just because
+        # multiple detectors fired.
+        def _has_any_flag(f: dict) -> bool:
+            return bool(
+                f.get("is_family_outlier")
+                or f.get("is_family_dbscan_outlier")
+                or f.get("is_family_markov_outlier")
+                or (f.get("if_outlier_count", 0) or 0) > 0
+                or (f.get("dbscan_outlier_count", 0) or 0) > 0
+            )
+        impacted_families = {
+            f.get("device_family")
+            for f in findings
+            if f.get("device_family") and _has_any_flag(f)
         }
-        health_by_site = {
-            sid: (json.loads(pipeline_results[i * 2 + 1]) if pipeline_results[i * 2 + 1] else {})
-            for i, (sid, _) in enumerate(sites_sorted)
-        }
-        raw_org = pipeline_results[n * 2]
-        org_findings = json.loads(raw_org) if raw_org else []
-
-        from ..webhook_dispatcher import get_alarm_min_family_size, get_health_score_threshold
-        _SUMMARY_HEALTH_THRESHOLD = get_health_score_threshold()
-        _SUMMARY_MIN_FAMILY_SIZE = int(get_alarm_min_family_size())
-
-        result = []
-        for sid, site_name in sites_sorted:
-            findings = findings_by_site[sid]
-            health = health_by_site[sid]
-            event_count = events_per_site.get(sid, 0)
-            # alert_count: families that are both anomalous (in findings) AND unhealthy.
-            # "Unhealthy" matches the webhook dispatch gate: health_score below
-            # threshold OR at least one service_alarms entry present. Tiny families
-            # below alarm_min_family_size are suppressed to stay in sync with
-            # webhook dispatch and the OrgAlerts feed.
-            def _is_alert(f: dict) -> bool:
-                fam_health = health.get(f.get("device_family"), {})
-                score_bad = fam_health.get("health_score", 1.0) < _SUMMARY_HEALTH_THRESHOLD
-                service_bad = len(fam_health.get("service_alarms") or []) > 0
-                return (
-                    (score_bad or service_bad)
-                    and (f.get("total_mac_count", 0) or 0) >= _SUMMARY_MIN_FAMILY_SIZE
-                )
-            alert_count = sum(1 for f in findings if _is_alert(f))
-            result.append({
-                "site_id": sid,
-                "site_name": site_name,
-                "finding_count": len(findings),
-                "critical_count": sum(1 for f in findings if f.get("severity") == "significant"),
-                "warning_count": sum(1 for f in findings if f.get("severity") == "moderate"),
-                "info_count": sum(1 for f in findings if f.get("severity") == "minimal"),
-                "alert_count": alert_count,
-                "event_count": event_count,
-                "has_data": event_count > 0,
-            })
-    finally:
-        await redis_client.aclose()
+        result.append({
+            "site_id": sid,
+            "site_name": site_name,
+            "finding_count": len(findings),
+            "critical_count": sum(1 for f in findings if f.get("severity") == "significant"),
+            "warning_count": sum(1 for f in findings if f.get("severity") == "moderate"),
+            "info_count": sum(1 for f in findings if f.get("severity") == "minimal"),
+            "impacted_family_count": len(impacted_families),
+            "alert_count": alert_count,
+            "event_count": event_count,
+            "has_data": event_count > 0,
+        })
 
     return {
         "sites": result,
@@ -756,6 +762,39 @@ async def get_org_summary(wlan: str = Query(..., description="WLAN (SSID) name t
         ),
         "org_finding_count": len(org_findings),
     }
+
+
+@router.get("/org/summary")
+async def get_org_summary(wlan: str = Query(..., description="WLAN (SSID) name to scope results to. Required.")):
+    """
+    Per-site findings and event counts for the org overview.
+    Reads from Redis — no real-time Mist API calls for the data itself.
+
+    Cache-first: pre-computed by the detection pipeline tail. On miss, the
+    response is built live and the cache is opportunistically populated.
+    """
+    if not MIST_ORG_ID:
+        raise HTTPException(status_code=500, detail="MIST_ORG_ID not configured.")
+    if not MIST_API_TOKEN:
+        raise HTTPException(status_code=500, detail="MIST_API_TOKEN not configured.")
+
+    redis_client = _get_redis()
+    try:
+        cache_key = summary_cache._org_summary_key(wlan)
+        cached = await summary_cache.cache_get(redis_client, cache_key)
+        if cached is not None:
+            return cached
+
+        try:
+            site_map = await _get_org_site_map(redis_client)
+        except Exception:
+            raise HTTPException(status_code=502, detail="Could not reach Mist API")
+
+        response = await build_org_summary(redis_client, site_map, wlan)
+        await summary_cache.cache_set(redis_client, cache_key, response)
+        return response
+    finally:
+        await redis_client.aclose()
 
 
 async def _org_detect_background_task(site_ids: list[str], site_map: dict[str, str]) -> None:
@@ -884,6 +923,10 @@ async def flush_org_redis():
 
         # Also clear the org sites cache
         await redis_client.delete(_ORG_SITES_CACHE_KEY)
+
+        # Drop every pre-computed dashboard summary so the next request
+        # falls through to a live recompute (and re-populates the cache).
+        total_deleted += await summary_cache.flush_org_summary_cache(redis_client)
     finally:
         await redis_client.aclose()
 
@@ -1094,6 +1137,24 @@ async def get_org_detect_progress():
     return json.loads(raw)
 
 
+async def build_org_findings(redis_client, site_map: dict[str, str], wlan: str) -> dict:
+    """
+    Build the /org/findings response from Redis state. Pure aggregator — no
+    Mist API calls. Called by the route handler (cache miss path) and the
+    pipeline writer (post-detection cache fill).
+    """
+    raw = await redis_client.get(_org_findings_redis_key(wlan))
+    if not raw:
+        return {"findings": [], "count": 0, "wlan": wlan}
+
+    findings = json.loads(raw)
+    for f in findings:
+        for sa in f.get("sites_affected", []):
+            sa["site_name"] = site_map.get(sa["site_id"], sa["site_id"])
+
+    return {"findings": findings, "count": len(findings), "wlan": wlan}
+
+
 @router.get("/org/findings")
 async def get_org_findings_endpoint(wlan: str = Query(..., description="WLAN (SSID) name to scope results to. Required.")):
     """
@@ -1106,65 +1167,49 @@ async def get_org_findings_endpoint(wlan: str = Query(..., description="WLAN (SS
     site_name for display.
 
     Returns an empty list when the org-wide job has not yet run.
+
+    Cache-first: pre-computed by the detection pipeline tail. On miss, the
+    response is built live and the cache is opportunistically populated.
     """
     if not MIST_ORG_ID or not MIST_API_TOKEN:
         raise HTTPException(status_code=500, detail="MIST_ORG_ID or MIST_API_TOKEN not configured.")
 
     redis_client = _get_redis()
     try:
+        cache_key = summary_cache._org_findings_key(wlan)
+        cached = await summary_cache.cache_get(redis_client, cache_key)
+        if cached is not None:
+            return cached
+
         try:
             site_map = await _get_org_site_map(redis_client)
         except Exception:
             raise HTTPException(status_code=502, detail="Could not reach Mist API")
-        raw = await redis_client.get(_org_findings_redis_key(wlan))
+
+        response = await build_org_findings(redis_client, site_map, wlan)
+        await summary_cache.cache_set(redis_client, cache_key, response)
+        return response
     finally:
         await redis_client.aclose()
 
-    if not raw:
-        return {"findings": [], "count": 0, "wlan": wlan}
 
-    findings = json.loads(raw)
-    for f in findings:
-        for sa in f.get("sites_affected", []):
-            sa["site_name"] = site_map.get(sa["site_id"], sa["site_id"])
-
-    return {"findings": findings, "count": len(findings), "wlan": wlan}
-
-
-@router.get("/org/alerts")
-async def get_org_alerts(wlan: str = Query(..., description="WLAN (SSID) name to scope results to. Required.")):
+async def build_org_alerts(redis_client, site_map: dict[str, str], wlan: str) -> dict:
     """
-    Return org-wide alerts AND per-site alerts in a single response.
-
-    Org-wide alerts: org findings (cross-site scoring) where health_score < 0.75.
-    Site alerts: per-site findings where the family health_score < 0.75, grouped by site.
-    Only sites with at least one alert are included in site_alerts.
-
-    All data is read from Redis — no real-time Mist API calls.
+    Build the /org/alerts response from Redis state. Pure aggregator — no
+    Mist API calls. Called by the route handler (cache miss path) and the
+    pipeline writer (post-detection cache fill).
     """
-    if not MIST_ORG_ID or not MIST_API_TOKEN:
-        raise HTTPException(status_code=500, detail="MIST_ORG_ID or MIST_API_TOKEN not configured.")
-
     from ..webhook_dispatcher import get_alarm_min_family_size, get_health_score_threshold
     _ALERT_HEALTH_THRESHOLD = get_health_score_threshold()
     _ALARM_MIN_FAMILY_SIZE = int(get_alarm_min_family_size())
 
-    redis_client = _get_redis()
-    try:
-        try:
-            site_map = await _get_org_site_map(redis_client)
-        except Exception:
-            raise HTTPException(status_code=502, detail="Could not reach Mist API")
-
-        sites_sorted = sorted(site_map.items(), key=lambda x: x[1].lower())
-        pipe = redis_client.pipeline()
-        for sid, _ in sites_sorted:
-            pipe.get(_findings_redis_key(sid, wlan))
-            pipe.get(_health_redis_key(sid, wlan))
-        pipe.get(_org_findings_redis_key(wlan))
-        pipeline_results = await pipe.execute()
-    finally:
-        await redis_client.aclose()
+    sites_sorted = sorted(site_map.items(), key=lambda x: x[1].lower())
+    pipe = redis_client.pipeline()
+    for sid, _ in sites_sorted:
+        pipe.get(_findings_redis_key(sid, wlan))
+        pipe.get(_health_redis_key(sid, wlan))
+    pipe.get(_org_findings_redis_key(wlan))
+    pipeline_results = await pipe.execute()
 
     n = len(sites_sorted)
     findings_by_site = {
@@ -1238,52 +1283,65 @@ async def get_org_alerts(wlan: str = Query(..., description="WLAN (SSID) name to
     }
 
 
-@router.get("/org/alerts-full")
-async def get_org_alerts_full():
+@router.get("/org/alerts")
+async def get_org_alerts(wlan: str = Query(..., description="WLAN (SSID) name to scope results to. Required.")):
     """
-    Cross-WLAN aggregation of /org/alerts.
+    Return org-wide alerts AND per-site alerts in a single response.
 
-    Enumerates every WLAN with events in the retention window, then applies the
-    same dual-gate (family-level anomaly + unhealthy + min family size) used by
-    /org/alerts against each WLAN's org findings and per-site findings/health.
+    Org-wide alerts: org findings (cross-site scoring) where health_score < 0.75.
+    Site alerts: per-site findings where the family health_score < 0.75, grouped by site.
+    Only sites with at least one alert are included in site_alerts.
 
-    Every returned alert carries a `wlan` field so the UI can display which SSID
-    the alarm fired on. `site_alerts` is grouped first by site, then each site's
-    alert list spans all WLANs (each alert tagged with its own `wlan`).
+    All data is read from Redis — no real-time Mist API calls.
 
-    This endpoint powers the "Full Alert Summary" tab — the default landing view
-    on the Organization page. It is a pure aggregation of existing Redis state;
-    no Mist API calls beyond the org site map.
+    Cache-first: pre-computed by the detection pipeline tail. On miss, the
+    response is built live and the cache is opportunistically populated.
     """
     if not MIST_ORG_ID or not MIST_API_TOKEN:
         raise HTTPException(status_code=500, detail="MIST_ORG_ID or MIST_API_TOKEN not configured.")
 
+    redis_client = _get_redis()
+    try:
+        cache_key = summary_cache._org_alerts_key(wlan)
+        cached = await summary_cache.cache_get(redis_client, cache_key)
+        if cached is not None:
+            return cached
+
+        try:
+            site_map = await _get_org_site_map(redis_client)
+        except Exception:
+            raise HTTPException(status_code=502, detail="Could not reach Mist API")
+
+        response = await build_org_alerts(redis_client, site_map, wlan)
+        await summary_cache.cache_set(redis_client, cache_key, response)
+        return response
+    finally:
+        await redis_client.aclose()
+
+
+async def build_org_alerts_full(redis_client, site_map: dict[str, str]) -> dict:
+    """
+    Build the /org/alerts-full response from Redis state. Pure aggregator —
+    no Mist API calls. Called by the route handler (cache miss path) and the
+    pipeline writer (post-detection cache fill).
+    """
     from ..webhook_dispatcher import get_alarm_min_family_size, get_health_score_threshold
     _ALERT_HEALTH_THRESHOLD = get_health_score_threshold()
     _ALARM_MIN_FAMILY_SIZE = int(get_alarm_min_family_size())
 
     wlans = await get_wlans(site_id=None)
 
-    redis_client = _get_redis()
-    try:
-        try:
-            site_map = await _get_org_site_map(redis_client)
-        except Exception:
-            raise HTTPException(status_code=502, detail="Could not reach Mist API")
+    sites_sorted = sorted(site_map.items(), key=lambda x: x[1].lower())
 
-        sites_sorted = sorted(site_map.items(), key=lambda x: x[1].lower())
-
-        # One pipelined read across every (site, wlan) pair plus every org-wide
-        # findings key. Each WLAN contributes 2*len(sites) + 1 reads to the pipeline.
-        pipe = redis_client.pipeline()
-        for wlan in wlans:
-            for sid, _ in sites_sorted:
-                pipe.get(_findings_redis_key(sid, wlan))
-                pipe.get(_health_redis_key(sid, wlan))
-            pipe.get(_org_findings_redis_key(wlan))
-        pipeline_results = await pipe.execute() if wlans else []
-    finally:
-        await redis_client.aclose()
+    # One pipelined read across every (site, wlan) pair plus every org-wide
+    # findings key. Each WLAN contributes 2*len(sites) + 1 reads to the pipeline.
+    pipe = redis_client.pipeline()
+    for wlan in wlans:
+        for sid, _ in sites_sorted:
+            pipe.get(_findings_redis_key(sid, wlan))
+            pipe.get(_health_redis_key(sid, wlan))
+        pipe.get(_org_findings_redis_key(wlan))
+    pipeline_results = await pipe.execute() if wlans else []
 
     n_sites = len(sites_sorted)
     stride = n_sites * 2 + 1
@@ -1360,6 +1418,48 @@ async def get_org_alerts_full():
         "site_alerts": site_alerts,
         "wlans": wlans,
     }
+
+
+@router.get("/org/alerts-full")
+async def get_org_alerts_full():
+    """
+    Cross-WLAN aggregation of /org/alerts.
+
+    Enumerates every WLAN with events in the retention window, then applies the
+    same dual-gate (family-level anomaly + unhealthy + min family size) used by
+    /org/alerts against each WLAN's org findings and per-site findings/health.
+
+    Every returned alert carries a `wlan` field so the UI can display which SSID
+    the alarm fired on. `site_alerts` is grouped first by site, then each site's
+    alert list spans all WLANs (each alert tagged with its own `wlan`).
+
+    This endpoint powers the "Full Alert Summary" tab — the default landing view
+    on the Organization page. It is a pure aggregation of existing Redis state;
+    no Mist API calls beyond the org site map.
+
+    Cache-first: pre-computed by the detection pipeline tail. On miss, the
+    response is built live and the cache is opportunistically populated.
+    """
+    if not MIST_ORG_ID or not MIST_API_TOKEN:
+        raise HTTPException(status_code=500, detail="MIST_ORG_ID or MIST_API_TOKEN not configured.")
+
+    redis_client = _get_redis()
+    try:
+        cache_key = summary_cache._org_alerts_full_key()
+        cached = await summary_cache.cache_get(redis_client, cache_key)
+        if cached is not None:
+            return cached
+
+        try:
+            site_map = await _get_org_site_map(redis_client)
+        except Exception:
+            raise HTTPException(status_code=502, detail="Could not reach Mist API")
+
+        response = await build_org_alerts_full(redis_client, site_map)
+        await summary_cache.cache_set(redis_client, cache_key, response)
+        return response
+    finally:
+        await redis_client.aclose()
 
 
 @router.get("/org/alert-history")
@@ -1516,248 +1616,257 @@ async def get_org_alert_history(
     }
 
 
+async def build_org_family_insights(redis_client, site_map: dict[str, str], wlan: str) -> dict:
+    """
+    Build the /org/family-insights response from Redis state. Pure aggregator —
+    no Mist API calls. Called by the route handler (cache miss path) and the
+    pipeline writer (post-detection cache fill).
+    """
+    # Fetch per-site findings, anomalies, health scores, pre-computed family event
+    # counts, and the org-wide findings in one pipeline round trip.
+    site_ids_ordered = list(site_map.keys())
+    pipe = redis_client.pipeline()
+    for sid in site_ids_ordered:
+        pipe.get(_findings_redis_key(sid, wlan))
+        pipe.get(_health_redis_key(sid, wlan))
+        pipe.get(_family_event_counts_redis_key(sid, wlan))
+    pipe.get(_org_findings_redis_key(wlan))
+    pipeline_results = await pipe.execute()
+    n = len(site_ids_ordered)
+    findings_by_site = {
+        sid: (json.loads(pipeline_results[i * 3]) if pipeline_results[i * 3] else [])
+        for i, sid in enumerate(site_ids_ordered)
+    }
+    health_by_site = {
+        sid: (json.loads(pipeline_results[i * 3 + 1]) if pipeline_results[i * 3 + 1] else {})
+        for i, sid in enumerate(site_ids_ordered)
+    }
+    event_counts_by_site = {
+        sid: (json.loads(pipeline_results[i * 3 + 2]) if pipeline_results[i * 3 + 2] else {})
+        for i, sid in enumerate(site_ids_ordered)
+    }
+    # family_is_family_outlier and family_worst_dbscan_severity come exclusively from
+    # org-wide detection, not per-site findings. IF and DBSCAN badges mean the family
+    # was flagged across the whole org population, not just at one site.
+    raw_org_findings = pipeline_results[n * 3]
+    org_findings_list: list[dict] = json.loads(raw_org_findings) if raw_org_findings else []
+    family_is_family_outlier: dict[str, bool] = {
+        f["device_family"]: True
+        for f in org_findings_list
+        if f.get("is_family_outlier") and f.get("device_family")
+    }
+    SEVERITY_RANK = {"significant": 3, "moderate": 2, "minimal": 1}
+
+    # Org-wide DBSCAN severity, Markov ratio, and DBSCAN outlier site count — all read
+    # directly from org findings (not aggregated from per-site findings).
+    org_family_dbscan_severity: dict[str, str] = {}
+    org_family_markov_ratio: dict[str, float] = {}
+    org_family_markov_is_outlier: dict[str, bool] = {}
+    org_family_markov_reason: dict[str, str | None] = {}
+    org_family_dbscan_site_count: dict[str, int] = {}
+    for f in org_findings_list:
+        fam = f.get("device_family")
+        if not fam:
+            continue
+        sev = f.get("dbscan_severity")
+        if sev and SEVERITY_RANK.get(sev, 0) > SEVERITY_RANK.get(org_family_dbscan_severity.get(fam, ""), 0):
+            org_family_dbscan_severity[fam] = sev
+        ratio = f.get("markov_family_anomaly_ratio")
+        if ratio is not None:
+            org_family_markov_ratio[fam] = ratio
+        if f.get("is_family_markov_outlier"):
+            org_family_markov_is_outlier[fam] = True
+        reason = f.get("markov_family_reason")
+        if reason and fam not in org_family_markov_reason:
+            org_family_markov_reason[fam] = reason
+        cnt = f.get("dbscan_outlier_site_count")
+        if cnt is not None:
+            org_family_dbscan_site_count[fam] = cnt
+
+    family_event_counts: dict[str, Counter] = defaultdict(Counter)
+    family_total_events: Counter = Counter()
+    family_worst_severity: dict[str, str] = {}
+    family_outlier_sites: dict[str, list[str]] = defaultdict(list)
+    family_is_markov_outlier: dict[str, bool] = defaultdict(bool)
+    family_worst_markov_ratio: dict[str, float] = {}
+    family_site_count: Counter = Counter()
+    # mac_count is summed across sites (same device at multiple sites counted once per site).
+    family_mac_count: Counter = Counter()
+    # Health score aggregation: weighted sum and total weight per family for averaging
+    family_health_weighted_sum: dict[str, float] = defaultdict(float)
+    family_health_weight_total: dict[str, float] = defaultdict(float)
+    family_health_components_sum: dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
+    # Per-service org rollup: sum active/unhealthy MAC counts and active-weighted
+    # health values per family across all sites. Org-level service alarm fires when
+    # the summed unhealthy/active ratio exceeds FAMILY_SERVICE_ALARM_THRESHOLD across
+    # the full device-family scope (matches the user-specified ">50% of clients in
+    # the total device family scope" semantic).
+    from ..health_scorer import (
+        SERVICES as _HSCORE_SERVICES,
+        FAMILY_SERVICE_ALARM_THRESHOLD as _HSCORE_FAMILY_SVC_THRESHOLD,
+    )
+    family_svc_active: dict[str, dict[str, int]] = defaultdict(
+        lambda: {svc: 0 for svc in _HSCORE_SERVICES}
+    )
+    family_svc_unhealthy: dict[str, dict[str, int]] = defaultdict(
+        lambda: {svc: 0 for svc in _HSCORE_SERVICES}
+    )
+    family_svc_health_wsum: dict[str, dict[str, float]] = defaultdict(
+        lambda: {svc: 0.0 for svc in _HSCORE_SERVICES}
+    )
+    sites_with_data = 0
+
+    for site_id, site_name in site_map.items():
+        site_counts = event_counts_by_site.get(site_id, {})
+        if not site_counts:
+            continue
+        sites_with_data += 1
+        findings: list[dict] = findings_by_site[site_id]
+
+        # Aggregate pre-computed family event category counts.
+        for family, fdata in site_counts.items():
+            for cat, cnt in fdata.get("categories", {}).items():
+                family_event_counts[family][cat] += cnt
+            family_total_events[family] += fdata.get("total_events", 0)
+            family_mac_count[family] += fdata.get("mac_count", 0)
+            family_site_count[family] += 1
+
+        for finding in findings:
+            fam = finding.get("device_family")
+            if not fam:
+                continue
+            sev = finding.get("severity")
+            if sev and SEVERITY_RANK.get(sev, 0) > SEVERITY_RANK.get(family_worst_severity.get(fam, ""), 0):
+                family_worst_severity[fam] = sev
+            if finding.get("is_family_markov_outlier"):
+                family_is_markov_outlier[fam] = True
+            markov_ratio = finding.get("markov_family_anomaly_ratio")
+            if markov_ratio is not None and markov_ratio > family_worst_markov_ratio.get(fam, 0.0):
+                family_worst_markov_ratio[fam] = markov_ratio
+            # dbscan_severity is sourced from org-wide findings, not per-site findings.
+            if sev in SEVERITY_RANK:
+                family_outlier_sites[fam].append(site_name)
+
+        # Accumulate health scores — mac_count-weighted so every device gets equal vote,
+        # matching the per-device-average principle in health_scorer.py and the weighting
+        # used when attaching health to org findings in score_org_wide().
+        site_health = health_by_site.get(site_id, {})
+        for fam, hdata in site_health.items():
+            weight = hdata.get("mac_count", 0)
+            if weight > 0:
+                family_health_weighted_sum[fam] += hdata.get("health_score", 1.0) * weight
+                family_health_weight_total[fam] += weight
+                for comp, rate in hdata.get("components", {}).items():
+                    family_health_components_sum[fam][comp] += rate * weight
+            # Sum service alarm counts and health across sites for org rollup.
+            site_svc_counts = hdata.get("service_alarm_counts", {}) or {}
+            site_svc_health = hdata.get("service_health", {}) or {}
+            for svc in _HSCORE_SERVICES:
+                info = site_svc_counts.get(svc) or {}
+                a = int(info.get("active", 0))
+                u = int(info.get("unhealthy", 0))
+                family_svc_active[fam][svc] += a
+                family_svc_unhealthy[fam][svc] += u
+                sh_val = site_svc_health.get(svc)
+                if sh_val is not None and a > 0:
+                    family_svc_health_wsum[fam][svc] += float(sh_val) * a
+
+    all_categories = list(EVENT_CATEGORIES.keys()) + ["OTHER"]
+    families_out: dict[str, dict] = {}
+    for family, cat_counts in family_event_counts.items():
+        total = family_total_events[family]
+        health_weight = family_health_weight_total.get(family, 0.0)
+        health_score = (
+            round(family_health_weighted_sum[family] / health_weight, 4)
+            if health_weight > 0 else None
+        )
+        health_components = (
+            {
+                comp: round(family_health_components_sum[family][comp] / health_weight, 4)
+                for comp in family_health_components_sum.get(family, {})
+            }
+            if health_weight > 0 else None
+        )
+        # Org-wide service rollup: alarm fires when summed unhealthy/active > threshold.
+        svc_active_map = family_svc_active.get(family, {})
+        svc_unhealthy_map = family_svc_unhealthy.get(family, {})
+        svc_health_wsum_map = family_svc_health_wsum.get(family, {})
+        service_health_out: dict[str, float | None] = {}
+        service_alarm_counts_out: dict[str, dict[str, int]] = {}
+        service_alarms_out: list[str] = []
+        for svc in _HSCORE_SERVICES:
+            a = svc_active_map.get(svc, 0)
+            u = svc_unhealthy_map.get(svc, 0)
+            service_alarm_counts_out[svc] = {"active": a, "unhealthy": u}
+            if a > 0:
+                service_health_out[svc] = round(svc_health_wsum_map.get(svc, 0.0) / a, 4)
+                if (u / a) > _HSCORE_FAMILY_SVC_THRESHOLD:
+                    service_alarms_out.append(svc)
+            else:
+                service_health_out[svc] = None
+        is_sa = family.endswith(".service_account")
+        families_out[family] = {
+            "family_kind": "service_account" if is_sa else "device_family",
+            "service_account_label": family[: -len(".service_account")] if is_sa else "",
+            "total_events": total,
+            "client_count": family_mac_count[family],
+            "site_count": family_site_count[family],
+            "worst_severity": family_worst_severity.get(family),
+            "worst_dbscan_severity": org_family_dbscan_severity.get(family),
+            "dbscan_outlier_site_count": org_family_dbscan_site_count.get(family, 0),
+            "is_family_outlier_any_site": family_is_family_outlier.get(family, False),
+            "is_family_markov_outlier_any_site": org_family_markov_is_outlier.get(family, False),
+            "worst_markov_ratio": org_family_markov_ratio.get(family),
+            "markov_family_reason": org_family_markov_reason.get(family),
+            "outlier_sites": family_outlier_sites.get(family, []),
+            "health_score": health_score,
+            "health_components": health_components,
+            "service_health": service_health_out,
+            "service_alarm_counts": service_alarm_counts_out,
+            "service_alarms": service_alarms_out,
+            "categories": {
+                cat: {
+                    "count": cat_counts.get(cat, 0),
+                    "ratio": round(cat_counts.get(cat, 0) / total, 4) if total > 0 else 0.0,
+                }
+                for cat in all_categories
+            },
+        }
+
+    return {
+        "families": families_out,
+        "categories": list(EVENT_CATEGORIES.keys()),
+        "total_sites": len(site_map),
+        "sites_with_data": sites_with_data,
+    }
+
+
 @router.get("/org/family-insights")
 async def get_org_family_insights(wlan: str = Query(..., description="WLAN (SSID) name to scope results to. Required.")):
     """
     Aggregate event category counts and anomaly findings per device family across all org sites.
     Optionally scoped to a specific WLAN via ?wlan=.
+
+    Cache-first: pre-computed by the detection pipeline tail. On miss, the
+    response is built live and the cache is opportunistically populated.
     """
     if not MIST_ORG_ID or not MIST_API_TOKEN:
         raise HTTPException(status_code=500, detail="MIST_ORG_ID or MIST_API_TOKEN not configured.")
 
     redis_client = _get_redis()
     try:
-        # Check 60s response cache — data only changes on detection cycles.
-        wlan_key = sanitize_wlan_key(wlan)
-        cache_key = f"sasquatch:cache:org_family_insights:{wlan_key}"
-        cached = await redis_client.get(cache_key)
-        if cached:
-            return json.loads(cached)
+        cache_key = summary_cache._org_family_insights_key(wlan)
+        cached = await summary_cache.cache_get(redis_client, cache_key)
+        if cached is not None:
+            return cached
 
         try:
             site_map = await _get_org_site_map(redis_client)
         except Exception:
             raise HTTPException(status_code=502, detail="Could not reach Mist API")
 
-        # Fetch per-site findings, anomalies, health scores, pre-computed family event
-        # counts, and the org-wide findings in one pipeline round trip.
-        site_ids_ordered = list(site_map.keys())
-        pipe = redis_client.pipeline()
-        for sid in site_ids_ordered:
-            pipe.get(_findings_redis_key(sid, wlan))
-            pipe.get(_health_redis_key(sid, wlan))
-            pipe.get(_family_event_counts_redis_key(sid, wlan))
-        pipe.get(_org_findings_redis_key(wlan))
-        pipeline_results = await pipe.execute()
-        n = len(site_ids_ordered)
-        findings_by_site = {
-            sid: (json.loads(pipeline_results[i * 3]) if pipeline_results[i * 3] else [])
-            for i, sid in enumerate(site_ids_ordered)
-        }
-        health_by_site = {
-            sid: (json.loads(pipeline_results[i * 3 + 1]) if pipeline_results[i * 3 + 1] else {})
-            for i, sid in enumerate(site_ids_ordered)
-        }
-        event_counts_by_site = {
-            sid: (json.loads(pipeline_results[i * 3 + 2]) if pipeline_results[i * 3 + 2] else {})
-            for i, sid in enumerate(site_ids_ordered)
-        }
-        # family_is_family_outlier and family_worst_dbscan_severity come exclusively from
-        # org-wide detection, not per-site findings. IF and DBSCAN badges mean the family
-        # was flagged across the whole org population, not just at one site.
-        raw_org_findings = pipeline_results[n * 3]
-        org_findings_list: list[dict] = json.loads(raw_org_findings) if raw_org_findings else []
-        family_is_family_outlier: dict[str, bool] = {
-            f["device_family"]: True
-            for f in org_findings_list
-            if f.get("is_family_outlier") and f.get("device_family")
-        }
-        SEVERITY_RANK = {"significant": 3, "moderate": 2, "minimal": 1}
-
-        # Org-wide DBSCAN severity, Markov ratio, and DBSCAN outlier site count — all read
-        # directly from org findings (not aggregated from per-site findings).
-        org_family_dbscan_severity: dict[str, str] = {}
-        org_family_markov_ratio: dict[str, float] = {}
-        org_family_markov_is_outlier: dict[str, bool] = {}
-        org_family_markov_reason: dict[str, str | None] = {}
-        org_family_dbscan_site_count: dict[str, int] = {}
-        for f in org_findings_list:
-            fam = f.get("device_family")
-            if not fam:
-                continue
-            sev = f.get("dbscan_severity")
-            if sev and SEVERITY_RANK.get(sev, 0) > SEVERITY_RANK.get(org_family_dbscan_severity.get(fam, ""), 0):
-                org_family_dbscan_severity[fam] = sev
-            ratio = f.get("markov_family_anomaly_ratio")
-            if ratio is not None:
-                org_family_markov_ratio[fam] = ratio
-            if f.get("is_family_markov_outlier"):
-                org_family_markov_is_outlier[fam] = True
-            reason = f.get("markov_family_reason")
-            if reason and fam not in org_family_markov_reason:
-                org_family_markov_reason[fam] = reason
-            cnt = f.get("dbscan_outlier_site_count")
-            if cnt is not None:
-                org_family_dbscan_site_count[fam] = cnt
-
-        family_event_counts: dict[str, Counter] = defaultdict(Counter)
-        family_total_events: Counter = Counter()
-        family_worst_severity: dict[str, str] = {}
-        family_outlier_sites: dict[str, list[str]] = defaultdict(list)
-        family_is_markov_outlier: dict[str, bool] = defaultdict(bool)
-        family_worst_markov_ratio: dict[str, float] = {}
-        family_site_count: Counter = Counter()
-        # mac_count is summed across sites (same device at multiple sites counted once per site).
-        family_mac_count: Counter = Counter()
-        # Health score aggregation: weighted sum and total weight per family for averaging
-        family_health_weighted_sum: dict[str, float] = defaultdict(float)
-        family_health_weight_total: dict[str, float] = defaultdict(float)
-        family_health_components_sum: dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
-        # Per-service org rollup: sum active/unhealthy MAC counts and active-weighted
-        # health values per family across all sites. Org-level service alarm fires when
-        # the summed unhealthy/active ratio exceeds FAMILY_SERVICE_ALARM_THRESHOLD across
-        # the full device-family scope (matches the user-specified ">50% of clients in
-        # the total device family scope" semantic).
-        from ..health_scorer import (
-            SERVICES as _HSCORE_SERVICES,
-            FAMILY_SERVICE_ALARM_THRESHOLD as _HSCORE_FAMILY_SVC_THRESHOLD,
-        )
-        family_svc_active: dict[str, dict[str, int]] = defaultdict(
-            lambda: {svc: 0 for svc in _HSCORE_SERVICES}
-        )
-        family_svc_unhealthy: dict[str, dict[str, int]] = defaultdict(
-            lambda: {svc: 0 for svc in _HSCORE_SERVICES}
-        )
-        family_svc_health_wsum: dict[str, dict[str, float]] = defaultdict(
-            lambda: {svc: 0.0 for svc in _HSCORE_SERVICES}
-        )
-        sites_with_data = 0
-
-        for site_id, site_name in site_map.items():
-            site_counts = event_counts_by_site.get(site_id, {})
-            if not site_counts:
-                continue
-            sites_with_data += 1
-            findings: list[dict] = findings_by_site[site_id]
-
-            # Aggregate pre-computed family event category counts.
-            for family, fdata in site_counts.items():
-                for cat, cnt in fdata.get("categories", {}).items():
-                    family_event_counts[family][cat] += cnt
-                family_total_events[family] += fdata.get("total_events", 0)
-                family_mac_count[family] += fdata.get("mac_count", 0)
-                family_site_count[family] += 1
-
-            for finding in findings:
-                fam = finding.get("device_family")
-                if not fam:
-                    continue
-                sev = finding.get("severity")
-                if sev and SEVERITY_RANK.get(sev, 0) > SEVERITY_RANK.get(family_worst_severity.get(fam, ""), 0):
-                    family_worst_severity[fam] = sev
-                if finding.get("is_family_markov_outlier"):
-                    family_is_markov_outlier[fam] = True
-                markov_ratio = finding.get("markov_family_anomaly_ratio")
-                if markov_ratio is not None and markov_ratio > family_worst_markov_ratio.get(fam, 0.0):
-                    family_worst_markov_ratio[fam] = markov_ratio
-                # dbscan_severity is sourced from org-wide findings, not per-site findings.
-                if sev in SEVERITY_RANK:
-                    family_outlier_sites[fam].append(site_name)
-
-            # Accumulate health scores — mac_count-weighted so every device gets equal vote,
-            # matching the per-device-average principle in health_scorer.py and the weighting
-            # used when attaching health to org findings in score_org_wide().
-            site_health = health_by_site.get(site_id, {})
-            for fam, hdata in site_health.items():
-                weight = hdata.get("mac_count", 0)
-                if weight > 0:
-                    family_health_weighted_sum[fam] += hdata.get("health_score", 1.0) * weight
-                    family_health_weight_total[fam] += weight
-                    for comp, rate in hdata.get("components", {}).items():
-                        family_health_components_sum[fam][comp] += rate * weight
-                # Sum service alarm counts and health across sites for org rollup.
-                site_svc_counts = hdata.get("service_alarm_counts", {}) or {}
-                site_svc_health = hdata.get("service_health", {}) or {}
-                for svc in _HSCORE_SERVICES:
-                    info = site_svc_counts.get(svc) or {}
-                    a = int(info.get("active", 0))
-                    u = int(info.get("unhealthy", 0))
-                    family_svc_active[fam][svc] += a
-                    family_svc_unhealthy[fam][svc] += u
-                    sh_val = site_svc_health.get(svc)
-                    if sh_val is not None and a > 0:
-                        family_svc_health_wsum[fam][svc] += float(sh_val) * a
-
-        all_categories = list(EVENT_CATEGORIES.keys()) + ["OTHER"]
-        families_out: dict[str, dict] = {}
-        for family, cat_counts in family_event_counts.items():
-            total = family_total_events[family]
-            health_weight = family_health_weight_total.get(family, 0.0)
-            health_score = (
-                round(family_health_weighted_sum[family] / health_weight, 4)
-                if health_weight > 0 else None
-            )
-            health_components = (
-                {
-                    comp: round(family_health_components_sum[family][comp] / health_weight, 4)
-                    for comp in family_health_components_sum.get(family, {})
-                }
-                if health_weight > 0 else None
-            )
-            # Org-wide service rollup: alarm fires when summed unhealthy/active > threshold.
-            svc_active_map = family_svc_active.get(family, {})
-            svc_unhealthy_map = family_svc_unhealthy.get(family, {})
-            svc_health_wsum_map = family_svc_health_wsum.get(family, {})
-            service_health_out: dict[str, float | None] = {}
-            service_alarm_counts_out: dict[str, dict[str, int]] = {}
-            service_alarms_out: list[str] = []
-            for svc in _HSCORE_SERVICES:
-                a = svc_active_map.get(svc, 0)
-                u = svc_unhealthy_map.get(svc, 0)
-                service_alarm_counts_out[svc] = {"active": a, "unhealthy": u}
-                if a > 0:
-                    service_health_out[svc] = round(svc_health_wsum_map.get(svc, 0.0) / a, 4)
-                    if (u / a) > _HSCORE_FAMILY_SVC_THRESHOLD:
-                        service_alarms_out.append(svc)
-                else:
-                    service_health_out[svc] = None
-            is_sa = family.endswith(".service_account")
-            families_out[family] = {
-                "family_kind": "service_account" if is_sa else "device_family",
-                "service_account_label": family[: -len(".service_account")] if is_sa else "",
-                "total_events": total,
-                "client_count": family_mac_count[family],
-                "site_count": family_site_count[family],
-                "worst_severity": family_worst_severity.get(family),
-                "worst_dbscan_severity": org_family_dbscan_severity.get(family),
-                "dbscan_outlier_site_count": org_family_dbscan_site_count.get(family, 0),
-                "is_family_outlier_any_site": family_is_family_outlier.get(family, False),
-                "is_family_markov_outlier_any_site": org_family_markov_is_outlier.get(family, False),
-                "worst_markov_ratio": org_family_markov_ratio.get(family),
-                "markov_family_reason": org_family_markov_reason.get(family),
-                "outlier_sites": family_outlier_sites.get(family, []),
-                "health_score": health_score,
-                "health_components": health_components,
-                "service_health": service_health_out,
-                "service_alarm_counts": service_alarm_counts_out,
-                "service_alarms": service_alarms_out,
-                "categories": {
-                    cat: {
-                        "count": cat_counts.get(cat, 0),
-                        "ratio": round(cat_counts.get(cat, 0) / total, 4) if total > 0 else 0.0,
-                    }
-                    for cat in all_categories
-                },
-            }
-
-        response = {
-            "families": families_out,
-            "categories": list(EVENT_CATEGORIES.keys()),
-            "total_sites": len(site_map),
-            "sites_with_data": sites_with_data,
-        }
-        if families_out:
-            await redis_client.set(cache_key, json.dumps(response), ex=60)
+        response = await build_org_family_insights(redis_client, site_map, wlan)
+        await summary_cache.cache_set(redis_client, cache_key, response)
         return response
     finally:
         await redis_client.aclose()
@@ -2076,11 +2185,37 @@ async def get_org_cluster_viz(wlan: str = Query(..., description="WLAN (SSID) na
     }
 
 
-@router.get("/sites/{site_id}/findings")
-async def get_site_findings(site_id: str, wlan: str = Query(..., description="WLAN (SSID) name to scope results to. Required.")):
-    """Current anomaly findings from Redis for a site, optionally scoped to a WLAN."""
+async def build_site_findings(site_id: str, wlan: str) -> dict:
+    """Build the /sites/{id}/findings response. Pure aggregator."""
     findings = await get_findings(site_id, wlan)
     return {"site_id": site_id, "wlan": wlan, "findings": findings, "count": len(findings)}
+
+
+@router.get("/sites/{site_id}/findings")
+async def get_site_findings(site_id: str, wlan: str = Query(..., description="WLAN (SSID) name to scope results to. Required.")):
+    """Current anomaly findings from Redis for a site, optionally scoped to a WLAN.
+
+    Cache-first: pre-computed by the detection pipeline tail. On miss, the
+    response is built live and the cache is opportunistically populated.
+    """
+    redis_client = _get_redis()
+    try:
+        cache_key = summary_cache._site_findings_key(site_id, wlan)
+        cached = await summary_cache.cache_get(redis_client, cache_key)
+        if cached is not None:
+            return cached
+
+        response = await build_site_findings(site_id, wlan)
+        await summary_cache.cache_set(redis_client, cache_key, response)
+        return response
+    finally:
+        await redis_client.aclose()
+
+
+async def build_site_health(site_id: str, wlan: str) -> dict:
+    """Build the /sites/{id}/health response. Pure aggregator."""
+    health = await get_health(site_id, wlan)
+    return {"site_id": site_id, "wlan": wlan, "health": health}
 
 
 @router.get("/sites/{site_id}/health")
@@ -2089,9 +2224,22 @@ async def get_site_health(site_id: str, wlan: str = Query(..., description="WLAN
     Per-family health scores for a site, optionally scoped to a WLAN.
     Returns {family: {health_score, components, total_events, mac_count}}.
     health_score ranges 0.0 (all failures) to 1.0 (no failures).
+
+    Cache-first: pre-computed by the detection pipeline tail. On miss, the
+    response is built live and the cache is opportunistically populated.
     """
-    health = await get_health(site_id, wlan)
-    return {"site_id": site_id, "wlan": wlan, "health": health}
+    redis_client = _get_redis()
+    try:
+        cache_key = summary_cache._site_health_key(site_id, wlan)
+        cached = await summary_cache.cache_get(redis_client, cache_key)
+        if cached is not None:
+            return cached
+
+        response = await build_site_health(site_id, wlan)
+        await summary_cache.cache_set(redis_client, cache_key, response)
+        return response
+    finally:
+        await redis_client.aclose()
 
 
 @router.get("/sites/{site_id}/clients")
@@ -2122,18 +2270,18 @@ async def get_site_clients(site_id: str):
     }
 
 
-@router.get("/sites/{site_id}/events/summary")
-async def get_events_summary(site_id: str, wlan: str = Query(..., description="WLAN (SSID) name to scope results to. Required.")):
+async def build_site_events_summary(site_id: str, wlan: str) -> dict | None:
     """
-    Event category counts per device family — used for heatmap in SiteOverview.
-    Optionally scoped to a specific WLAN via ?wlan=.
+    Build the /sites/{id}/events/summary response. Pure aggregator. Returns
+    None when no events exist for the (site, wlan) pair so the caller can
+    translate that to a 404.
     """
     events = await get_events(
         site_id=site_id,
         wlan=wlan,
     )
     if not events:
-        raise HTTPException(status_code=404, detail="No events found for site.")
+        return None
 
     summary: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
     family_totals: Counter = Counter()
@@ -2256,6 +2404,32 @@ async def get_events_summary(site_id: str, wlan: str = Query(..., description="W
         "family_metadata": family_metadata,
         "categories": list(EVENT_CATEGORIES.keys()),
     }
+
+
+@router.get("/sites/{site_id}/events/summary")
+async def get_events_summary(site_id: str, wlan: str = Query(..., description="WLAN (SSID) name to scope results to. Required.")):
+    """
+    Event category counts per device family — used for heatmap in SiteOverview.
+    Optionally scoped to a specific WLAN via ?wlan=.
+
+    Cache-first: pre-computed by the detection pipeline tail. On miss, the
+    response is built live and the cache is opportunistically populated.
+    """
+    redis_client = _get_redis()
+    try:
+        cache_key = summary_cache._site_events_summary_key(site_id, wlan)
+        cached = await summary_cache.cache_get(redis_client, cache_key)
+        if cached is not None:
+            return cached
+
+        response = await build_site_events_summary(site_id, wlan)
+        if response is None:
+            raise HTTPException(status_code=404, detail="No events found for site.")
+
+        await summary_cache.cache_set(redis_client, cache_key, response)
+        return response
+    finally:
+        await redis_client.aclose()
 
 
 @router.get("/sites/{site_id}/families/{family}/if-outliers")
@@ -2666,6 +2840,10 @@ async def flush_site_redis(site_id: str):
                     break
         if pattern_keys:
             deleted += await client.delete(*pattern_keys)
+
+        # Drop site-scoped + org-level dashboard summary cache entries —
+        # the org views aggregate this site's contribution.
+        deleted += await summary_cache.flush_site_summary_cache(client, site_id)
 
     finally:
         await client.aclose()
