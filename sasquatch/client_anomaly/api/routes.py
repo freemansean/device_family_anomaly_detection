@@ -2116,6 +2116,12 @@ async def get_org_cluster_viz(wlan: str = Query(..., description="WLAN (SSID) na
     """
     PCA 2D projection of all MAC feature vectors across every org site.
     Optionally scoped to a specific WLAN via ?wlan=.
+
+    Outlier flags come from sasquatch:org_anomalies:{site}:{wlan} (written by
+    score_org_wide), so a MAC is circled only when it is an outlier relative
+    to the combined org-wide population of its family — not just within its
+    own site. This matches the org-wide finding rollup and keeps the Org PCA
+    plot consistent with what surfaces on the Org Findings tab.
     """
     if not MIST_ORG_ID or not MIST_API_TOKEN:
         raise HTTPException(status_code=500, detail="MIST_ORG_ID or MIST_API_TOKEN not configured.")
@@ -2127,12 +2133,12 @@ async def get_org_cluster_viz(wlan: str = Query(..., description="WLAN (SSID) na
 
     try:
         site_map = await _get_org_site_map(redis_client)
-        # Fetch features and anomalies for all sites in one pipeline round trip
+        # Fetch features and org-wide anomalies for all sites in one pipeline round trip
         site_ids_ordered = list(site_map.keys())
         pipe = redis_client.pipeline()
         for sid in site_ids_ordered:
             pipe.get(_features_redis_key(sid, wlan))
-            pipe.get(_anomalies_redis_key(sid, wlan))
+            pipe.get(_org_anomalies_redis_key(sid, wlan))
         pipeline_results = await pipe.execute()
 
         for i, site_id in enumerate(site_ids_ordered):
@@ -2296,34 +2302,37 @@ async def build_site_events_summary(site_id: str, wlan: str) -> dict | None:
         if mac:
             family_macs[family].add(mac)
 
-    # Aggregate per-family Markov stats from anomaly records so SiteOverview can
-    # display Markov results for families that have no finding. Anomaly records
-    # also carry virtual service-account families ({label}.service_account) — we
-    # use the same pass to discover sa family membership, then build synthetic
-    # sa heatmap rows by summing the underlying member MACs' events.
+    # Aggregate per-family Markov stats from anomaly records. Uses the canonical
+    # family rollup rules from markov_analyzer.run_markov_analysis so the Site
+    # WLAN Family Insights badge lights up only when a finding would actually
+    # fire — single source of truth with anomaly_detector.score's rollup:
+    #   1. ratio = anomalous_macs / total_family_macs  (NOT anomalous / evaluatable)
+    #   2. is_family_markov_outlier = ratio >= markov_family_outlier_ratio
+    #   3. total_family_macs >= anomaly_finding_min_size
+    # Also discovers virtual service-account family membership for synthetic row
+    # construction below.
     family_markov: dict[str, dict] = {}
     sa_family_members: dict[str, set[str]] = defaultdict(set)
     sa_member_families_map: dict[str, set[str]] = defaultdict(set)
     try:
         anomalies_raw = await get_anomalies(site_id, wlan)
         if anomalies_raw:
+            markov_family_ratio_threshold = _config_mod.get("anomaly", "markov_family_outlier_ratio")
+            finding_min_size = _config_mod.get("anomaly", "anomaly_finding_min_size")
+            fam_total: dict[str, int] = defaultdict(int)
             fam_evaluatable: dict[str, int] = defaultdict(int)
             fam_anomalous: dict[str, int] = defaultdict(int)
-            fam_markov_outlier: dict[str, bool] = {}
             fam_reason_counts: dict[str, Counter] = defaultdict(Counter)
             for mac_data in anomalies_raw.values():
                 fam = mac_data.get("device_family", "Unknown")
+                fam_total[fam] += 1
                 scoreable = mac_data.get("markov_scoreable_episodes", 0)
                 is_stuck = mac_data.get("is_stuck_loop", False)
                 is_markov_out = mac_data.get("is_markov_outlier", False)
-                # Evaluatable = enough scoreable episodes OR a stuck-loop signal,
-                # mirroring markov_analyzer.run_markov_analysis().
                 if scoreable > 0 or is_stuck:
                     fam_evaluatable[fam] += 1
-                    if is_markov_out:
-                        fam_anomalous[fam] += 1
                 if is_markov_out:
-                    fam_markov_outlier[fam] = True
+                    fam_anomalous[fam] += 1
                     reason = mac_data.get("markov_reason")
                     if reason:
                         fam_reason_counts[fam][reason] += 1
@@ -2335,10 +2344,14 @@ async def build_site_events_summary(site_id: str, wlan: str) -> dict | None:
                     primary_family = mac_data.get("primary_device_family", "")
                     if primary_family:
                         sa_member_families_map[fam].add(primary_family)
-            for fam in set(list(fam_evaluatable.keys()) + list(fam_markov_outlier.keys())):
-                evaluatable = fam_evaluatable.get(fam, 0)
+            for fam, total in fam_total.items():
                 anomalous = fam_anomalous.get(fam, 0)
-                is_outlier = fam_markov_outlier.get(fam, False)
+                evaluatable = fam_evaluatable.get(fam, 0)
+                ratio = anomalous / total if total > 0 else 0.0
+                is_outlier = (
+                    ratio >= markov_family_ratio_threshold
+                    and total >= finding_min_size
+                )
                 reason: str | None = None
                 if is_outlier:
                     counts = fam_reason_counts.get(fam, Counter())
@@ -2349,7 +2362,7 @@ async def build_site_events_summary(site_id: str, wlan: str) -> dict | None:
                 family_markov[fam] = {
                     "markov_evaluatable_count": evaluatable,
                     "markov_family_anomalous_count": anomalous,
-                    "markov_family_anomaly_ratio": round(anomalous / evaluatable, 4) if evaluatable > 0 else 0.0,
+                    "markov_family_anomaly_ratio": round(ratio, 4),
                     "is_family_markov_outlier": is_outlier,
                     "markov_family_reason": reason,
                 }
