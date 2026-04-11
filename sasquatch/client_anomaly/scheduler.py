@@ -430,6 +430,101 @@ async def _run_org_pipeline_body(
             phase4_wlans_failed,
         )
 
+        # ── Phase 5: Pre-compute dashboard summary cache ─────────────────
+        # Builds the aggregates that /org/summary, /org/alerts, /org/findings,
+        # /org/family-insights, /sites/{id}/findings, /sites/{id}/health, and
+        # /sites/{id}/events/summary serve out of cache between detection
+        # cycles. Best-effort: cache failures must never fail the pipeline,
+        # so each builder is wrapped in its own try/except. Lazy import to
+        # break the circular import (api.routes already imports scheduler).
+        try:
+            from .api import routes as _routes
+            from . import summary_cache as _summary_cache
+
+            cache_redis = aioredis.from_url(REDIS_URL, decode_responses=True)
+            try:
+                summary_wlans = sorted(all_wlans)
+                org_built = 0
+                site_built = 0
+
+                # Org-level entries are per-WLAN.
+                for wlan in summary_wlans:
+                    for build_fn, key_fn in (
+                        (_routes.build_org_summary, _summary_cache._org_summary_key),
+                        (_routes.build_org_findings, _summary_cache._org_findings_key),
+                        (_routes.build_org_alerts, _summary_cache._org_alerts_key),
+                        (_routes.build_org_family_insights, _summary_cache._org_family_insights_key),
+                    ):
+                        try:
+                            payload = await build_fn(cache_redis, site_map, wlan)
+                            await _summary_cache.cache_set(cache_redis, key_fn(wlan), payload)
+                            org_built += 1
+                        except Exception:
+                            log.exception(
+                                "[org pipeline] summary cache build failed: %s wlan=%s",
+                                build_fn.__name__, wlan,
+                            )
+
+                # Cross-WLAN aggregation has no wlan dimension.
+                try:
+                    payload = await _routes.build_org_alerts_full(cache_redis, site_map)
+                    await _summary_cache.cache_set(
+                        cache_redis, _summary_cache._org_alerts_full_key(), payload,
+                    )
+                    org_built += 1
+                except Exception:
+                    log.exception("[org pipeline] summary cache build failed: build_org_alerts_full")
+
+                # Site-level entries are per (site, wlan).
+                for sid in site_ids:
+                    for wlan in wlans_by_site.get(sid, []):
+                        try:
+                            payload = await _routes.build_site_findings(sid, wlan)
+                            await _summary_cache.cache_set(
+                                cache_redis, _summary_cache._site_findings_key(sid, wlan), payload,
+                            )
+                            site_built += 1
+                        except Exception:
+                            log.exception(
+                                "[org pipeline] site_findings cache build failed: site=%s wlan=%s",
+                                sid, wlan,
+                            )
+                        try:
+                            payload = await _routes.build_site_health(sid, wlan)
+                            await _summary_cache.cache_set(
+                                cache_redis, _summary_cache._site_health_key(sid, wlan), payload,
+                            )
+                            site_built += 1
+                        except Exception:
+                            log.exception(
+                                "[org pipeline] site_health cache build failed: site=%s wlan=%s",
+                                sid, wlan,
+                            )
+                        try:
+                            payload = await _routes.build_site_events_summary(sid, wlan)
+                            if payload is not None:
+                                await _summary_cache.cache_set(
+                                    cache_redis,
+                                    _summary_cache._site_events_summary_key(sid, wlan),
+                                    payload,
+                                )
+                                site_built += 1
+                        except Exception:
+                            log.exception(
+                                "[org pipeline] site_events_summary cache build failed: "
+                                "site=%s wlan=%s", sid, wlan,
+                            )
+
+                log.info(
+                    "[org pipeline] Phase 5 summary cache: org_entries=%d site_entries=%d "
+                    "wlans=%d sites=%d",
+                    org_built, site_built, len(summary_wlans), total_sites,
+                )
+            finally:
+                await cache_redis.aclose()
+        except Exception:
+            log.exception("[org pipeline] Phase 5 summary cache populate failed (non-fatal)")
+
         # ── Done ─────────────────────────────────────────────────────────
         await _record_last_timestamp(_LAST_DETECTION_KEY)
 
