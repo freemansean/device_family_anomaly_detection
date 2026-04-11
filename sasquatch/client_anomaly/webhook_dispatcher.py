@@ -60,6 +60,47 @@ def get_health_score_threshold() -> float:
     return config.get("general", "anomaly_health_score_threshold")
 
 
+def get_alarm_service_device_pct() -> float:
+    """Read the service-alarm device-percentage threshold.
+
+    A family fires an alarm via the service-alarm path when at least this
+    fraction of its MACs have individually tripped a service alarm. Default
+    0.0 preserves the prior behavior (any service alarm fires). Imported by
+    routes.py so the same gate is used for API alert filtering.
+    """
+    return config.get("general", "alarm_service_device_pct")
+
+
+def get_alarm_dbscan_markov_ratio() -> float:
+    """Read the DBSCAN/Markov family-rollup alarm ratio.
+
+    A family fires an alarm via the rollup gate when the fraction of its
+    clients flagged by *either* DBSCAN or Markov is at or above this value.
+    Inter-family centroid detection (is_family_outlier) is independent of
+    this gate and remains independently sufficient to fire an alarm.
+    Resolution: config_overrides.json → env var → hardcoded default (0.20).
+    Imported by routes.py so the same ratio is used for API alert filtering.
+    """
+    return config.get("general", "alarm_dbscan_markov_ratio")
+
+
+def family_passes_dbscan_markov_gate(finding: dict, ratio: float) -> bool:
+    """Return True when a finding qualifies for an alarm via the centroid or
+    the DBSCAN-or-Markov rollup gate.
+
+    Centroid (is_family_outlier) is independently sufficient. Otherwise the
+    per-MAC union of DBSCAN and Markov flags must reach `ratio` of the
+    family's total client count.
+    """
+    if finding.get("is_family_outlier", False):
+        return True
+    total = finding.get("total_mac_count", 0) or 0
+    if total <= 0:
+        return False
+    union_count = finding.get("dbscan_or_markov_outlier_count", 0) or 0
+    return (union_count / total) >= ratio
+
+
 def get_alarm_min_family_size() -> int:
     """Read the minimum device-family size required to generate an alarm.
 
@@ -299,6 +340,8 @@ async def evaluate_and_dispatch(
     config = await _get_webhook_config()
     threshold = get_health_score_threshold()
     alarm_min_family_size = int(get_alarm_min_family_size())
+    service_device_pct = float(get_alarm_service_device_pct())
+    dbscan_markov_ratio = float(get_alarm_dbscan_markov_ratio())
 
     effective_url = config["url"]
     if not config["enabled"] or not effective_url:
@@ -317,14 +360,12 @@ async def evaluate_and_dispatch(
     for f in findings:
         family = f.get("device_family", "")
 
-        # Gate 1: must carry at least one family-level anomaly label
-        # (centroid IF/distance, DBSCAN family noise, or Markov Chain)
-        is_any_family_anomaly = (
-            f.get("is_family_outlier", False)
-            or f.get("is_family_dbscan_outlier", False)
-            or f.get("is_family_markov_outlier", False)
-        )
-        if not is_any_family_anomaly:
+        # Gate 1: family must qualify via the centroid OR the
+        # DBSCAN-or-Markov rollup gate. Centroid (is_family_outlier) is
+        # independently sufficient. Otherwise the per-MAC union of DBSCAN
+        # and Markov flags must reach `alarm_dbscan_markov_ratio` of the
+        # family's total client count.
+        if not family_passes_dbscan_markov_gate(f, dbscan_markov_ratio):
             continue
 
         # Gate 2: family must be unhealthy by EITHER metric:
@@ -337,23 +378,34 @@ async def evaluate_and_dispatch(
             health_components = f.get("health_components", {})
             service_alarms = f.get("service_alarms", []) or []
             service_health = f.get("service_health", {}) or {}
+            mac_alarm_ratio = float(f.get("mac_alarm_ratio", 0.0) or 0.0)
         else:
             family_health = health.get(family, {})
             health_score = family_health.get("health_score", 1.0)
             health_components = family_health.get("components", {})
             service_alarms = family_health.get("service_alarms", []) or []
             service_health = family_health.get("service_health", {}) or {}
+            mac_alarm_ratio = float(family_health.get("mac_alarm_ratio", 0.0) or 0.0)
 
         unhealthy_by_score = health_score < threshold
-        unhealthy_by_service = len(service_alarms) > 0
+        # Service-alarm gate fires only when the share of devices in the family
+        # that have individually tripped a service alarm meets the admin-set
+        # device-percentage floor. With the default floor of 0.0, any single
+        # tripped device is enough — matching the prior "any service alarm fires"
+        # behavior.
+        unhealthy_by_service = (
+            len(service_alarms) > 0 and mac_alarm_ratio >= service_device_pct
+        )
         if not (unhealthy_by_score or unhealthy_by_service):
             log.debug(
-                "[%s] Skipping webhook for [%s]: family anomaly label present but "
-                "health_score=%.3f >= threshold %.3f and no service alarms "
-                "(if=%s dbscan=%s markov=%s)",
+                "[%s] Skipping webhook for [%s]: rollup gate passed but "
+                "health_score=%.3f >= threshold %.3f and service-alarm device "
+                "ratio %.3f < %.3f (centroid=%s dbscan_or_markov=%d/%d)",
                 wlan, family, health_score, threshold,
-                f.get("is_family_outlier"), f.get("is_family_dbscan_outlier"),
-                f.get("is_family_markov_outlier"),
+                mac_alarm_ratio, service_device_pct,
+                f.get("is_family_outlier"),
+                f.get("dbscan_or_markov_outlier_count", 0),
+                f.get("total_mac_count", 0),
             )
             continue
 
@@ -386,6 +438,7 @@ async def evaluate_and_dispatch(
             "health_components": health_components,
             "service_alarms": service_alarms,
             "service_health": service_health,
+            "mac_alarm_ratio": mac_alarm_ratio,
         })
 
     # Track alert history regardless of qualifying count or scope setting.

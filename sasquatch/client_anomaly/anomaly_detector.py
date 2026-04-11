@@ -610,7 +610,7 @@ async def score(
         # All real MACs participate. min_samples + eps are auto-tuned per run
         # from the population size (see _run_dbscan). The redundant
         # min_family_size pre-filter has been removed — small-family
-        # suppression is the job of the Finding Threshold downstream.
+        # suppression is the job of ALARM_MIN_FAMILY_SIZE downstream.
         # sa records are excluded — see real_family_groups comment above.
         dbscan_eligible_macs = list(real_macs_only)
         dbscan_eligible_records = [features[m] for m in dbscan_eligible_macs]
@@ -810,10 +810,12 @@ async def score(
             outlier_count = len(outlier_macs)
             outlier_ratio = outlier_count / total if total > 0 else 0.0
 
-            # Evaluate Markov family flag here so it can bypass the finding threshold.
-            # A family where enough MACs have anomalous episode patterns warrants a
-            # finding even if the combined IF/DBSCAN/Markov MAC-level outlier ratio
-            # is below the finding threshold.
+            # Surface every family with at least one outlier MAC, a Markov family
+            # flag, or a centroid (is_family_outlier) flag. The alarm gate
+            # (alarm_dbscan_markov_ratio, applied in webhook_dispatcher and the
+            # OrgAlerts feed) decides which findings escalate to alarms; finding
+            # visibility is intentionally unconditional so operators can browse
+            # low-ratio signal in the Findings UI.
             fam_markov = markov_family_flags.get(family, {})
             is_family_markov_outlier = fam_markov.get("is_family_markov_outlier", False)
             markov_family_reason = fam_markov.get("markov_family_reason")
@@ -821,8 +823,11 @@ async def score(
             markov_evaluatable_count = fam_markov.get("markov_evaluatable_count", 0)
             markov_family_anomalous_count = fam_markov.get("markov_family_anomalous_count", 0)
 
-            finding_threshold = _cfg("anomaly_finding_threshold")
-            if outlier_ratio < finding_threshold and not is_family_markov_outlier:
+            if (
+                outlier_count == 0
+                and not is_family_markov_outlier
+                and family not in flagged_families
+            ):
                 continue
 
             # DBSCAN-specific rollup (used by Site Overview severity badge)
@@ -902,6 +907,20 @@ async def score(
                 family_dbscan_noise_ratio.get(family, 0.0) >= dbscan_noise_thresh
             )
 
+            # DBSCAN-or-Markov per-MAC union — used by the alarm gate
+            # (alarm_dbscan_markov_ratio in webhook_dispatcher and the
+            # OrgAlerts feed). A single client flagged by both detectors
+            # counts once. Centroid (is_family_outlier) is independent of
+            # this rollup and remains independently sufficient to alarm.
+            dbscan_or_markov_macs = [
+                m for m in family_macs
+                if anomalies[m]["is_dbscan_outlier"] or anomalies[m]["is_markov_outlier"]
+            ]
+            dbscan_or_markov_outlier_count = len(dbscan_or_markov_macs)
+            dbscan_or_markov_outlier_ratio = (
+                dbscan_or_markov_outlier_count / total if total > 0 else 0.0
+            )
+
             # For sa findings, surface the human-readable username label and the
             # set of underlying device families this service-account spans, so the
             # GUI can render "srv_Apple_EP.service_account (15 MacBooks, 3 Windows)".
@@ -934,6 +953,8 @@ async def score(
                 "dbscan_severity": _severity(dbscan_outlier_ratio) if dbscan_outlier_count > 0 else None,
                 "dbscan_outlier_ratio": round(dbscan_outlier_ratio, 4),
                 "dbscan_outlier_count": dbscan_outlier_count,
+                "dbscan_or_markov_outlier_count": dbscan_or_markov_outlier_count,
+                "dbscan_or_markov_outlier_ratio": round(dbscan_or_markov_outlier_ratio, 4),
                 "if_outlier_macs": [underlying_mac(m) for m in if_outlier_macs],
                 "if_outlier_count": len(if_outlier_macs),
                 "markov_family_anomaly_ratio": round(markov_family_anomaly_ratio, 4),
@@ -1038,7 +1059,7 @@ async def score_org_wide(
     # All real composite MACs participate. min_samples + eps are auto-tuned per
     # run from the population size (see _run_dbscan). The redundant
     # min_family_size pre-filter has been removed — small-family suppression
-    # is the job of the Finding Threshold downstream.
+    # is the job of ALARM_MIN_FAMILY_SIZE downstream.
     # sa composite keys are filtered out — see real_org_family_groups comment.
     dbscan_eligible_keys = list(real_composite_macs)
     dbscan_results_eligible = _run_dbscan(
@@ -1303,16 +1324,22 @@ async def score_org_wide(
             outlier_count = len(outlier_cks)
             outlier_ratio = outlier_count / total if total > 0 else 0.0
 
-            # Evaluate family-level DBSCAN and Markov flags before the threshold gate so
-            # they can bypass it — mirrors site-level rollup logic (line ~712).
+            # Surface every org-level family with at least one signal. The
+            # alarm gate (alarm_dbscan_markov_ratio, applied in
+            # webhook_dispatcher and the OrgAlerts feed) decides which findings
+            # escalate to alarms; finding visibility is intentionally
+            # unconditional so operators can browse low-ratio signal.
             org_dbscan_noise_thresh = _cfg("anomaly_dbscan_family_noise_threshold")
             is_family_dbscan_outlier = (
                 family_dbscan_noise_ratio.get(family, 0.0) >= org_dbscan_noise_thresh
             )
             is_family_markov_outlier = org_family_markov_flags.get(family, False)
 
-            org_finding_threshold = _cfg("anomaly_finding_threshold")
-            if outlier_ratio < org_finding_threshold and not is_family_dbscan_outlier and not is_family_markov_outlier:
+            if (
+                outlier_count == 0
+                and not is_family_dbscan_outlier
+                and not is_family_markov_outlier
+            ):
                 continue
 
             # Per-site breakdown for the sites_affected field
@@ -1334,6 +1361,19 @@ async def score_org_wide(
             if_outlier_cks = [k for k in family_cks if org_anomalies_flat[k]["is_if_outlier"]]
             dbscan_outlier_count = len(dbscan_outlier_cks)
             dbscan_outlier_ratio = dbscan_outlier_count / total
+
+            # DBSCAN-or-Markov per-MAC union for the alarm gate
+            # (alarm_dbscan_markov_ratio). Centroid (is_family_outlier) remains
+            # an independently sufficient alarm trigger and is NOT counted here.
+            dbscan_or_markov_cks = [
+                k for k in family_cks
+                if org_anomalies_flat[k]["is_dbscan_outlier"]
+                or org_anomalies_flat[k]["is_markov_outlier"]
+            ]
+            dbscan_or_markov_outlier_count = len(dbscan_or_markov_cks)
+            dbscan_or_markov_outlier_ratio = (
+                dbscan_or_markov_outlier_count / total if total > 0 else 0.0
+            )
 
             family_weights = [org_anomalies_flat[k]["volume_concentration_weight"] for k in family_cks]
             total_weight = sum(family_weights) or 1.0
@@ -1463,6 +1503,8 @@ async def score_org_wide(
                 ),
                 "dbscan_outlier_ratio": round(dbscan_outlier_ratio, 4),
                 "dbscan_outlier_count": dbscan_outlier_count,
+                "dbscan_or_markov_outlier_count": dbscan_or_markov_outlier_count,
+                "dbscan_or_markov_outlier_ratio": round(dbscan_or_markov_outlier_ratio, 4),
                 "dbscan_outlier_site_count": len({composite_to_site[k] for k in dbscan_outlier_cks}),
                 "if_outlier_count": len(if_outlier_cks),
                 "top_features": top_features,
@@ -1507,6 +1549,10 @@ async def score_org_wide(
                 _svc_active: dict[str, int] = {svc: 0 for svc in _HSCORE_SERVICES}
                 _svc_unhealthy: dict[str, int] = {svc: 0 for svc in _HSCORE_SERVICES}
                 _svc_health_wsum: dict[str, float] = {svc: 0.0 for svc in _HSCORE_SERVICES}
+                # Org-level device-alarm rollup: sum the per-site MAC counts that
+                # tripped at least one service alarm so the percentage gate
+                # applies to the full org-wide family population.
+                _mac_alarm_count_total = 0
                 for _sh in site_health_map.values():
                     _fh = _sh.get(_family)
                     if not _fh:
@@ -1514,6 +1560,7 @@ async def score_org_wide(
                     _n = _fh.get("mac_count", 1)
                     _wsum += _fh.get("health_score", 1.0) * _n
                     _wcount += _n
+                    _mac_alarm_count_total += int(_fh.get("mac_alarm_count", 0) or 0)
                     for _cat, _val in _fh.get("components", {}).items():
                         _comp_wsum[_cat] = _comp_wsum.get(_cat, 0.0) + _val * _n
                         _comp_wcount[_cat] = _comp_wcount.get(_cat, 0.0) + _n
@@ -1554,6 +1601,12 @@ async def score_org_wide(
                 _f["service_health"] = _service_health
                 _f["service_alarm_counts"] = _service_alarm_counts
                 _f["service_alarms"] = _service_alarms
+                _f["mac_alarm_count"] = _mac_alarm_count_total
+                _total_macs = int(_f.get("total_mac_count", 0) or 0)
+                _f["mac_alarm_ratio"] = (
+                    round(_mac_alarm_count_total / _total_macs, 4)
+                    if _total_macs > 0 else 0.0
+                )
 
         severity_order = {"significant": 0, "moderate": 1, "minimal": 2}
         org_findings.sort(
