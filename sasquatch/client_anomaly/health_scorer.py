@@ -32,6 +32,11 @@ log = logging.getLogger(__name__)
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 HEALTH_TTL = 24 * 3600
 
+# Heterogeneous catch-all buckets excluded from family health scoring — same set
+# suppressed at finding rollup in anomaly_detector.HIDDEN_FAMILIES. Duplicated here
+# to avoid a circular import (anomaly_detector → health_scorer).
+_HIDDEN_FAMILIES: frozenset[str] = frozenset({"Unknown", "IoT (Unknown)"})
+
 _SUCCESS_CATS = ("AUTH_SUCCESS", "ROAM_SUCCESS", "DHCP_SUCCESS", "DNS_SUCCESS", "ARP_SUCCESS")
 _FAILURE_CATS = ("AUTH_FAILURE", "ROAM_FAILURE", "DHCP_FAILURE", "DNS_FAILURE", "ARP_FAILURE")
 
@@ -197,6 +202,8 @@ def compute_family_health(features: dict[str, dict]) -> dict[str, dict]:
     for record in features.values():
         vec = record.get("vector", {})
         family = record.get("device_family", "Unknown")
+        if family in _HIDDEN_FAMILIES:
+            continue
 
         score, comps = _mac_health_score(vec)
         family_scores[family].append(score)
