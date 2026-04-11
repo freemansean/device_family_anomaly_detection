@@ -72,6 +72,12 @@ REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 ANOMALIES_TTL = 24 * 3600
 FINDINGS_TTL = 24 * 3600
 
+# Device families excluded from finding rollup — heterogeneous catch-all buckets
+# (Mist returned no fingerprint, OUI lookup also failed). Mixing unrelated devices
+# into one "family" produces noisy centroid/IF/Markov signal that is not actionable,
+# so they are suppressed across site findings, org findings, and webhook dispatch.
+HIDDEN_FAMILIES: frozenset[str] = frozenset({"Unknown", "IoT (Unknown)"})
+
 
 def _cfg(key: str) -> int | float:
     """Shorthand to read an anomaly-section config value at runtime."""
@@ -783,6 +789,8 @@ async def score(
         # --- Finding rollup per device family ---
         findings: list[dict] = []
         for family, family_macs in family_groups.items():
+            if family in HIDDEN_FAMILIES:
+                continue
             total = len(family_macs)
 
             # Org-pooled families borrowed cross-site data to run IF, so require
@@ -1284,6 +1292,8 @@ async def score_org_wide(
         org_findings: list[dict] = []
 
         for family, family_cks in org_family_groups.items():
+            if family in HIDDEN_FAMILIES:
+                continue
             total = len(family_cks)
             org_min_for_finding = _cfg("anomaly_min_peers")
             if total < org_min_for_finding:
