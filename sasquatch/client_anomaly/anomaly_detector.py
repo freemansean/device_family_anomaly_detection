@@ -49,6 +49,7 @@ from sklearn.cluster import DBSCAN
 from sklearn.decomposition import PCA
 from sklearn.ensemble import IsolationForest
 from sklearn.metrics.pairwise import cosine_distances
+from sklearn.neighbors import NearestNeighbors
 from sklearn.preprocessing import StandardScaler
 
 from . import config
@@ -151,22 +152,77 @@ def _run_isolation_forest(
     return results
 
 
+def _auto_min_samples(n_clients: int) -> int:
+    """
+    Auto-tune DBSCAN min_samples from population size.
+
+    min_samples = max(3, int(n_clients * pct))
+
+    `pct` is sourced from anomaly_dbscan_min_samples_pct (integer 1–10),
+    mapped to 0.01–0.10 — 3 → 0.03 by default. The floor of 3 keeps the
+    detector well-defined on tiny populations.
+    """
+    pct_int = int(_cfg("anomaly_dbscan_min_samples_pct"))
+    pct = max(1, min(10, pct_int)) / 100.0
+    return max(3, int(n_clients * pct))
+
+
+def _auto_eps(X_reduced: np.ndarray, min_samples: int) -> float:
+    """
+    Pick DBSCAN eps via the k-distance elbow method.
+
+    For each point, take the distance to its k-th nearest neighbor (k = min_samples).
+    Sort ascending. The "elbow" — the point of maximum curvature — is the
+    classic Ester et al. heuristic for eps. Approximated here by the point of
+    maximum perpendicular distance from the line joining the first and last
+    points of the sorted curve (the "knee" / triangle method), which is
+    parameter-free and robust on monotone curves.
+    """
+    n = X_reduced.shape[0]
+    k = max(2, min(min_samples, n - 1))
+    nn = NearestNeighbors(n_neighbors=k + 1).fit(X_reduced)
+    dists, _ = nn.kneighbors(X_reduced)
+    kth = np.sort(dists[:, k])
+    if kth.size < 2 or kth[-1] <= kth[0]:
+        return float(kth[-1]) if kth.size else 0.5
+
+    x = np.arange(kth.size, dtype=float)
+    y = kth.astype(float)
+    x0, y0 = x[0], y[0]
+    x1, y1 = x[-1], y[-1]
+    denom = float(np.hypot(y1 - y0, x1 - x0)) or 1.0
+    perp = np.abs((y1 - y0) * x - (x1 - x0) * y + x1 * y0 - y1 * x0) / denom
+    elbow_idx = int(np.argmax(perp))
+    return float(kth[elbow_idx])
+
+
 def _run_dbscan(macs: list[str], feature_records: list[dict]) -> dict[str, dict]:
     """
-    Run DBSCAN across all MACs in the WLAN scope.
+    Run DBSCAN across all MACs in the WLAN/org scope.
+
     PCA reduction is applied before DBSCAN to mitigate the curse of dimensionality:
     Euclidean distance degrades in 61-dimensional space (all points tend toward the
     same inter-point distance), and the sparse frequency vectors make this worse.
     PCA is not applied before Isolation Forest — IF splits on one random feature at
     a time and handles high-dimensional sparse vectors without distance degradation.
+
+    Auto-tuning: min_samples is derived from the size of the input population
+    (`max(3, int(n_clients * pct))` — `pct` configurable via the GUI, 0.01–0.10),
+    and eps is selected by the k-distance elbow method per run. Both adapt to
+    site/org population size automatically — small sites get tight clusters,
+    large sites get looser ones.
+
     Returns per-MAC dict with dbscan_label and is_dbscan_outlier.
     """
+    n_clients = len(macs)
+    if n_clients == 0:
+        return {}
+
+    min_samples = _auto_min_samples(n_clients)
+    if n_clients < min_samples:
+        return {mac: {"dbscan_label": -1, "is_dbscan_outlier": True} for mac in macs}
+
     X = _extract_vector_array(feature_records)
-    if X.shape[0] < _cfg("anomaly_dbscan_min_samples"):
-        return {
-            mac: {"dbscan_label": -1, "is_dbscan_outlier": True}
-            for mac in macs
-        }
 
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X)
@@ -178,15 +234,21 @@ def _run_dbscan(macs: list[str], feature_records: list[dict]) -> dict[str, dict]
     max_components = min(X_scaled.shape[0] - 1, X_scaled.shape[1])
     pca = PCA(n_components=min(_cfg("anomaly_dbscan_pca_variance"), max_components), random_state=_random_state())
     X_reduced = pca.fit_transform(X_scaled)
+
+    eps = _auto_eps(X_reduced, min_samples)
+
     log.info(
-        "DBSCAN PCA: %d MACs, %d→%d dims (%.1f%% variance explained)",
-        X_scaled.shape[0],
+        "DBSCAN auto-tune: n_clients=%d → min_samples=%d, eps=%.4f "
+        "(PCA %d→%d dims, %.1f%% variance)",
+        n_clients,
+        min_samples,
+        eps,
         X_scaled.shape[1],
         pca.n_components_,
         pca.explained_variance_ratio_.sum() * 100,
     )
 
-    db = DBSCAN(eps=_cfg("anomaly_dbscan_eps"), min_samples=_cfg("anomaly_dbscan_min_samples"))
+    db = DBSCAN(eps=eps, min_samples=min_samples)
     labels = db.fit_predict(X_reduced)
 
     return {
@@ -539,20 +601,16 @@ async def score(
             }
 
         # --- Stage 1: DBSCAN across real MACs in WLAN scope ---
-        # Only include MACs from families large enough to contribute meaningful signal.
+        # All real MACs participate. min_samples + eps are auto-tuned per run
+        # from the population size (see _run_dbscan). The redundant
+        # min_family_size pre-filter has been removed — small-family
+        # suppression is the job of the Finding Threshold downstream.
         # sa records are excluded — see real_family_groups comment above.
-        dbscan_eligible_macs = [
-            mac for mac in real_macs_only
-            if len(real_family_groups.get(features[mac].get("device_family", "Unknown"), [])) >= _cfg("anomaly_dbscan_min_family_size")
-        ]
-        excluded_from_dbscan = real_macs_only - set(dbscan_eligible_macs)
-
+        dbscan_eligible_macs = list(real_macs_only)
         dbscan_eligible_records = [features[m] for m in dbscan_eligible_macs]
         dbscan_results_eligible = _run_dbscan(dbscan_eligible_macs, dbscan_eligible_records)
 
         dbscan_results: dict[str, dict] = {**dbscan_results_eligible}
-        for mac in excluded_from_dbscan:
-            dbscan_results[mac] = {"dbscan_label": None, "is_dbscan_outlier": False}
 
         # Copy each primary MAC's DBSCAN result onto its sa record so the merge
         # step has something to read for sa keys. sa records inherit their
@@ -567,18 +625,11 @@ async def score(
                     )
                 )
 
-        if excluded_from_dbscan:
-            excluded_families = {features[m].get("device_family", "Unknown") for m in excluded_from_dbscan}
-            log.info(
-                f"DBSCAN [{wlan}]: excluded {len(excluded_from_dbscan)} MACs from "
-                f"{len(excluded_families)} small families: {excluded_families}"
-            )
-
         # Compute DBSCAN noise ratio per family (stored on anomaly records and used
-        # by the frontend). No longer used to populate flagged_families.
-        # For sa families, every member is a composite key and never appears in
-        # dbscan_results_eligible — fall back to the underlying primary MACs so
-        # the family-level signal still reflects DBSCAN cluster behavior.
+        # by the frontend). For sa families, every member is a composite key and
+        # never appears in dbscan_results_eligible — fall back to the underlying
+        # primary MACs so the family-level signal still reflects DBSCAN cluster
+        # behavior.
         family_dbscan_noise_ratio: dict[str, float] = {}
         for family, family_macs in family_groups.items():
             eligible = [m for m in family_macs if m in dbscan_results_eligible]
@@ -976,23 +1027,18 @@ async def score_org_wide(
         real_org_family_groups[family].append(key)
 
     # --- Stage 1: DBSCAN across all real org MACs ---
+    # All real composite MACs participate. min_samples + eps are auto-tuned per
+    # run from the population size (see _run_dbscan). The redundant
+    # min_family_size pre-filter has been removed — small-family suppression
+    # is the job of the Finding Threshold downstream.
     # sa composite keys are filtered out — see real_org_family_groups comment.
-    dbscan_eligible_keys = [
-        k for k in real_composite_macs
-        if len(real_org_family_groups.get(
-            composite_features[k].get("device_family", "Unknown"), []
-        )) >= _cfg("anomaly_dbscan_min_family_size")
-    ]
-    excluded_from_dbscan = real_composite_macs - set(dbscan_eligible_keys)
-
+    dbscan_eligible_keys = list(real_composite_macs)
     dbscan_results_eligible = _run_dbscan(
         dbscan_eligible_keys,
         [composite_features[k] for k in dbscan_eligible_keys],
     )
 
     dbscan_results: dict[str, dict] = {**dbscan_results_eligible}
-    for key in excluded_from_dbscan:
-        dbscan_results[key] = {"dbscan_label": None, "is_dbscan_outlier": False}
 
     # Copy each primary composite MAC's DBSCAN result onto its sa composite
     # key so the merge step has a consistent value to read for sa entries.
@@ -1007,16 +1053,6 @@ async def score_org_wide(
                 primary_ck,
                 {"dbscan_label": None, "is_dbscan_outlier": False},
             )
-        )
-
-    if excluded_from_dbscan:
-        excluded_families = {
-            composite_features[k].get("device_family", "Unknown")
-            for k in excluded_from_dbscan
-        }
-        log.info(
-            f"[org DBSCAN] wlan={wlan}: excluded {len(excluded_from_dbscan)} MACs "
-            f"from {len(excluded_families)} small families: {excluded_families}"
         )
 
     # DBSCAN noise ratio per family (stored on anomaly records).

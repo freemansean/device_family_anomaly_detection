@@ -11,6 +11,7 @@ event.
 import asyncio
 import logging
 import os
+import re
 import time
 
 import httpx
@@ -28,57 +29,90 @@ def _auth_headers() -> dict:
     return {"Authorization": f"Token {MIST_API_TOKEN}"}
 
 
-def _normalize_family(name: str) -> str:
+# Corporate suffixes stripped from manufacturer strings so "Apple", "Apple Inc",
+# and "Apple Inc." all collapse to the same token. Order matters for the regex —
+# longer multi-word suffixes must be tried before shorter ones.
+_CORP_SUFFIX_RE = re.compile(
+    r"[,.\s]+("
+    r"incorporated|corporation|technologies|electronics|international"
+    r"|company|limited|holdings|systems"
+    r"|inc|llc|ltd|gmbh|co|corp|sa|ag|nv|bv|plc|kk|srl|oy|ab"
+    r")\.?$",
+    re.IGNORECASE,
+)
+
+# Mist placeholder strings that carry no fingerprint information.
+_PLACEHOLDER_TOKENS = {
+    "", "unknown", "unknown manufacturer", "private",
+    "iot", "iot device", "embedded", "other", "n/a", "none", "null",
+}
+
+
+def _clean_token(value: str) -> str:
+    """Strip corporate suffixes, punctuation, and collapse whitespace.
+
+    "Apple, Inc." → "Apple"
+    "Zebra Technologies Inc" → "Zebra"
+    "Hewlett-Packard Company" → "Hewlett-Packard"
     """
-    Normalize a dynamic (non-hardcoded) family name for consistent grouping.
-    Strips trailing punctuation/whitespace then truncates to 12 characters so that
-    variants like "Zebra Technologies Inc" and "Zebra Technologies Inc." map to the
-    same family label.
+    if not value:
+        return ""
+    cleaned = value.strip().rstrip(".,;:")
+    # Repeatedly strip suffixes so "Foo Technologies, Inc." → "Foo".
+    for _ in range(4):
+        new = _CORP_SUFFIX_RE.sub("", cleaned).strip().rstrip(".,;:")
+        if new == cleaned:
+            break
+        cleaned = new
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    if cleaned.lower() in _PLACEHOLDER_TOKENS:
+        return ""
+    return cleaned
+
+
+def _os_major(os_str: str) -> str:
+    """Collapse OS strings to major-version granularity.
+
+    "iOS 17.2.1" → "iOS 17"
+    "Windows 11.0.22631" → "Windows 11"
+    "macOS 14.4" → "macOS 14"
+    "Android 13" → "Android 13"
+    "iPadOS" → "iPadOS"
     """
-    cleaned = name.rstrip(".,; ").strip()
-    return cleaned[:12].strip() if len(cleaned) > 12 else cleaned
+    cleaned = (os_str or "").strip()
+    if not cleaned or cleaned.lower() in _PLACEHOLDER_TOKENS:
+        return ""
+    # Match "<name> <major>[.<rest>]" — keep name + major only.
+    m = re.match(r"^(.*?)[\s_-]+(\d+)(?:[._]\d+)*\b", cleaned)
+    if m:
+        name = m.group(1).strip()
+        major = m.group(2)
+        return f"{name} {major}".strip()
+    return cleaned
 
 
 def classify_family(client: dict) -> str:
-    model = (client.get("last_model") or "").strip()
-    device = (client.get("last_device") or "").strip()
-    os_str = (client.get("last_os") or "").strip()
-    mfg = (client.get("mfg") or "").strip()
+    """Build a device family key from Mist fingerprint fields.
 
-    combined = f"{model} {device} {os_str} {mfg}".lower()
+    Priority: a unique combination of Manufacturer → Model → OS (major version)
+    when Mist provides them. Tokens are joined with " | " so the field count
+    is visually obvious and 2-field composites stay distinct from 3-field ones.
 
-    if "iphone" in combined:
-        return "iPhone"
-    if "ipad" in combined:
-        return "iPad"
-    if "mac" in combined and "apple" in combined:
-        return "MacBook"
-    if "apple" in combined:
-        return "Apple"
-    if "android" in combined and "tablet" in combined:
-        return "Android Tablet"
-    if "android" in combined:
-        return "Android Phone"
-    if "windows" in combined:
-        return "Windows"
-    if "chrome" in combined:
-        return "Chromebook"
-    if "linux" in combined:
-        return "Linux"
-    if "printer" in combined or "print" in combined:
-        return "Printer"
-    if "awair" in combined:
-        return "Awair"
-    # Use OS type if available; fall back to manufacturer name.
-    # Skip generic IoT/embedded markers that Mist uses as placeholder OS labels —
-    # they add no information over the manufacturer name.
-    # Normalize to first 12 chars so minor variants (punctuation, trailing text)
-    # collapse into the same family group.
-    _GENERIC_OS = {"iot", "iot device", "embedded", "other"}
-    if os_str and os_str.lower() not in _GENERIC_OS:
-        return _normalize_family(os_str)
-    if mfg:
-        return _normalize_family(mfg)
+    Falls back to a single-token family (manufacturer or OS alone) when Mist
+    only provides one field, or to the OUI-derived manufacturer that
+    `_build_client_record()` injects as `mfg` when Mist provides nothing.
+    """
+    mfg = _clean_token(client.get("mfg") or "")
+    model = _clean_token(client.get("last_model") or "")
+    os_str = _os_major(client.get("last_os") or "")
+    # last_device is a coarse type label ("Phone", "Laptop") — use it only as
+    # a model fallback when Mist omits the specific model string.
+    if not model:
+        model = _clean_token(client.get("last_device") or "")
+
+    parts = [p for p in (mfg, model, os_str) if p]
+    if parts:
+        return " | ".join(parts)
     return "Unknown"
 
 

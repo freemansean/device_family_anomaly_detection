@@ -52,9 +52,10 @@ GUI_CONTROLS: list[tuple[str, str, float | int]] = [
     ("anomaly", "anomaly_if_contamination", 0.17),
     ("anomaly", "anomaly_min_peers", 7),
     # Anomaly tab — DBSCAN
-    ("anomaly", "anomaly_dbscan_eps", 3.3),
-    ("anomaly", "anomaly_dbscan_min_samples", 8),
-    ("anomaly", "anomaly_dbscan_min_family_size", 4),
+    # min_samples is auto-tuned per run from population size; the only
+    # admin-tunable input is the percentage knob (integer 1–10 → 0.01–0.10).
+    # eps is auto-selected per run via the k-distance elbow method.
+    ("anomaly", "anomaly_dbscan_min_samples_pct", 4),
     # Anomaly tab — Centroid detection
     ("anomaly", "anomaly_centroid_dist_threshold", 0.42),
     ("anomaly", "anomaly_centroid_healthy_ref_threshold", 0.66),

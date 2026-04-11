@@ -18,13 +18,13 @@ const ANOMALY_COLOR = { significant: "#39e84e", moderate: "#2eb845", minimal: "#
 const ANOMALY_BG    = { significant: "#0d2a15", moderate: "#0b2210", minimal: "#09180a" };
 
 function SiteCard({ site, onClick }) {
-  const { site_name, site_id, has_data, alert_count = 0, critical_count, warning_count, info_count, event_count } = site;
+  const { site_name, site_id, has_data, alert_count = 0, impacted_family_count = 0, event_count } = site;
 
   const severity = !has_data
     ? "none"
     : alert_count > 0
     ? "alert"
-    : (critical_count > 0 || warning_count > 0 || info_count > 0)
+    : impacted_family_count > 0
     ? "anomalous"
     : "ok";
 
@@ -75,23 +75,15 @@ function SiteCard({ site, onClick }) {
               {alert_count} ALERT
             </span>
           )}
-          {critical_count > 0 && (
-            <span style={{ background: ANOMALY_BG.significant, color: ANOMALY_COLOR.significant, padding: "1px 6px", borderRadius: "3px", fontSize: "10px" }}>
-              {critical_count} SIGNIFICANT
+          {impacted_family_count > 0 ? (
+            <span
+              title="Device families flagged by DBSCAN, centroid, or Markov detectors"
+              style={{ background: ANOMALY_BG.moderate, color: ANOMALY_COLOR.moderate, padding: "1px 6px", borderRadius: "3px", fontSize: "10px" }}
+            >
+              {impacted_family_count} {impacted_family_count === 1 ? "FAMILY" : "FAMILIES"} IMPACTED
             </span>
-          )}
-          {warning_count > 0 && (
-            <span style={{ background: ANOMALY_BG.moderate, color: ANOMALY_COLOR.moderate, padding: "1px 6px", borderRadius: "3px", fontSize: "10px" }}>
-              {warning_count} MODERATE
-            </span>
-          )}
-          {info_count > 0 && (
-            <span style={{ background: ANOMALY_BG.minimal, color: ANOMALY_COLOR.minimal, padding: "1px 6px", borderRadius: "3px", fontSize: "10px" }}>
-              {info_count} MINIMAL
-            </span>
-          )}
-          {critical_count === 0 && warning_count === 0 && info_count === 0 && (
-            <span style={{ color: "#2d7a4f", fontSize: "10px" }}>No findings</span>
+          ) : (
+            <span style={{ color: "#2d7a4f", fontSize: "10px" }}>No impacted families</span>
           )}
           <span style={{ color: "#444", fontSize: "10px", marginLeft: "auto" }}>
             {event_count.toLocaleString()} events
@@ -140,10 +132,6 @@ export default function OrgOverview({ apiBase, onSiteSelect, onMacSiteSelect, re
   const sites             = allSites.slice(0, MAX_SITE_CARDS);
   const hiddenSiteCount   = Math.max(0, allSites.length - sites.length);
   const sitesWithData     = allSites.filter(s => s.has_data).length;
-  const orgAlertCount     = summary?.org_alert_count ?? 0;
-  const orgSignificant    = summary?.org_significant_count ?? 0;
-  const orgModerate       = summary?.org_moderate_count ?? 0;
-  const orgMinimal        = summary?.org_minimal_count ?? 0;
   const orgFindingCount   = summary?.org_finding_count ?? 0;
 
   return (
@@ -203,26 +191,6 @@ export default function OrgOverview({ apiBase, onSiteSelect, onMacSiteSelect, re
             }
             {sitesWithData > 0 && (
               <span style={{ color: "#555", fontSize: "12px" }}>{sitesWithData} with data</span>
-            )}
-            {orgAlertCount > 0 && (
-              <span style={{ background: "#2a1515", color: "#e05555", padding: "2px 8px", borderRadius: "3px", fontSize: "11px" }}>
-                {orgAlertCount} ALERT
-              </span>
-            )}
-            {orgSignificant > 0 && (
-              <span style={{ background: ANOMALY_BG.significant, color: ANOMALY_COLOR.significant, padding: "2px 8px", borderRadius: "3px", fontSize: "11px" }}>
-                {orgSignificant} SIGNIFICANT
-              </span>
-            )}
-            {orgModerate > 0 && (
-              <span style={{ background: ANOMALY_BG.moderate, color: ANOMALY_COLOR.moderate, padding: "2px 8px", borderRadius: "3px", fontSize: "11px" }}>
-                {orgModerate} MODERATE
-              </span>
-            )}
-            {orgMinimal > 0 && (
-              <span style={{ background: ANOMALY_BG.minimal, color: ANOMALY_COLOR.minimal, padding: "2px 8px", borderRadius: "3px", fontSize: "11px" }}>
-                {orgMinimal} MINIMAL
-              </span>
             )}
             {!loading && !error && orgFindingCount === 0 && sitesWithData > 0 && (
               <span style={{ color: "#444", fontSize: "11px" }}>No org-wide findings yet — run Full Discovery to start org analysis</span>
