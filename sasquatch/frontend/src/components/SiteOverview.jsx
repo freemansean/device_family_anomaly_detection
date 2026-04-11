@@ -133,8 +133,8 @@ export default function SiteOverview({ siteId, apiBase, onMacSelect, onFamilySel
   }, [load]);
 
   if (loading && !summary) {
-    // Skeleton: 7 fixed cols (Family, IF, DB, Markov, Health, Service Alarm, Count) + 15 CATEGORIES = 22 columns
-    const skeletonColWidths = [110, 44, 62, 62, 80, 100, 44, ...Array(15).fill(18)];
+    // Skeleton: 7 fixed cols (Family, Count, IF, DB, Markov, Health, Service Alarm) + 15 CATEGORIES = 22 columns
+    const skeletonColWidths = [110, 44, 44, 62, 62, 80, 100, ...Array(15).fill(18)];
     const shimmer = "sq-site-shimmer 1.5s ease-in-out infinite";
     return (
       <div>
@@ -281,17 +281,17 @@ export default function SiteOverview({ siteId, apiBase, onMacSelect, onFamilySel
           <thead>
             <tr>
               <th
+                style={{ ...thStyle, cursor: "pointer", userSelect: "none" }}
+                onClick={() => handleSort("family")}
+              >
+                Device Family<SortIndicator active={sortKey === "family"} dir={sortDir} />
+              </th>
+              <th
                 style={{ ...thStyle, whiteSpace: "nowrap", cursor: "pointer", userSelect: "none" }}
                 title="Count — total MACs in this device family at this site."
                 onClick={() => handleSort("count")}
               >
                 Count<SortIndicator active={sortKey === "count"} dir={sortDir} />
-              </th>
-              <th
-                style={{ ...thStyle, cursor: "pointer", userSelect: "none" }}
-                onClick={() => handleSort("family")}
-              >
-                Device Family<SortIndicator active={sortKey === "family"} dir={sortDir} />
               </th>
               <th
                 style={{ ...thStyle, whiteSpace: "nowrap", cursor: "pointer", userSelect: "none" }}
@@ -384,13 +384,6 @@ export default function SiteOverview({ siteId, apiBase, onMacSelect, onFamilySel
               const rowBg = isSaFamily ? SA_BG : undefined;
               return (
                 <tr key={family} style={rowBg ? { background: rowBg } : undefined}>
-                  {/* Count — MACs in this family at this site */}
-                  <td
-                    style={{ ...tdStyle, textAlign: "right", color: "#aaa", fontSize: "11px", fontVariantNumeric: "tabular-nums" }}
-                    title={`${clientCount} MAC${clientCount === 1 ? "" : "s"} in ${family} at this site`}
-                  >
-                    {clientCount}
-                  </td>
                   <td style={{ ...tdStyle, whiteSpace: "nowrap" }}>
                     <span style={{
                       display: "inline-block", width: 8, height: 8,
@@ -419,6 +412,13 @@ export default function SiteOverview({ siteId, apiBase, onMacSelect, onFamilySel
                         SVC ACCT
                       </span>
                     )}
+                  </td>
+                  {/* Count — MACs in this family at this site */}
+                  <td
+                    style={{ ...tdStyle, textAlign: "right", color: "#aaa", fontSize: "11px", fontVariantNumeric: "tabular-nums" }}
+                    title={`${clientCount} MAC${clientCount === 1 ? "" : "s"} in ${family} at this site`}
+                  >
+                    {clientCount}
                   </td>
                   {/* IF: Centroid Isolation Forest — whole-family behavioral outlier */}
                   <td style={{ ...tdStyle, textAlign: "center" }}>
@@ -550,9 +550,6 @@ export default function SiteOverview({ siteId, apiBase, onMacSelect, onFamilySel
             })}
             {showOtherRow && (
               <tr style={{ borderTop: "1px solid #2a2a2a" }}>
-                <td style={{ ...tdStyle, textAlign: "right", color: "#888", fontSize: "11px", fontVariantNumeric: "tabular-nums" }}>
-                  {otherClientCount}
-                </td>
                 <td style={{ ...tdStyle, whiteSpace: "nowrap", color: "#aaa", fontStyle: "italic" }}>
                   <span style={{
                     display: "inline-block", width: 8, height: 8,
@@ -563,6 +560,9 @@ export default function SiteOverview({ siteId, apiBase, onMacSelect, onFamilySel
                   <span style={{ color: "#888", fontSize: "11px", marginLeft: "6px" }}>
                     ({otherClientCount} clients, {otherFamilies.length} types)
                   </span>
+                </td>
+                <td style={{ ...tdStyle, textAlign: "right", color: "#888", fontSize: "11px", fontVariantNumeric: "tabular-nums" }}>
+                  {otherClientCount}
                 </td>
                 <td style={{ ...tdStyle, textAlign: "center" }}>
                   <span style={{ color: "#888", fontSize: "10px" }}>—</span>

@@ -1364,6 +1364,32 @@ async def score_org_wide(
                     for k in family_cks
                 })
 
+            # Worst-health MACs: top 3 across all family members (org-wide) by
+            # ascending health score. Each entry carries its own site_id so the
+            # webhook TSHOOT enrichment step (and downstream consumers) can
+            # target the right Mist site. For sa families the composite mac
+            # string carries the "#sa" suffix — strip it via underlying_mac so
+            # the displayed mac is always the real one.
+            ck_health_scores = {
+                ck: _mac_health_score(composite_features[ck]["vector"])
+                for ck in family_cks
+                if ck in composite_features
+            }
+            worst_health_macs = sorted(
+                [
+                    {
+                        "mac": underlying_mac(composite_to_mac[ck]),
+                        "site_id": composite_to_site[ck],
+                        "health_score": round(h_score, 4),
+                        "health_components": {
+                            k: round(v, 4) for k, v in comps.items() if v > 0
+                        },
+                    }
+                    for ck, (h_score, comps) in ck_health_scores.items()
+                ],
+                key=lambda x: x["health_score"],
+            )[:3]
+
             finding = {
                 "device_family": family,
                 "family_kind": family_kind,
@@ -1378,6 +1404,7 @@ async def score_org_wide(
                 "site_count": len(sites_affected),
                 "sites_affected": sites_affected,
                 "example_macs": example_macs,
+                "worst_health_macs": worst_health_macs,
                 "is_family_outlier": is_family_level_outlier,
                 "is_family_dbscan_outlier": is_family_dbscan_outlier,
                 "is_family_markov_outlier": is_family_markov_outlier,

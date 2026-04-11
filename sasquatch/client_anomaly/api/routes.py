@@ -23,7 +23,7 @@ from typing import Optional
 import httpx
 import numpy as np
 import redis.asyncio as aioredis
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Query
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 
@@ -63,7 +63,6 @@ from ..scheduler import (
 )
 from .. import alert_tracker
 from ..webhook_dispatcher import evaluate_and_dispatch, run_family_tshoot
-from .auth import require_auth
 
 log = logging.getLogger(__name__)
 
@@ -548,12 +547,27 @@ async def set_general_config(body: dict):
         # Negative dBm. -120 is effectively "off" (below noise floor).
         "anomaly_rssi_min_threshold": (-120, 0),
     }
+    float_bounds = {
+        # Health score threshold for dual-gate alarm generation. Lives under
+        # general config because it gates alarm generation alongside
+        # alarm_min_family_size at both org and site level.
+        "anomaly_health_score_threshold": (0.0, 1.0),
+    }
     for key, (lo, hi) in int_bounds.items():
         if key in body:
             try:
                 v = int(body[key])
             except (ValueError, TypeError):
                 raise HTTPException(status_code=400, detail=f"{key} must be an integer")
+            if not (lo <= v <= hi):
+                raise HTTPException(status_code=400, detail=f"{key} must be between {lo} and {hi}")
+            config[key] = v
+    for key, (lo, hi) in float_bounds.items():
+        if key in body:
+            try:
+                v = float(body[key])
+            except (ValueError, TypeError):
+                raise HTTPException(status_code=400, detail=f"{key} must be a number")
             if not (lo <= v <= hi):
                 raise HTTPException(status_code=400, detail=f"{key} must be between {lo} and {hi}")
             config[key] = v
@@ -582,7 +596,6 @@ async def set_anomaly_config(body: dict):
         "anomaly_finding_threshold": (0.0, 1.0),
         "anomaly_centroid_dist_threshold": (0.0, 2.0),
         "anomaly_centroid_healthy_ref_threshold": (0.0, 1.0),
-        "anomaly_health_score_threshold": (0.0, 1.0),
         "markov_family_outlier_ratio": (0.0, 1.0),
         "markov_outlier_episode_ratio": (0.0, 1.0),
         "markov_stuck_loop_threshold": (0.0, 1.0),
@@ -700,13 +713,19 @@ async def get_org_summary(wlan: str = Query(..., description="WLAN (SSID) name t
             health = health_by_site[sid]
             event_count = events_per_site.get(sid, 0)
             # alert_count: families that are both anomalous (in findings) AND unhealthy.
-            # Tiny families below alarm_min_family_size are suppressed to stay in sync
-            # with webhook dispatch and the OrgAlerts feed.
-            alert_count = sum(
-                1 for f in findings
-                if health.get(f.get("device_family"), {}).get("health_score", 1.0) < _SUMMARY_HEALTH_THRESHOLD
-                and (f.get("total_mac_count", 0) or 0) >= _SUMMARY_MIN_FAMILY_SIZE
-            )
+            # "Unhealthy" matches the webhook dispatch gate: health_score below
+            # threshold OR at least one service_alarms entry present. Tiny families
+            # below alarm_min_family_size are suppressed to stay in sync with
+            # webhook dispatch and the OrgAlerts feed.
+            def _is_alert(f: dict) -> bool:
+                fam_health = health.get(f.get("device_family"), {})
+                score_bad = fam_health.get("health_score", 1.0) < _SUMMARY_HEALTH_THRESHOLD
+                service_bad = len(fam_health.get("service_alarms") or []) > 0
+                return (
+                    (score_bad or service_bad)
+                    and (f.get("total_mac_count", 0) or 0) >= _SUMMARY_MIN_FAMILY_SIZE
+                )
+            alert_count = sum(1 for f in findings if _is_alert(f))
             result.append({
                 "site_id": sid,
                 "site_name": site_name,
@@ -729,7 +748,10 @@ async def get_org_summary(wlan: str = Query(..., description="WLAN (SSID) name t
         "org_minimal_count": sum(1 for f in org_findings if f.get("severity") == "minimal"),
         "org_alert_count": sum(
             1 for f in org_findings
-            if f.get("health_score", 1.0) < _SUMMARY_HEALTH_THRESHOLD
+            if (
+                f.get("health_score", 1.0) < _SUMMARY_HEALTH_THRESHOLD
+                or len(f.get("service_alarms") or []) > 0
+            )
             and (f.get("total_mac_count", 0) or 0) >= _SUMMARY_MIN_FAMILY_SIZE
         ),
         "org_finding_count": len(org_findings),
@@ -1157,11 +1179,16 @@ async def get_org_alerts(wlan: str = Query(..., description="WLAN (SSID) name to
     org_findings = json.loads(raw_org) if raw_org else []
 
     # Org-wide alerts: org findings where any family-level anomaly flag is set AND unhealthy.
-    # Any of centroid IF, DBSCAN past threshold, or Markov qualifies — not just centroid.
-    # Tiny families below alarm_min_family_size are suppressed (same gate as webhook dispatch).
+    # "Unhealthy" matches the webhook dispatch gate: health_score below threshold
+    # OR at least one service_alarms entry present (>50% of active MACs failing in a
+    # service category). Any of centroid IF, DBSCAN past threshold, or Markov qualifies
+    # — not just centroid. Tiny families below alarm_min_family_size are suppressed.
     org_alerts = [
         f for f in org_findings
-        if f.get("health_score", 1.0) < _ALERT_HEALTH_THRESHOLD
+        if (
+            f.get("health_score", 1.0) < _ALERT_HEALTH_THRESHOLD
+            or len(f.get("service_alarms") or []) > 0
+        )
         and (f.get("total_mac_count", 0) or 0) >= _ALARM_MIN_FAMILY_SIZE
         and (
             f.get("is_family_outlier")
@@ -1174,18 +1201,29 @@ async def get_org_alerts(wlan: str = Query(..., description="WLAN (SSID) name to
             sa["site_name"] = site_map.get(sa["site_id"], sa["site_id"])
 
     # Per-site alerts: per-site findings cross-referenced with per-site health.
-    # Tiny families below alarm_min_family_size are suppressed (same gate as webhook dispatch).
+    # "Unhealthy" matches the webhook dispatch gate: health_score below threshold
+    # OR at least one service_alarms entry present. Tiny families below
+    # alarm_min_family_size are suppressed.
     site_alerts = []
     for sid, site_name in sites_sorted:
         findings = findings_by_site[sid]
         health = health_by_site[sid]
-        alerts = [
-            {**f, "health_score": health.get(f.get("device_family"), {}).get("health_score", 1.0),
-             "health_components": health.get(f.get("device_family"), {}).get("components")}
-            for f in findings
-            if health.get(f.get("device_family"), {}).get("health_score", 1.0) < _ALERT_HEALTH_THRESHOLD
-            and (f.get("total_mac_count", 0) or 0) >= _ALARM_MIN_FAMILY_SIZE
-        ]
+        alerts = []
+        for f in findings:
+            family_health = health.get(f.get("device_family"), {})
+            fam_health_score = family_health.get("health_score", 1.0)
+            fam_service_alarms = family_health.get("service_alarms") or []
+            if (
+                (fam_health_score < _ALERT_HEALTH_THRESHOLD or len(fam_service_alarms) > 0)
+                and (f.get("total_mac_count", 0) or 0) >= _ALARM_MIN_FAMILY_SIZE
+            ):
+                alerts.append({
+                    **f,
+                    "health_score": fam_health_score,
+                    "health_components": family_health.get("components"),
+                    "service_alarms": fam_service_alarms,
+                    "service_health": family_health.get("service_health") or {},
+                })
         if alerts:
             site_alerts.append({
                 "site_id": sid,
@@ -1197,6 +1235,130 @@ async def get_org_alerts(wlan: str = Query(..., description="WLAN (SSID) name to
         "org_alerts": org_alerts,
         "site_alerts": site_alerts,
         "wlan": wlan,
+    }
+
+
+@router.get("/org/alerts-full")
+async def get_org_alerts_full():
+    """
+    Cross-WLAN aggregation of /org/alerts.
+
+    Enumerates every WLAN with events in the retention window, then applies the
+    same dual-gate (family-level anomaly + unhealthy + min family size) used by
+    /org/alerts against each WLAN's org findings and per-site findings/health.
+
+    Every returned alert carries a `wlan` field so the UI can display which SSID
+    the alarm fired on. `site_alerts` is grouped first by site, then each site's
+    alert list spans all WLANs (each alert tagged with its own `wlan`).
+
+    This endpoint powers the "Full Alert Summary" tab — the default landing view
+    on the Organization page. It is a pure aggregation of existing Redis state;
+    no Mist API calls beyond the org site map.
+    """
+    if not MIST_ORG_ID or not MIST_API_TOKEN:
+        raise HTTPException(status_code=500, detail="MIST_ORG_ID or MIST_API_TOKEN not configured.")
+
+    from ..webhook_dispatcher import get_alarm_min_family_size, get_health_score_threshold
+    _ALERT_HEALTH_THRESHOLD = get_health_score_threshold()
+    _ALARM_MIN_FAMILY_SIZE = int(get_alarm_min_family_size())
+
+    wlans = await get_wlans(site_id=None)
+
+    redis_client = _get_redis()
+    try:
+        try:
+            site_map = await _get_org_site_map(redis_client)
+        except Exception:
+            raise HTTPException(status_code=502, detail="Could not reach Mist API")
+
+        sites_sorted = sorted(site_map.items(), key=lambda x: x[1].lower())
+
+        # One pipelined read across every (site, wlan) pair plus every org-wide
+        # findings key. Each WLAN contributes 2*len(sites) + 1 reads to the pipeline.
+        pipe = redis_client.pipeline()
+        for wlan in wlans:
+            for sid, _ in sites_sorted:
+                pipe.get(_findings_redis_key(sid, wlan))
+                pipe.get(_health_redis_key(sid, wlan))
+            pipe.get(_org_findings_redis_key(wlan))
+        pipeline_results = await pipe.execute() if wlans else []
+    finally:
+        await redis_client.aclose()
+
+    n_sites = len(sites_sorted)
+    stride = n_sites * 2 + 1
+
+    org_alerts: list[dict] = []
+    # site_id -> list of alert dicts (each tagged with its wlan)
+    site_alerts_by_site: dict[str, list[dict]] = {sid: [] for sid, _ in sites_sorted}
+
+    for wi, wlan in enumerate(wlans):
+        base = wi * stride
+        findings_by_site: dict[str, list] = {}
+        health_by_site: dict[str, dict] = {}
+        for i, (sid, _) in enumerate(sites_sorted):
+            raw_f = pipeline_results[base + i * 2]
+            raw_h = pipeline_results[base + i * 2 + 1]
+            findings_by_site[sid] = json.loads(raw_f) if raw_f else []
+            health_by_site[sid] = json.loads(raw_h) if raw_h else {}
+        raw_org = pipeline_results[base + n_sites * 2]
+        org_findings_for_wlan = json.loads(raw_org) if raw_org else []
+
+        # Org-wide alerts for this WLAN (same gate as /org/alerts)
+        for f in org_findings_for_wlan:
+            unhealthy = (
+                f.get("health_score", 1.0) < _ALERT_HEALTH_THRESHOLD
+                or len(f.get("service_alarms") or []) > 0
+            )
+            anomalous = (
+                f.get("is_family_outlier")
+                or f.get("is_family_dbscan_outlier")
+                or f.get("is_family_markov_outlier")
+            )
+            meets_floor = (f.get("total_mac_count", 0) or 0) >= _ALARM_MIN_FAMILY_SIZE
+            if unhealthy and anomalous and meets_floor:
+                tagged = {**f, "wlan": f.get("wlan") or wlan}
+                for sa in tagged.get("sites_affected", []):
+                    sa["site_name"] = site_map.get(sa["site_id"], sa["site_id"])
+                org_alerts.append(tagged)
+
+        # Per-site alerts for this WLAN
+        for sid, _ in sites_sorted:
+            findings = findings_by_site[sid]
+            health = health_by_site[sid]
+            for f in findings:
+                family_health = health.get(f.get("device_family"), {})
+                fam_health_score = family_health.get("health_score", 1.0)
+                fam_service_alarms = family_health.get("service_alarms") or []
+                unhealthy = (
+                    fam_health_score < _ALERT_HEALTH_THRESHOLD
+                    or len(fam_service_alarms) > 0
+                )
+                meets_floor = (f.get("total_mac_count", 0) or 0) >= _ALARM_MIN_FAMILY_SIZE
+                if unhealthy and meets_floor:
+                    site_alerts_by_site[sid].append({
+                        **f,
+                        "wlan": f.get("wlan") or wlan,
+                        "health_score": fam_health_score,
+                        "health_components": family_health.get("components"),
+                        "service_alarms": fam_service_alarms,
+                        "service_health": family_health.get("service_health") or {},
+                    })
+
+    site_alerts = []
+    for sid, site_name in sites_sorted:
+        alerts = site_alerts_by_site.get(sid, [])
+        if alerts:
+            site_alerts.append({
+                "site_id": sid,
+                "site_name": site_name,
+                "alerts": alerts,
+            })
+
+    return {
+        "org_alerts": org_alerts,
+        "site_alerts": site_alerts,
+        "wlans": wlans,
     }
 
 
@@ -2244,7 +2406,6 @@ async def trigger_family_tshoot(
     site_id: str,
     family: str,
     wlan: str = Query(..., description="WLAN (SSID) name to scope results to. Required."),
-    _: None = Depends(require_auth),
 ):
     """
     Manually trigger a Mist client TSHOOT for the worst-health MACs in a device family.

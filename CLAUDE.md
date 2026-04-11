@@ -1018,8 +1018,10 @@ helper if the shape needs to change.
 **Org-scope payload** differs in three ways:
 - `"scope": "org"`, `"site_id": null`
 - Each finding adds `"site_count"` and `"sites_affected": [...]`
-- `worst_health_macs` and `marvis_tshoot` are **omitted** (org-wide scoring doesn't compute
-  per-MAC worst-health lists; TSHOOT only enriches site-scope findings).
+- `worst_health_macs` and `marvis_tshoot` are included, and each entry carries its
+  own `site_id` so the consumer can correlate a troubled MAC with the specific site
+  it lives at (TSHOOT is dispatched per-MAC against that site). `score_org_wide` picks
+  the top 3 worst-health MACs across the family's org-wide population.
 
 **Service-account family findings** add two conditional fields when
 `family_kind == "service_account"`:

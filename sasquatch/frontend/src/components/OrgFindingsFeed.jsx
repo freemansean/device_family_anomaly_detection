@@ -18,8 +18,8 @@ const HEALTH_BG    = "#2a2015";
 const SA_COLOR = "#d4a06a";
 const SA_BG    = "#2a1f15";
 
-// Default — overridden at runtime by anomaly-config endpoint
-const HEALTH_THRESHOLD_DEFAULT = 0.75;
+// Default — overridden at runtime by general-config endpoint
+const HEALTH_THRESHOLD_DEFAULT = 0.80;
 
 const PATTERN_LABELS = {
   dhcp_discard_loop: "DHCP Discard Loop",
@@ -263,7 +263,9 @@ export default function OrgFindingsFeed({ apiBase, onMacSiteSelect, refreshToken
   const [selectedFamily, setSelectedFamily] = useState(null);
 
   useEffect(() => {
-    apiFetch(`${apiBase}/api/v1/anomaly-config`).then(r => r.json())
+    // Health score threshold lives under general-config (gates alarm
+    // generation, not detection).
+    apiFetch(`${apiBase}/api/v1/general-config`).then(r => r.json())
       .then(cfg => { if (cfg.anomaly_health_score_threshold != null) setHealthThreshold(cfg.anomaly_health_score_threshold); })
       .catch(() => {});
   }, [apiBase]);
@@ -303,16 +305,19 @@ export default function OrgFindingsFeed({ apiBase, onMacSiteSelect, refreshToken
   if (loading) return <div style={{ color: "#888" }}>Loading findings…</div>;
   if (error)   return <div style={{ color: "#e05555" }}>Error: {error}</div>;
 
-  // Partition findings into 4 detector classes (priority order to avoid duplication)
-  // IF Centroid: whole-family centroid flagged by IF/cosine-distance
-  const ifCentroidFindings = findings.filter(f => f.is_family_outlier);
-  // DBSCAN: family noise ratio above threshold, not already in IF Centroid
-  const dbscanFindings     = findings.filter(f => f.is_family_dbscan_outlier && !f.is_family_outlier);
-  // Markov: family event-chain anomaly ratio above threshold, not already in IF or DBSCAN
-  const markovFindings     = findings.filter(f => f.is_family_markov_outlier && !f.is_family_outlier && !f.is_family_dbscan_outlier);
-  // Catch-all for findings driven by per-MAC IF without a family-level flag (fold into IF section)
-  const ifDeviceFindings   = findings.filter(f => !f.is_family_outlier && !f.is_family_dbscan_outlier && !f.is_family_markov_outlier);
-  const ifSectionFindings  = [...ifCentroidFindings, ...ifDeviceFindings];
+  // Unified flat list: sort by (alert-first, severity, outlier_ratio desc).
+  // Detector method is conveyed via per-card badges (Centroid / DBSCAN / Markov) —
+  // no section-header grouping by detector.
+  const SEVERITY_RANK = { significant: 0, moderate: 1, minimal: 2 };
+  const sortedFindings = [...findings].sort((a, b) => {
+    const aAlert = (a.health_score ?? 1.0) < healthThreshold ? 0 : 1;
+    const bAlert = (b.health_score ?? 1.0) < healthThreshold ? 0 : 1;
+    if (aAlert !== bAlert) return aAlert - bAlert;
+    const aSev = SEVERITY_RANK[a.severity] ?? 99;
+    const bSev = SEVERITY_RANK[b.severity] ?? 99;
+    if (aSev !== bSev) return aSev - bSev;
+    return (b.outlier_ratio ?? 0) - (a.outlier_ratio ?? 0);
+  });
 
   // GENERAL HEALTH: unhealthy families from org insights NOT in any anomaly finding
   const findingFamilies = new Set(findings.map(f => f.device_family));
@@ -324,27 +329,10 @@ export default function OrgFindingsFeed({ apiBase, onMacSiteSelect, refreshToken
     )
     .sort(([, a], [, b]) => a.health_score - b.health_score);
 
-  const hasAnything = ifSectionFindings.length > 0 || dbscanFindings.length > 0 || markovFindings.length > 0 || healthOnlyFamilies.length > 0;
+  const hasAnything = sortedFindings.length > 0 || healthOnlyFamilies.length > 0;
 
   if (!hasAnything) {
     return <div style={{ color: "#2d7a4f", padding: "20px" }}>No anomalies detected across the organization.</div>;
-  }
-
-  const IF_COLOR     = "#b06ad4";
-  const DBSCAN_COLOR = "#5ab86c";
-  const MARKOV_COLOR = "#4ab0e8";
-
-  function renderFindingCards(list, prefix) {
-    return list.map((finding, idx) => (
-      <AnomalyFindingCard
-        key={`${prefix}-${idx}`}
-        finding={finding}
-        healthComponents={familyInsights[finding.device_family]?.health_components ?? null}
-        isAlert={(finding.health_score ?? 1.0) < healthThreshold}
-        healthThreshold={healthThreshold}
-        onFamilyClick={() => setSelectedFamily(finding.device_family)}
-      />
-    ));
   }
 
   return (
@@ -358,33 +346,18 @@ export default function OrgFindingsFeed({ apiBase, onMacSiteSelect, refreshToken
         Org Anomaly Findings — {findings.length} active
       </h2>
 
-      {/* IF CENTROID — whole-family centroid outlier (+ per-device IF catch-all) */}
-      {ifSectionFindings.length > 0 && (
-        <div>
-          <SectionHeader label="CENTROID" color={IF_COLOR} count={ifSectionFindings.length} />
-          <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
-            {renderFindingCards(ifSectionFindings, "if")}
-          </div>
-        </div>
-      )}
-
-      {/* DBSCAN — % of device family are site-wide behavioral outliers */}
-      {dbscanFindings.length > 0 && (
-        <div>
-          <SectionHeader label="DBSCAN" color={DBSCAN_COLOR} count={dbscanFindings.length} />
-          <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
-            {renderFindingCards(dbscanFindings, "dbscan")}
-          </div>
-        </div>
-      )}
-
-      {/* MARKOV — % of device family have anomalous event-chain patterns */}
-      {markovFindings.length > 0 && (
-        <div>
-          <SectionHeader label="MARKOV" color={MARKOV_COLOR} count={markovFindings.length} />
-          <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
-            {renderFindingCards(markovFindings, "markov")}
-          </div>
+      {sortedFindings.length > 0 && (
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(480px, 1fr))", gap: "10px", marginTop: "10px" }}>
+          {sortedFindings.map((finding, idx) => (
+            <AnomalyFindingCard
+              key={`f-${idx}`}
+              finding={finding}
+              healthComponents={familyInsights[finding.device_family]?.health_components ?? null}
+              isAlert={(finding.health_score ?? 1.0) < healthThreshold}
+              healthThreshold={healthThreshold}
+              onFamilyClick={() => setSelectedFamily(finding.device_family)}
+            />
+          ))}
         </div>
       )}
 
@@ -392,7 +365,7 @@ export default function OrgFindingsFeed({ apiBase, onMacSiteSelect, refreshToken
       {healthOnlyFamilies.length > 0 && (
         <div>
           <SectionHeader label="GENERAL HEALTH" color={HEALTH_COLOR} count={healthOnlyFamilies.length} />
-          <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(480px, 1fr))", gap: "10px" }}>
             {healthOnlyFamilies.map(([fam, data]) => (
               <HealthOnlyCard key={fam} family={fam} data={data} />
             ))}

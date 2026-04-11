@@ -108,9 +108,19 @@ export default function OrgOverview({ apiBase, onSiteSelect, onMacSiteSelect, re
   const [summary, setSummary]       = useState(null);
   const [loading, setLoading]       = useState(true);
   const [error, setError]           = useState(null);
-  const [activeView, setActiveView] = useState("alerts");
+  const [activeView, setActiveView] = useState("full-alerts");
 
   useEffect(() => {
+    // /org/summary requires a WLAN. When none is selected (e.g. on first
+    // paint before the auto-select effect resolves) skip the fetch — the
+    // Full Alert Summary tab uses its own cross-WLAN endpoint and does not
+    // depend on this summary payload.
+    if (!wlan) {
+      setLoading(false);
+      setSummary(null);
+      onLoaded?.();
+      return;
+    }
     setLoading(true);
     setError(null);
     apiFetch(`${apiBase}/api/v1/org/summary?wlan=${encodeURIComponent(wlan)}`)
@@ -138,12 +148,19 @@ export default function OrgOverview({ apiBase, onSiteSelect, onMacSiteSelect, re
 
   return (
     <div>
-      {/* View toggle */}
-      <div style={{ display: "flex", gap: "8px", marginBottom: "18px" }}>
-        {["alerts", "overview", "insights", "findings"].map(view => {
-          const label = view === "alerts" ? "Org Alerts" : view === "overview" ? "Org Overview" : view === "insights" ? "Org Family Insights" : "Org Findings";
+      {/* View toggle. "full-alerts" aggregates across every WLAN in the
+          retention window and is the default landing tab. The other four tabs
+          are WLAN-scoped and reflect the selection in the WLAN dropdown. */}
+      <div style={{ display: "flex", gap: "8px", marginBottom: "18px", flexWrap: "wrap" }}>
+        {["full-alerts", "alerts", "overview", "insights", "findings"].map(view => {
+          const label =
+            view === "full-alerts" ? "Full Alert Summary" :
+            view === "alerts"      ? "Org WLAN Alerts" :
+            view === "overview"    ? "Org WLAN Overview" :
+            view === "insights"    ? "Org WLAN Family Insights" :
+                                     "Org WLAN Findings";
           const active = activeView === view;
-          const isAlertTab = view === "alerts";
+          const isAlertTab = view === "alerts" || view === "full-alerts";
           const activeColor  = isAlertTab ? "#e05555" : "#7ec8e3";
           const activeBg     = isAlertTab ? "#2a1515" : "#0d2a38";
           return (
@@ -166,6 +183,10 @@ export default function OrgOverview({ apiBase, onSiteSelect, onMacSiteSelect, re
           );
         })}
       </div>
+
+      {activeView === "full-alerts" && (
+        <OrgAlerts apiBase={apiBase} onMacSiteSelect={onMacSiteSelect} refreshToken={refreshToken} wlan={wlan} detectionInProgress={detectionInProgress} fullScope={true} />
+      )}
 
       {activeView === "alerts" && (
         <OrgAlerts apiBase={apiBase} onMacSiteSelect={onMacSiteSelect} refreshToken={refreshToken} wlan={wlan} detectionInProgress={detectionInProgress} />

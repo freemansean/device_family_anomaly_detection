@@ -37,6 +37,13 @@ DEFAULTS = {
         # detection pipeline itself. Applies to both webhook dispatch and the
         # OrgAlerts UI feed. Set to 1 to disable (default — every family eligible).
         "alarm_min_family_size": {"default": 1, "env": "ALARM_MIN_FAMILY_SIZE", "cast": int},
+        # Health score threshold for dual-gate alarm generation. Device families
+        # with health_score below this value are considered degraded and — if also
+        # flagged by any family-level anomaly detector — trigger an alert via the
+        # webhook dispatcher and the OrgAlerts UI feed. Lives under General Config
+        # (alongside alarm_min_family_size) because it gates alarm generation at
+        # both org and site level, not the anomaly detection pipeline itself.
+        "anomaly_health_score_threshold": {"default": 0.80, "env": "ANOMALY_HEALTH_SCORE_THRESHOLD", "cast": float},
         # RSSI floor (dBm) below which *failure* events are discarded during
         # enrichment. Clients at the fringe of RF coverage generate auth/roam
         # failure events that reflect poor signal, not device-level behavior —
@@ -78,8 +85,6 @@ DEFAULTS = {
         "anomaly_finding_threshold": {"default": 0.2, "env": "ANOMALY_FINDING_THRESHOLD", "cast": float},
         # Min family size for site-level finding generation
         "anomaly_finding_min_size": {"default": 2, "env": "ANOMALY_FINDING_MIN_SIZE", "cast": int},
-        # Health score threshold for dual-gate webhook dispatch
-        "anomaly_health_score_threshold": {"default": 0.80, "env": "ANOMALY_HEALTH_SCORE_THRESHOLD", "cast": float},
         # Markov: fraction of family clients that must be outliers
         "markov_family_outlier_ratio": {"default": 0.5, "env": "MARKOV_FAMILY_OUTLIER_RATIO", "cast": float},
         # Markov: min episode length

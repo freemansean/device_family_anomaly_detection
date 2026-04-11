@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from "react";
 import { apiFetch } from "../api";
+import FamilyDrilldown from "./FamilyDrilldown";
 
 // Anomaly severity — green spectrum (anomalies alone are not actionable alerts)
 const ANOMALY_COLOR = { significant: "#39e84e", moderate: "#2eb845", minimal: "#1a6b27" };
@@ -17,88 +18,14 @@ const HEALTH_BG    = "#2a2015";
 const SA_COLOR = "#d4a06a";
 const SA_BG    = "#2a1f15";
 
-// Default — overridden at runtime by anomaly-config endpoint
-const HEALTH_THRESHOLD_DEFAULT = 0.75;
-
-function shapleyScoreFromCentroidDist(dist) {
-  // Cosine distance on L2-normalized unit vectors ranges 0 (identical) to 2 (opposite).
-  // In practice healthy families sit near 0 and flagged families exceed ~0.35.
-  // Map linearly to 0–100 with 0 dist → 0 and 1.0 dist → 100.
-  if (dist == null) return null;
-  return Math.max(0, Math.min(100, Math.round(dist * 100)));
-}
-
-function shapleyColor(score) {
-  if (score >= 60) return ANOMALY_COLOR.significant;
-  if (score >= 35) return ANOMALY_COLOR.moderate;
-  return ANOMALY_COLOR.minimal;
-}
+// Default — overridden at runtime by general-config endpoint
+const HEALTH_THRESHOLD_DEFAULT = 0.80;
 
 function healthScoreColor(score) {
   if (score >= 0.85) return "#2d7a4f";
   if (score >= 0.75) return "#e0a835";
   if (score >= 0.55) return "#c87832";
   return "#e05555";
-}
-
-function ShapleyBlock({ label, score, features, description }) {
-  const color = score != null ? shapleyColor(score) : "#666";
-  return (
-    <div style={{
-      background: "#0e0e0e",
-      border: `1px solid ${color}33`,
-      borderLeft: `3px solid ${color}`,
-      borderRadius: "3px",
-      padding: "10px 12px",
-      marginBottom: "10px",
-    }}>
-      <div style={{ display: "flex", alignItems: "center", gap: "12px", marginBottom: "6px" }}>
-        <span style={{ fontSize: "11px", color: "#666", fontWeight: "normal", textTransform: "uppercase", letterSpacing: "0.06em" }}>
-          {label}
-        </span>
-        {score != null && (
-          <div style={{ display: "flex", alignItems: "center", gap: "8px", flex: 1 }}>
-            <div style={{ flex: 1, height: "6px", background: "#1a1a1a", borderRadius: "3px", overflow: "hidden" }}>
-              <div style={{ width: `${score}%`, height: "100%", background: color, borderRadius: "3px", transition: "width 0.4s ease" }} />
-            </div>
-            <span style={{ fontSize: "13px", fontWeight: "bold", color, minWidth: "36px", textAlign: "right" }}>
-              {score}<span style={{ fontSize: "10px", color: "#555" }}>/100</span>
-            </span>
-          </div>
-        )}
-        {score == null && (
-          <span style={{ fontSize: "11px", color: "#444" }}>score unavailable</span>
-        )}
-      </div>
-      {description && (
-        <div style={{ fontSize: "11px", color: "#555", marginBottom: features?.length > 0 ? "6px" : 0 }}>
-          {description}
-        </div>
-      )}
-      {features?.length > 0 && (
-        <div style={{ display: "flex", flexDirection: "column", gap: "3px" }}>
-          {features.slice(0, 4).map((f, i) => {
-            const delta = Math.abs(f.outlier_mean - f.baseline_mean);
-            const barWidth = Math.min(delta * 400, 100);
-            return (
-              <div key={i} style={{ display: "flex", alignItems: "center", gap: "8px" }}>
-                <span style={{ fontSize: "10px", color: "#777", width: "220px", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flexShrink: 0 }}
-                  title={f.feature}>
-                  {f.feature}
-                </span>
-                <div style={{ flex: 1, height: "5px", background: "#1a1a1a", borderRadius: "2px", overflow: "hidden" }}>
-                  <div style={{ width: `${barWidth}%`, height: "100%", background: color + "99", borderRadius: "2px" }} />
-                </div>
-                <span style={{ fontSize: "10px", color: color, minWidth: "42px", textAlign: "right" }}>
-                  +{delta.toFixed(3)}
-                </span>
-              </div>
-            );
-          })}
-        </div>
-      )}
-    </div>
-  );
 }
 
 const PATTERN_LABELS = {
@@ -114,7 +41,7 @@ const PATTERN_LABELS = {
   family_behavioral_outlier: "Family-Wide Outlier",
 };
 
-function SectionHeader({ label, color, count }) {
+function SectionHeader({ label, color, count, subtitle }) {
   return (
     <div style={{
       display: "flex",
@@ -138,17 +65,175 @@ function SectionHeader({ label, color, count }) {
         {label}
       </span>
       <span style={{ color: "#444", fontSize: "11px" }}>{count} {count === 1 ? "family" : "families"}</span>
+      {subtitle && <span style={{ color: "#333", fontSize: "11px" }}>· {subtitle}</span>}
     </div>
   );
 }
 
-function AnomalyFindingCard({ finding, healthData, isAlert, expanded, onToggle, onMacSelect, healthThreshold }) {
+// Dedicated alert card for the top-of-page SITE ALERTS section. Mirrors the
+// shape of OrgAlerts.jsx's AlertCard so a site alert and an org alert look
+// the same. Cross-references the separately-fetched site /health endpoint
+// for health_score / components, since per-site finding records don't carry
+// those fields directly.
+function SiteAlertCard({ finding, healthData, onMacSelect, onFamilyClick }) {
+  const sev = finding.severity;
+  const hs  = healthData?.health_score ?? null;
+  const components = healthData?.components ?? null;
+
+  const failureComponents = components
+    ? Object.entries(components).filter(([, rate]) => rate > 0)
+    : [];
+
+  return (
+    <div style={{
+      border: `1px solid ${ALERT_COLOR}44`,
+      borderLeft: `3px solid ${ALERT_COLOR}`,
+      background: ALERT_BG,
+      borderRadius: "4px",
+      padding: "12px 14px",
+    }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
+        <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: "6px" }}>
+          <span style={{
+            background: ALERT_COLOR + "33",
+            color: ALERT_COLOR,
+            padding: "2px 8px",
+            borderRadius: "3px",
+            fontSize: "11px",
+            fontWeight: "bold",
+            border: `1px solid ${ALERT_COLOR}55`,
+          }}>
+            ALERT
+          </span>
+          <button
+            onClick={onFamilyClick}
+            style={{ fontWeight: "bold", fontSize: "14px", color: "#7ec8e3", background: "none", border: "none", cursor: "pointer", padding: 0, textDecoration: "underline", textDecorationColor: "#7ec8e344" }}
+          >
+            {finding.family_kind === "service_account" && finding.service_account_label
+              ? finding.service_account_label
+              : finding.device_family}
+          </button>
+          {finding.family_kind === "service_account" && (
+            <span
+              style={{ background: SA_BG, color: SA_COLOR, border: `1px solid ${SA_COLOR}55`, borderRadius: "3px", padding: "2px 7px", fontSize: "10px", fontWeight: "bold", letterSpacing: "0.05em" }}
+              title={
+                finding.service_account_member_families?.length
+                  ? `Service account spanning: ${finding.service_account_member_families.join(", ")}`
+                  : "Service account (shared username across multiple devices)"
+              }
+            >
+              SVC ACCT{finding.service_account_member_families?.length ? ` · ${finding.service_account_member_families.length} families` : ""}
+            </span>
+          )}
+          <span style={{ color: "#666", fontSize: "12px" }}>
+            {PATTERN_LABELS[finding.probable_pattern] || finding.probable_pattern}
+          </span>
+          {finding.wlan && (
+            <span style={{ background: "#1a2a1a", color: "#7aaa7a", border: "1px solid #3a6a3a", borderRadius: "3px", padding: "2px 7px", fontSize: "10px" }}>
+              {finding.wlan}
+            </span>
+          )}
+          {finding.is_family_outlier && (
+            <span style={{ background: "#2a1a3a", color: "#b06ad4", border: "1px solid #6a3a8a", borderRadius: "3px", padding: "2px 7px", fontSize: "10px" }}
+              title="Centroid IF/distance: whole family's collective behavior differs from healthy reference">
+              Centroid
+            </span>
+          )}
+          {finding.is_family_dbscan_outlier && (
+            <span style={{ background: "#1a2a1a", color: "#5ab86c", border: "1px solid #2a6a3a", borderRadius: "3px", padding: "2px 7px", fontSize: "10px" }}
+              title={`DBSCAN: ${finding.dbscan_family_noise_ratio != null ? (finding.dbscan_family_noise_ratio * 100).toFixed(0) + "%" : ""} of family MACs are site-wide behavioral outliers`}>
+              DBSCAN {finding.dbscan_family_noise_ratio != null ? `${(finding.dbscan_family_noise_ratio * 100).toFixed(0)}%` : ""}
+            </span>
+          )}
+          {finding.is_family_markov_outlier && (
+            <span style={{ background: "#1a2a3a", color: "#4ab0e8", border: "1px solid #2a6a8a", borderRadius: "3px", padding: "2px 7px", fontSize: "10px" }}
+              title={`Markov ${finding.markov_family_reason || "anomaly"}: ${finding.markov_family_anomalous_count ?? ""}/${finding.markov_evaluatable_count ?? ""} clients flagged${finding.markov_family_anomaly_ratio != null ? ` (${(finding.markov_family_anomaly_ratio * 100).toFixed(0)}%)` : ""}`}>
+              Markov {finding.markov_family_reason || "chain"}
+            </span>
+          )}
+        </div>
+        <div style={{ textAlign: "right", fontSize: "12px", marginLeft: "10px", flexShrink: 0 }}>
+          <div style={{ whiteSpace: "nowrap" }}>
+            <span style={{ color: "#ccc", fontWeight: "bold" }}>
+              {finding.affected_mac_count}/{finding.total_mac_count}
+            </span>
+            <span style={{ color: "#555" }}> devices</span>
+          </div>
+          {hs != null && (
+            <div style={{ whiteSpace: "nowrap", marginTop: "3px" }}>
+              <span style={{ color: "#555" }}>health </span>
+              <span style={{ color: healthScoreColor(hs), fontWeight: "bold" }}>
+                {(hs * 100).toFixed(0)}%
+              </span>
+            </div>
+          )}
+          {failureComponents.length > 0 && (
+            <div style={{ marginTop: "3px", display: "flex", flexDirection: "column", alignItems: "flex-end", gap: "1px" }}>
+              {failureComponents.map(([cat, rate]) => (
+                <span key={cat} style={{ fontSize: "10px", color: rate > 0.1 ? HEALTH_COLOR : "#666", whiteSpace: "nowrap" }}>
+                  {cat} {(rate * 100).toFixed(0)}% fail
+                </span>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* Top contributing features */}
+      {finding.top_features?.length > 0 && (
+        <div style={{ marginTop: "8px", display: "flex", gap: "6px", flexWrap: "wrap" }}>
+          {finding.top_features.slice(0, 3).map((f, fi) => (
+            <span
+              key={fi}
+              title={`Outlier mean: ${f.outlier_mean.toFixed(3)} vs baseline: ${f.baseline_mean.toFixed(3)}`}
+              style={{ background: "#222", border: "1px solid #333", borderRadius: "3px", padding: "2px 7px", fontSize: "11px", color: "#999" }}
+            >
+              {f.feature} <span style={{ color: ANOMALY_COLOR[sev] }}>↑{Math.abs(f.outlier_mean - f.baseline_mean).toFixed(3)}</span>
+            </span>
+          ))}
+        </div>
+      )}
+
+      {/* Worst-health MACs — clickable since we're at site scope */}
+      {finding.worst_health_macs?.length > 0 && (
+        <div style={{ marginTop: "10px" }}>
+          <div style={{ color: "#555", fontSize: "11px", marginBottom: "5px" }}>Worst-health devices</div>
+          <div style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
+            {finding.worst_health_macs.map(({ mac, health_score, health_components }) => {
+              const worstCat = Object.entries(health_components || {}).sort(([, a], [, b]) => b - a)[0];
+              return (
+                <div key={mac} style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                  <button
+                    onClick={() => onMacSelect(mac)}
+                    style={{ background: "#1a1a2e", border: "1px solid #2a2a5e", color: "#7ec8e3", borderRadius: "3px", padding: "3px 10px", cursor: "pointer", fontSize: "12px", fontFamily: "monospace" }}
+                  >
+                    {mac}
+                  </button>
+                  <span style={{ color: healthScoreColor(health_score), fontSize: "11px", fontWeight: "bold" }}>
+                    {(health_score * 100).toFixed(0)}%
+                  </span>
+                  {worstCat && (
+                    <span style={{ color: "#666", fontSize: "10px" }}>
+                      {worstCat[0]} {(worstCat[1] * 100).toFixed(0)}% fail
+                    </span>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function AnomalyFindingCard({ finding, healthData, onFamilyClick, healthThreshold }) {
   const sev        = finding.severity;
   const hs         = healthData?.health_score ?? null;
   const components = healthData?.components ?? null;
   const isUnhealthy = hs != null && hs < healthThreshold;
-  const cardColor  = isAlert ? ALERT_COLOR : ANOMALY_COLOR[sev];
-  const cardBg     = isAlert ? ALERT_BG    : ANOMALY_BG[sev];
+  const cardColor  = ANOMALY_COLOR[sev];
+  const cardBg     = ANOMALY_BG[sev];
 
   // Failure reasons: only categories with > 0% failure rate
   const failureReasons = components
@@ -165,11 +250,6 @@ function AnomalyFindingCard({ finding, healthData, isAlert, expanded, onToggle, 
     }}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
         <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: "6px" }}>
-          {isAlert && (
-            <span style={{ background: ALERT_COLOR + "33", color: ALERT_COLOR, padding: "2px 8px", borderRadius: "3px", fontSize: "11px", fontWeight: "bold", border: `1px solid ${ALERT_COLOR}55` }}>
-              ALERT
-            </span>
-          )}
           <span style={{
             background: ANOMALY_COLOR[sev] + "33",
             color: ANOMALY_COLOR[sev],
@@ -181,11 +261,14 @@ function AnomalyFindingCard({ finding, healthData, isAlert, expanded, onToggle, 
           }}>
             {sev}
           </span>
-          <span style={{ fontWeight: "bold", fontSize: "14px", color: "#ddd" }}>
+          <button
+            onClick={onFamilyClick}
+            style={{ fontWeight: "bold", fontSize: "14px", color: "#7ec8e3", background: "none", border: "none", cursor: "pointer", padding: 0, textDecoration: "underline", textDecorationColor: "#7ec8e344" }}
+          >
             {finding.family_kind === "service_account" && finding.service_account_label
               ? finding.service_account_label
               : finding.device_family}
-          </span>
+          </button>
           {finding.family_kind === "service_account" && (
             <span
               style={{ background: SA_BG, color: SA_COLOR, border: `1px solid ${SA_COLOR}55`, borderRadius: "3px", padding: "2px 7px", fontSize: "10px", fontWeight: "bold", letterSpacing: "0.05em" }}
@@ -262,72 +345,21 @@ function AnomalyFindingCard({ finding, healthData, isAlert, expanded, onToggle, 
         </div>
       </div>
 
-      <div style={{ marginTop: "10px" }}>
-        <ShapleyBlock
-          label="Device Family Behavior Explanation"
-          score={shapleyScoreFromCentroidDist(finding.centroid_dist_score)}
-          features={finding.top_features}
-          description={
-            finding.centroid_dist_score != null
-              ? `Cosine distance from healthy reference ${finding.centroid_dist_score.toFixed(4)} — measures how far this family's collective behavior sits from the healthy-family centroid.`
-              : finding.is_family_outlier
-                ? "This family's collective behavior is flagged as anomalous relative to the healthy-family reference."
-                : "Anomaly driven by individual device deviations within the family."
-          }
-        />
-      </div>
-
-      {isAlert && finding.worst_health_macs?.length > 0 ? (
-        <div style={{ marginTop: "10px" }}>
-          <div style={{ color: "#555", fontSize: "11px", marginBottom: "5px" }}>Worst-health devices</div>
-          <div style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
-            {finding.worst_health_macs.map(({ mac, health_score, health_components }) => {
-              const worstCat = Object.entries(health_components || {}).sort(([, a], [, b]) => b - a)[0];
-              return (
-                <div key={mac} style={{ display: "flex", alignItems: "center", gap: "8px" }}>
-                  <button
-                    onClick={() => onMacSelect(mac)}
-                    style={{ background: "#1a1a2e", border: "1px solid #2a2a5e", color: "#7ec8e3", borderRadius: "3px", padding: "3px 10px", cursor: "pointer", fontSize: "12px", fontFamily: "monospace" }}
-                  >
-                    {mac}
-                  </button>
-                  <span style={{ color: healthScoreColor(health_score), fontSize: "11px", fontWeight: "bold" }}>
-                    {(health_score * 100).toFixed(0)}%
-                  </span>
-                  {worstCat && (
-                    <span style={{ color: "#666", fontSize: "10px" }}>
-                      {worstCat[0]} {(worstCat[1] * 100).toFixed(0)}% fail
-                    </span>
-                  )}
-                </div>
-              );
-            })}
-          </div>
+      {/* Top contributing features */}
+      {finding.top_features?.length > 0 && (
+        <div style={{ marginTop: "8px", display: "flex", gap: "6px", flexWrap: "wrap" }}>
+          {finding.top_features.slice(0, 3).map((f, fi) => (
+            <span
+              key={fi}
+              title={`Outlier mean: ${f.outlier_mean.toFixed(3)} vs baseline: ${f.baseline_mean.toFixed(3)}`}
+              style={{ background: "#222", border: "1px solid #333", borderRadius: "3px", padding: "2px 7px", fontSize: "11px", color: "#999" }}
+            >
+              {f.feature} <span style={{ color: ANOMALY_COLOR[sev] }}>↑{(Math.abs(f.outlier_mean - f.baseline_mean)).toFixed(3)}</span>
+            </span>
+          ))}
         </div>
-      ) : (
-        <>
-          <button
-            onClick={onToggle}
-            style={{ background: "transparent", border: "none", color: "#555", cursor: "pointer", padding: "6px 0 0 0", fontSize: "12px" }}
-          >
-            {expanded ? "▲ Hide affected MACs" : `▼ Show ${finding.example_macs?.length || 0} example MACs`}
-          </button>
-
-          {expanded && finding.example_macs?.length > 0 && (
-            <div style={{ marginTop: "6px", display: "flex", gap: "6px", flexWrap: "wrap" }}>
-              {finding.example_macs.map((mac) => (
-                <button
-                  key={mac}
-                  onClick={() => onMacSelect(mac)}
-                  style={{ background: "#1a1a2e", border: "1px solid #2a2a5e", color: "#7ec8e3", borderRadius: "3px", padding: "3px 10px", cursor: "pointer", fontSize: "12px", fontFamily: "monospace" }}
-                >
-                  {mac}
-                </button>
-              ))}
-            </div>
-          )}
-        </>
       )}
+
     </div>
   );
 }
@@ -372,13 +404,19 @@ export default function FindingsFeed({ siteId, apiBase, onMacSelect, refreshToke
   const [findings, setFindings] = useState([]);
   const [health, setHealth]     = useState({});
   const [healthThreshold, setHealthThreshold] = useState(HEALTH_THRESHOLD_DEFAULT);
+  const [alarmMinFamilySize, setAlarmMinFamilySize] = useState(1);
   const [loading, setLoading]   = useState(true);
   const [error, setError]       = useState(null);
-  const [expanded, setExpanded] = useState({});
+  const [selectedFamily, setSelectedFamily] = useState(null);
 
   useEffect(() => {
-    apiFetch(`${apiBase}/api/v1/anomaly-config`).then(r => r.json())
-      .then(cfg => { if (cfg.anomaly_health_score_threshold != null) setHealthThreshold(cfg.anomaly_health_score_threshold); })
+    // Both anomaly_health_score_threshold and alarm_min_family_size live under
+    // general config — they gate alarm generation, not detection itself.
+    apiFetch(`${apiBase}/api/v1/general-config`).then(r => r.json())
+      .then(cfg => {
+        if (cfg.anomaly_health_score_threshold != null) setHealthThreshold(cfg.anomaly_health_score_threshold);
+        if (cfg.alarm_min_family_size != null) setAlarmMinFamilySize(cfg.alarm_min_family_size);
+      })
       .catch(() => {});
   }, [apiBase]);
 
@@ -402,6 +440,19 @@ export default function FindingsFeed({ siteId, apiBase, onMacSelect, refreshToke
     return () => clearInterval(interval);
   }, [load, refreshToken]);
 
+  if (selectedFamily) {
+    return (
+      <FamilyDrilldown
+        siteId={siteId}
+        family={selectedFamily}
+        apiBase={apiBase}
+        onMacSelect={onMacSelect}
+        onBack={() => setSelectedFamily(null)}
+        wlan={wlan}
+      />
+    );
+  }
+
   if (loading) return <div style={{ color: "#888" }}>Loading findings…</div>;
   if (error)   return <div style={{ color: "#e05555" }}>Error: {error}</div>;
 
@@ -409,17 +460,35 @@ export default function FindingsFeed({ siteId, apiBase, onMacSelect, refreshToke
   // Per-site findings may not have health_score embedded — health endpoint is authoritative.
   const familyHealth      = (family) => health[family] ?? null;
   const familyHealthScore = (family) => health[family]?.health_score ?? 1.0;
+  const familyServiceAlarms = (family) => health[family]?.service_alarms ?? [];
 
-  // Partition findings into 4 detector classes (priority order to avoid duplication)
-  // IF Centroid: whole-family centroid flagged by IF/cosine-distance
-  const ifCentroidFindings = findings.filter(f => f.is_family_outlier);
-  // DBSCAN: family noise ratio above threshold, not already in IF Centroid
-  const dbscanFindings     = findings.filter(f => f.is_family_dbscan_outlier && !f.is_family_outlier);
-  // Markov: family event-chain anomaly ratio above threshold, not already in IF or DBSCAN
-  const markovFindings     = findings.filter(f => f.is_family_markov_outlier && !f.is_family_outlier && !f.is_family_dbscan_outlier);
-  // Catch-all for findings driven by per-MAC IF without a family-level flag (fold into IF section)
-  const ifDeviceFindings   = findings.filter(f => !f.is_family_outlier && !f.is_family_dbscan_outlier && !f.is_family_markov_outlier);
-  const ifSectionFindings  = [...ifCentroidFindings, ...ifDeviceFindings];
+  // Split findings into alerts (matches backend site-alert gate in get_org_alerts)
+  // and the rest. Alerts float to the top as dedicated SITE ALERTS cards; remaining
+  // findings render in the unified flat list below. Within each bucket, sort by
+  // severity then outlier_ratio.
+  //
+  // Site-alert gate mirrors routes.py:get_org_alerts:
+  //   (health_score < threshold OR service_alarms non-empty)
+  //   AND total_mac_count >= alarm_min_family_size
+  // No is_family_outlier requirement — any finding in the list is already anomalous
+  // (centroid, DBSCAN, or Markov). Gating only on centroid would drop Markov-driven
+  // alerts that the backend flags at org level.
+  const SEVERITY_RANK = { significant: 0, moderate: 1, minimal: 2 };
+  const sortFindings = (arr) => [...arr].sort((a, b) => {
+    const aSev = SEVERITY_RANK[a.severity] ?? 99;
+    const bSev = SEVERITY_RANK[b.severity] ?? 99;
+    if (aSev !== bSev) return aSev - bSev;
+    return (b.outlier_ratio ?? 0) - (a.outlier_ratio ?? 0);
+  });
+  const isAlertFinding = (f) => {
+    const unhealthy =
+      familyHealthScore(f.device_family) < healthThreshold
+      || familyServiceAlarms(f.device_family).length > 0;
+    const meetsFloor = (f.total_mac_count ?? 0) >= alarmMinFamilySize;
+    return unhealthy && meetsFloor;
+  };
+  const alertFindings    = sortFindings(findings.filter(isAlertFinding));
+  const sortedFindings   = sortFindings(findings.filter(f => !isAlertFinding(f)));
 
   // GENERAL HEALTH: unhealthy families NOT triggering any anomaly finding
   const findingFamilies = new Set(findings.map(f => f.device_family));
@@ -427,33 +496,10 @@ export default function FindingsFeed({ siteId, apiBase, onMacSelect, refreshToke
     .filter(([fam, data]) => data.health_score < healthThreshold && !findingFamilies.has(fam))
     .sort(([, a], [, b]) => a.health_score - b.health_score);
 
-  const hasAnything = ifSectionFindings.length > 0 || dbscanFindings.length > 0 || markovFindings.length > 0 || healthOnlyFamilies.length > 0;
+  const hasAnything = alertFindings.length > 0 || sortedFindings.length > 0 || healthOnlyFamilies.length > 0;
 
   if (!hasAnything) {
     return <div style={{ color: "#2d7a4f", padding: "20px" }}>No anomalies detected. All device families behaving normally.</div>;
-  }
-
-  function toggleExpand(idx) {
-    setExpanded(prev => ({ ...prev, [idx]: !prev[idx] }));
-  }
-
-  const IF_COLOR     = "#b06ad4";
-  const DBSCAN_COLOR = "#5ab86c";
-  const MARKOV_COLOR = "#4ab0e8";
-
-  function renderFindingCards(list, prefix) {
-    return list.map((finding, idx) => (
-      <AnomalyFindingCard
-        key={`${prefix}-${idx}`}
-        finding={finding}
-        healthData={familyHealth(finding.device_family)}
-        isAlert={familyHealthScore(finding.device_family) < healthThreshold}
-        expanded={expanded[`${prefix}-${idx}`]}
-        onToggle={() => toggleExpand(`${prefix}-${idx}`)}
-        onMacSelect={onMacSelect}
-        healthThreshold={healthThreshold}
-      />
-    ));
   }
 
   return (
@@ -465,34 +511,54 @@ export default function FindingsFeed({ siteId, apiBase, onMacSelect, refreshToke
       )}
       <h2 style={{ fontSize: "15px", color: "#aaa", marginBottom: "4px" }}>
         Anomaly Findings — {findings.length} active
+        {alertFindings.length > 0 && (
+          <span style={{ marginLeft: "10px", background: ALERT_BG, color: ALERT_COLOR, padding: "2px 8px", borderRadius: "3px", fontSize: "11px" }}>
+            {alertFindings.length} {alertFindings.length === 1 ? "alert" : "alerts"}
+          </span>
+        )}
       </h2>
 
-      {/* IF CENTROID — whole-family centroid outlier (+ per-device IF catch-all) */}
-      {ifSectionFindings.length > 0 && (
+      {/* SITE ALERTS — dual-gate (is_family_outlier + unhealthy) lifted to the top */}
+      {alertFindings.length > 0 && (
         <div>
-          <SectionHeader label="CENTROID" color={IF_COLOR} count={ifSectionFindings.length} />
-          <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
-            {renderFindingCards(ifSectionFindings, "if")}
+          <SectionHeader
+            label="SITE ALERTS"
+            color={ALERT_COLOR}
+            count={alertFindings.length}
+            subtitle="device families anomalous and unhealthy at this site"
+          />
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(480px, 1fr))", gap: "10px" }}>
+            {alertFindings.map((finding, idx) => (
+              <SiteAlertCard
+                key={`alert-${idx}`}
+                finding={finding}
+                healthData={familyHealth(finding.device_family)}
+                onMacSelect={onMacSelect}
+                onFamilyClick={() => setSelectedFamily(finding.device_family)}
+              />
+            ))}
           </div>
         </div>
       )}
 
-      {/* DBSCAN — % of device family are site-wide behavioral outliers */}
-      {dbscanFindings.length > 0 && (
+      {sortedFindings.length > 0 && (
         <div>
-          <SectionHeader label="DBSCAN" color={DBSCAN_COLOR} count={dbscanFindings.length} />
-          <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
-            {renderFindingCards(dbscanFindings, "dbscan")}
-          </div>
-        </div>
-      )}
-
-      {/* MARKOV — % of device family have anomalous event-chain patterns */}
-      {markovFindings.length > 0 && (
-        <div>
-          <SectionHeader label="MARKOV" color={MARKOV_COLOR} count={markovFindings.length} />
-          <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
-            {renderFindingCards(markovFindings, "markov")}
+          <SectionHeader
+            label="SITE ANOMALIES"
+            color={ANOMALY_COLOR.moderate}
+            count={sortedFindings.length}
+            subtitle="device families behaving unusually but not unhealthy"
+          />
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(480px, 1fr))", gap: "10px" }}>
+            {sortedFindings.map((finding, idx) => (
+              <AnomalyFindingCard
+                key={`f-${idx}`}
+                finding={finding}
+                healthData={familyHealth(finding.device_family)}
+                onFamilyClick={() => setSelectedFamily(finding.device_family)}
+                healthThreshold={healthThreshold}
+              />
+            ))}
           </div>
         </div>
       )}
@@ -501,7 +567,7 @@ export default function FindingsFeed({ siteId, apiBase, onMacSelect, refreshToke
       {healthOnlyFamilies.length > 0 && (
         <div>
           <SectionHeader label="GENERAL HEALTH" color={HEALTH_COLOR} count={healthOnlyFamilies.length} />
-          <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(480px, 1fr))", gap: "10px" }}>
             {healthOnlyFamilies.map(([fam, data]) => (
               <HealthOnlyCard key={fam} family={fam} data={data} />
             ))}

@@ -48,8 +48,8 @@ PORT=$BACKEND_PORT .venv/bin/uvicorn main:app \
   --app-dir sasquatch \
   --host 0.0.0.0 \
   --port $BACKEND_PORT \
-  --log-level info \
-  > "$LOG_DIR/backend.log" 2>&1 &
+  --log-config sasquatch/log_config.yaml \
+  > "$LOG_DIR/backend.bootstrap.log" 2>&1 &
 echo $! > "$LOG_DIR/backend.pid"
 echo "✓ Backend started (PID $(cat $LOG_DIR/backend.pid)) → logs/backend.log"
 

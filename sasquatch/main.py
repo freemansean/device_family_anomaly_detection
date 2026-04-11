@@ -14,7 +14,6 @@ import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from client_anomaly.api.auth import auth_router
 from client_anomaly.api.routes import router
 from client_anomaly.scheduler import clear_stale_global_lock, create_scheduler
 
@@ -53,7 +52,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.include_router(auth_router)
 app.include_router(router)
 
 
