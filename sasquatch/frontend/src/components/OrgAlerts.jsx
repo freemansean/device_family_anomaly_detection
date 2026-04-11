@@ -128,6 +128,12 @@ function AlertCard({ finding, onFamilyClick }) {
           <span style={{ color: "#666", fontSize: "12px" }}>
             {PATTERN_LABELS[finding.probable_pattern] || finding.probable_pattern}
           </span>
+          {finding.wlan && (
+            <span style={{ background: "#1a2a1a", color: "#7aaa7a", border: "1px solid #3a6a3a", borderRadius: "3px", padding: "2px 7px", fontSize: "10px" }}
+              title={`WLAN: ${finding.wlan}`}>
+              {finding.wlan}
+            </span>
+          )}
           {finding.is_family_outlier && (
             <span style={{ background: "#2a1a3a", color: "#b06ad4", border: "1px solid #6a3a8a", borderRadius: "3px", padding: "2px 7px", fontSize: "10px" }}
               title="Centroid IF/distance: whole family's collective behavior differs from other families">
@@ -241,12 +247,12 @@ function SiteAlertGroup({ siteAlert, onFamilyClick }) {
           {siteAlert.alerts.length} {siteAlert.alerts.length === 1 ? "ALERT" : "ALERTS"}
         </span>
       </div>
-      <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(480px, 1fr))", gap: "8px" }}>
         {siteAlert.alerts.map((alert, idx) => (
           <AlertCard
             key={`${siteAlert.site_id}-${idx}`}
             finding={alert}
-            onFamilyClick={() => onFamilyClick(alert.device_family, siteAlert.site_id)}
+            onFamilyClick={() => onFamilyClick(alert.device_family, siteAlert.site_id, alert.wlan)}
           />
         ))}
       </div>
@@ -254,7 +260,7 @@ function SiteAlertGroup({ siteAlert, onFamilyClick }) {
   );
 }
 
-export default function OrgAlerts({ apiBase, onMacSiteSelect, refreshToken, wlan, detectionInProgress }) {
+export default function OrgAlerts({ apiBase, onMacSiteSelect, refreshToken, wlan, detectionInProgress, fullScope = false }) {
   const [data, setData]               = useState(null);
   const [loading, setLoading]         = useState(true);
   const [error, setError]             = useState(null);
@@ -267,10 +273,15 @@ export default function OrgAlerts({ apiBase, onMacSiteSelect, refreshToken, wlan
 
   const load = useCallback(() => {
     setLoading(true);
-    Promise.all([
-      apiFetch(`${apiBase}/api/v1/org/alerts?wlan=${encodeURIComponent(wlan)}`).then(r => r.json()),
-      apiFetch(`${apiBase}/api/v1/org/alert-history?wlan=${encodeURIComponent(wlan)}&days=7&tz_offset=${new Date().getTimezoneOffset()}`).then(r => r.json()),
-    ])
+    // Full scope aggregates across every WLAN in the retention window. History
+    // is WLAN-scoped and not meaningful in full scope, so it is omitted.
+    const alertsPromise = fullScope
+      ? apiFetch(`${apiBase}/api/v1/org/alerts-full`).then(r => r.json())
+      : apiFetch(`${apiBase}/api/v1/org/alerts?wlan=${encodeURIComponent(wlan)}`).then(r => r.json());
+    const historyPromise = fullScope
+      ? Promise.resolve(null)
+      : apiFetch(`${apiBase}/api/v1/org/alert-history?wlan=${encodeURIComponent(wlan)}&days=7&tz_offset=${new Date().getTimezoneOffset()}`).then(r => r.json());
+    Promise.all([alertsPromise, historyPromise])
       .then(([alertData, histData]) => {
         setData(alertData);
         setHistory(histData);
@@ -278,13 +289,17 @@ export default function OrgAlerts({ apiBase, onMacSiteSelect, refreshToken, wlan
       })
       .catch(e => setError(e.message))
       .finally(() => setLoading(false));
-  }, [apiBase, wlan]);
+  }, [apiBase, wlan, fullScope]);
 
   useEffect(() => {
     load();
   }, [load, refreshToken]);
 
   if (selectedFamily) {
+    // In full-scope mode, each alert carries its own wlan — use that for drilldown
+    // so the per-finding details match the row the user clicked. Otherwise fall
+    // back to the app-level wlan prop.
+    const drilldownWlan = selectedFamily.wlan || wlan;
     if (selectedFamily.siteId) {
       return (
         <FamilyDrilldown
@@ -293,7 +308,7 @@ export default function OrgAlerts({ apiBase, onMacSiteSelect, refreshToken, wlan
           apiBase={apiBase}
           onMacSelect={(mac) => onMacSiteSelect(mac, selectedFamily.siteId)}
           onBack={() => setSelectedFamily(null)}
-          wlan={wlan}
+          wlan={drilldownWlan}
         />
       );
     }
@@ -303,7 +318,7 @@ export default function OrgAlerts({ apiBase, onMacSiteSelect, refreshToken, wlan
         apiBase={apiBase}
         onMacSiteSelect={onMacSiteSelect}
         onBack={() => setSelectedFamily(null)}
-        wlan={wlan}
+        wlan={drilldownWlan}
       />
     );
   }
@@ -334,7 +349,12 @@ export default function OrgAlerts({ apiBase, onMacSiteSelect, refreshToken, wlan
       )}
       <div style={{ marginBottom: "4px" }}>
         <h2 style={{ fontSize: "15px", color: "#aaa", margin: 0 }}>
-          Org Alerts
+          {fullScope ? "Full Alert Summary" : "Org Alerts"}
+          {fullScope && (
+            <span style={{ marginLeft: "10px", color: "#555", fontSize: "11px", fontWeight: "normal" }}>
+              aggregated across all WLANs
+            </span>
+          )}
           {orgAlerts.length > 0 && (
             <span style={{ marginLeft: "10px", background: "#2a1515", color: ALERT_COLOR, padding: "2px 8px", borderRadius: "3px", fontSize: "11px" }}>
               {orgAlerts.length} org-wide
@@ -373,12 +393,12 @@ export default function OrgAlerts({ apiBase, onMacSiteSelect, refreshToken, wlan
             count={orgAlerts.length}
             subtitle="device families anomalous and unhealthy across the organization"
           />
-          <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(480px, 1fr))", gap: "10px" }}>
             {orgAlerts.map((finding, idx) => (
               <AlertCard
                 key={`org-${idx}`}
                 finding={finding}
-                onFamilyClick={() => setSelectedFamily({ family: finding.device_family, siteId: null })}
+                onFamilyClick={() => setSelectedFamily({ family: finding.device_family, siteId: null, wlan: finding.wlan })}
               />
             ))}
           </div>
@@ -428,7 +448,7 @@ export default function OrgAlerts({ apiBase, onMacSiteSelect, refreshToken, wlan
                 <SiteAlertGroup
                   key={siteAlert.site_id}
                   siteAlert={siteAlert}
-                  onFamilyClick={(family, siteId) => setSelectedFamily({ family, siteId })}
+                  onFamilyClick={(family, siteId, alertWlan) => setSelectedFamily({ family, siteId, wlan: alertWlan })}
                 />
               ))}
             </div>
@@ -436,8 +456,9 @@ export default function OrgAlerts({ apiBase, onMacSiteSelect, refreshToken, wlan
         </div>
       )}
 
-      {/* 7-day alert history */}
-      <AlertHistory history={history} />
+      {/* 7-day alert history — only in WLAN-scoped view. History is stored per
+          WLAN and does not aggregate cleanly in full-scope mode. */}
+      {!fullScope && <AlertHistory history={history} />}
     </div>
   );
 }

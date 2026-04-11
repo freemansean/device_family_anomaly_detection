@@ -1,11 +1,10 @@
 import { useState, useEffect, useRef } from "react";
 import FamilyDrilldown from "./components/FamilyDrilldown";
 import FindingsFeed from "./components/FindingsFeed";
-import Login from "./components/Login";
 import MacDrilldown from "./components/MacDrilldown";
 import OrgOverview from "./components/OrgOverview";
 import SiteOverview from "./components/SiteOverview";
-import { apiFetch, getToken, setToken, clearToken } from "./api";
+import { apiFetch } from "./api";
 
 const ORG_FOCUS_VALUE = "__org__";
 
@@ -157,9 +156,13 @@ function OrgCollectProgress({ progress, mode = "full" }) {
   );
 }
 
-function OrgDetectProgress({ progress }) {
+function OrgDetectProgress({ progress, mode = "manual" }) {
   if (!progress || progress.phase === "idle") return null;
   const { phase, current_site, sites_complete, total_sites, org_complete, message } = progress;
+
+  const isHourly = mode === "hourly";
+  const prefix = isHourly ? "Hourly detect" : null;
+  const withPrefix = (s) => (prefix ? `${prefix} — ${s}` : s);
 
   let pct = 0;
   let label = "";
@@ -169,26 +172,29 @@ function OrgDetectProgress({ progress }) {
     // Feature build: 0-30% of the bar
     pct = total_sites > 0 ? Math.min(2 + (sites_complete / total_sites) * 28, 30) : 5;
     label = current_site
-      ? `Building features… ${sites_complete}/${total_sites} sites (${current_site})`
-      : `Building features… ${sites_complete}/${total_sites} sites`;
+      ? withPrefix(`Building features… ${sites_complete}/${total_sites} sites (${current_site})`)
+      : withPrefix(`Building features… ${sites_complete}/${total_sites} sites`);
   } else if (phase === "org_scoring") {
     // Org-wide scoring: 30-55%
     pct = 40;
-    label = "Running org-wide anomaly detection…";
+    label = withPrefix("Running org-wide anomaly detection…");
   } else if (phase === "site_scoring") {
     // Per-site scoring: 55-95%
     pct = total_sites > 0 ? Math.min(55 + (sites_complete / total_sites) * 40, 95) : 60;
     label = current_site
-      ? `Site scoring… ${sites_complete}/${total_sites} (${current_site})${org_complete ? " — org findings ready" : ""}`
-      : `Site scoring… ${sites_complete}/${total_sites}${org_complete ? " — org findings ready" : ""}`;
+      ? withPrefix(`Site scoring… ${sites_complete}/${total_sites} (${current_site})${org_complete ? " — org findings ready" : ""}`)
+      : withPrefix(`Site scoring… ${sites_complete}/${total_sites}${org_complete ? " — org findings ready" : ""}`);
   } else if (phase === "complete") {
     pct = 100;
     color = "#2d7a4f";
-    label = `Done — ${total_sites} sites scored`;
+    label = isHourly
+      ? `Hourly detect done — ${total_sites} sites scored`
+      : `Done — ${total_sites} sites scored`;
   } else if (phase === "error") {
     pct = 100;
     color = "#e05555";
-    label = `Error: ${message || "Pipeline failed"}`;
+    const errPrefix = isHourly ? "Hourly detect error" : "Error";
+    label = `${errPrefix}: ${message || "Pipeline failed"}`;
   }
 
   return (
@@ -202,7 +208,6 @@ function OrgDetectProgress({ progress }) {
 }
 
 export default function App() {
-  const [token, setTokenState] = useState(() => getToken());
   const [sites, setSites] = useState([]); // [{id, name}]
   const [selectedSite, setSelectedSite] = useState(null); // site ID string
   const [selectedMac, setSelectedMac] = useState(null);
@@ -220,6 +225,7 @@ export default function App() {
 
   // WLAN scope
   const [wlans, setWlans] = useState([]); // list of SSID name strings
+  const [wlansFetching, setWlansFetching] = useState(false); // true while /api/v1/wlans is in flight
   const [selectedWlan, setSelectedWlan] = useState(null); // null until WLANs are loaded
   const [wlanLoading, setWlanLoading] = useState(false);
   // Ref so the WLAN fetch effect can read the current selection without it being a dep
@@ -265,6 +271,14 @@ export default function App() {
   // so we don't re-render the same terminal payload after the clear timer fires
   // (the Redis key keeps the `complete`/`error` block for up to 5 minutes).
   const hourlyDismissedStartedAtRef = useRef(null);
+  // Same pattern for the hourly-detect status bar: the auto-chain after a
+  // successful hourly poll writes progress into sasquatch:progress:org_detect,
+  // so we watch the same endpoint but gate rendering on eventPolling +
+  // autoDetect being enabled and dedupe runs by started_at.
+  const [orgHourlyDetectProgress, setOrgHourlyDetectProgress] = useState(null);
+  const hourlyDetectClearTimerRef = useRef(null);
+  const hourlyDetectDismissedStartedAtRef = useRef(null);
+  const hourlyDetectSeenStartedAtRef = useRef(null);
   const [activeOperation, setActiveOperation] = useState(null); // null or operation string from /org/job-status
   const [actionState, setActionState] = useState({
     clientRefresh: "idle", // idle | loading | ok | error
@@ -279,17 +293,7 @@ export default function App() {
     setActionState(prev => ({ ...prev, [key]: val }));
   }
 
-  // Handle token expiry from any component via custom event
   useEffect(() => {
-    function handleUnauthorized() {
-      setTokenState(null);
-    }
-    window.addEventListener("sasquatch:unauthorized", handleUnauthorized);
-    return () => window.removeEventListener("sasquatch:unauthorized", handleUnauthorized);
-  }, []);
-
-  useEffect(() => {
-    if (!token) return;
     apiFetch(`${API_BASE}/api/v1/org/sites`)
       .then((r) => r.json())
       .then((data) => {
@@ -318,11 +322,10 @@ export default function App() {
       .then((r) => r.json())
       .then((data) => setAnomalyConfig(data))
       .catch(console.error);
-  }, [token]);
+  }, []);
 
   // Poll /org/job-status to keep activeOperation in sync (disables buttons when busy)
   useEffect(() => {
-    if (!token) return;
     let cancelled = false;
     async function check() {
       try {
@@ -334,13 +337,12 @@ export default function App() {
     check();
     const iv = setInterval(check, 3000);
     return () => { cancelled = true; clearInterval(iv); };
-  }, [token]);
+  }, []);
 
   // Debounced client MAC search. Fires when macSearch has >= 2 hex chars
   // (matches the backend's minimum). The backend prefix-matches against the
   // clients.mac PRIMARY KEY so this is cheap even on large client caches.
   useEffect(() => {
-    if (!token) return;
     const norm = (macSearch || "").toLowerCase().replace(/[^0-9a-f]/g, "").slice(0, 12);
     if (norm.length < 2) {
       setMacResults([]);
@@ -364,7 +366,7 @@ export default function App() {
       }
     }, 220);
     return () => { cancelled = true; clearTimeout(timer); };
-  }, [macSearch, token]);
+  }, [macSearch]);
 
   // Fetch available WLANs whenever the selected site changes.
   // Auto-select the first WLAN alphabetically. If the previously-selected WLAN
@@ -372,7 +374,8 @@ export default function App() {
   useEffect(() => {
     setWlans([]);
     setSelectedWlan(null);
-    if (!token || !selectedSite) return;
+    if (!selectedSite) return;
+    setWlansFetching(true);
     const url = selectedSite === ORG_FOCUS_VALUE
       ? `${API_BASE}/api/v1/wlans`
       : `${API_BASE}/api/v1/wlans?site_id=${selectedSite}`;
@@ -381,6 +384,7 @@ export default function App() {
       .then((data) => {
         const newWlans = [...(data.wlans || [])].sort();
         setWlans(newWlans);
+        setWlansFetching(false);
         if (newWlans.length === 0) {
           setSelectedWlan(null);
           return;
@@ -401,8 +405,11 @@ export default function App() {
         pendingWlanRef.current = null;
         setSelectedWlan(next);
       })
-      .catch(console.error);
-  }, [token, selectedSite]);
+      .catch((err) => {
+        console.error(err);
+        setWlansFetching(false);
+      });
+  }, [selectedSite]);
 
   // Poll progress while org-wide event collection is running
   useEffect(() => {
@@ -441,7 +448,7 @@ export default function App() {
   // starts (tracked by `started_at`). Flipping the polling toggle off clears
   // the bar immediately.
   useEffect(() => {
-    if (!token || !eventPollingEnabled) {
+    if (!eventPollingEnabled) {
       setOrgHourlyProgress(null);
       if (hourlyClearTimerRef.current) {
         clearTimeout(hourlyClearTimerRef.current);
@@ -500,7 +507,102 @@ export default function App() {
         hourlyClearTimerRef.current = null;
       }
     };
-  }, [token, eventPollingEnabled]);
+  }, [eventPollingEnabled]);
+
+  // Hourly detect status bar — watches /org/detect-progress whenever event
+  // polling AND auto-detect are enabled. The hourly job's auto-chain writes
+  // detect progress into sasquatch:progress:org_detect (same key the manual
+  // detect trigger uses), so we poll the same endpoint and dedupe runs by
+  // started_at. A manual detect run (tracked by orgDetectPolling) takes
+  // precedence — the hourly bar suppresses itself to avoid duplicating the
+  // manual bar for the same underlying run. Terminal phases linger 6 seconds
+  // then clear; dismissed runs are remembered so the residual Redis payload
+  // doesn't re-render the bar.
+  useEffect(() => {
+    if (!eventPollingEnabled || !autoDetectEnabled) {
+      setOrgHourlyDetectProgress(null);
+      if (hourlyDetectClearTimerRef.current) {
+        clearTimeout(hourlyDetectClearTimerRef.current);
+        hourlyDetectClearTimerRef.current = null;
+      }
+      hourlyDetectDismissedStartedAtRef.current = null;
+      hourlyDetectSeenStartedAtRef.current = null;
+      return;
+    }
+    let cancelled = false;
+    async function tick() {
+      if (orgDetectPolling) {
+        // Manual detect owns the bar — the manual effect already polls this
+        // endpoint and drives OrgDetectProgress.
+        return;
+      }
+      try {
+        const r = await apiFetch(`${API_BASE}/api/v1/org/detect-progress`);
+        const data = await r.json();
+        if (cancelled) return;
+        if (!data || data.phase === "idle") {
+          setOrgHourlyDetectProgress(null);
+          return;
+        }
+        // Only surface runs we saw start during this watcher lifetime —
+        // avoids re-displaying a completed manual run's residual payload
+        // when the user flips eventPolling on.
+        const runId = data.started_at ?? null;
+        const isTerminal = data.phase === "complete" || data.phase === "error";
+        if (hourlyDetectSeenStartedAtRef.current == null) {
+          if (isTerminal) {
+            // First payload we see is already terminal — skip, we didn't
+            // witness the run start, so attributing it to the hourly chain
+            // would be a guess.
+            return;
+          }
+          hourlyDetectSeenStartedAtRef.current = runId;
+        } else if (runId !== hourlyDetectSeenStartedAtRef.current) {
+          // A new run started — reset tracking and adopt it.
+          hourlyDetectSeenStartedAtRef.current = runId;
+          hourlyDetectDismissedStartedAtRef.current = null;
+          if (hourlyDetectClearTimerRef.current) {
+            clearTimeout(hourlyDetectClearTimerRef.current);
+            hourlyDetectClearTimerRef.current = null;
+          }
+        }
+        if (
+          isTerminal
+          && hourlyDetectDismissedStartedAtRef.current != null
+          && runId === hourlyDetectDismissedStartedAtRef.current
+        ) {
+          setOrgHourlyDetectProgress(null);
+          return;
+        }
+        setOrgHourlyDetectProgress(data);
+        if (isTerminal) {
+          if (!hourlyDetectClearTimerRef.current) {
+            const dismissedRun = runId;
+            hourlyDetectClearTimerRef.current = setTimeout(() => {
+              if (!cancelled) {
+                hourlyDetectDismissedStartedAtRef.current = dismissedRun;
+                setOrgHourlyDetectProgress(null);
+              }
+              hourlyDetectClearTimerRef.current = null;
+            }, 6000);
+          }
+        } else if (hourlyDetectClearTimerRef.current) {
+          clearTimeout(hourlyDetectClearTimerRef.current);
+          hourlyDetectClearTimerRef.current = null;
+        }
+      } catch { /* ignore transient errors */ }
+    }
+    tick();
+    const iv = setInterval(tick, 3000);
+    return () => {
+      cancelled = true;
+      clearInterval(iv);
+      if (hourlyDetectClearTimerRef.current) {
+        clearTimeout(hourlyDetectClearTimerRef.current);
+        hourlyDetectClearTimerRef.current = null;
+      }
+    };
+  }, [eventPollingEnabled, autoDetectEnabled, orgDetectPolling]);
 
   // Poll progress while org-wide detection is running
   useEffect(() => {
@@ -658,6 +760,7 @@ export default function App() {
       org_detection_interval_hours: 1,
       anomaly_min_mac_events: 5,
       alarm_min_family_size: 1,
+      anomaly_health_score_threshold: 0.80,
     });
     setGeneralConfigSaveState("idle");
   }
@@ -690,7 +793,6 @@ export default function App() {
       anomaly_finding_threshold: 0.2,
       anomaly_min_peers: 3,
       anomaly_centroid_dist_threshold: 0.35,
-      anomaly_health_score_threshold: 0.80,
       markov_family_outlier_ratio: 0.5,
       markov_stuck_loop_threshold: 0.4,
       markov_stuck_loop_min_events: 20,
@@ -718,15 +820,6 @@ export default function App() {
     } catch {
       setAnomalyConfigSaveState("error");
     }
-  }
-
-  function handleLogin(newToken) {
-    setToken(newToken);
-    setTokenState(newToken);
-  }
-
-  if (!token) {
-    return <Login apiBase={API_BASE} onLogin={handleLogin} />;
   }
 
   function handleMacSelect(mac) {
@@ -868,7 +961,7 @@ export default function App() {
                     fontFamily: "monospace",
                   }}
                 >
-                  <option>No WLANs detected yet</option>
+                  <option>{wlansFetching ? "Loading WLANs…" : "No WLANs detected yet"}</option>
                 </select>
               ) : (
                 <select
@@ -941,20 +1034,6 @@ export default function App() {
               }}
             >
               Config
-            </button>
-            <button
-              onClick={() => { clearToken(); setTokenState(null); }}
-              style={{
-                background: "transparent",
-                color: "#555",
-                border: "1px solid #2a2a2a",
-                padding: "4px 10px",
-                borderRadius: "4px",
-                cursor: "pointer",
-                fontSize: "12px",
-              }}
-            >
-              Sign out
             </button>
           </div>
         </div>
@@ -1142,6 +1221,7 @@ export default function App() {
         <OrgCollectProgress progress={orgCollectProgress} />
         <OrgCollectProgress progress={orgHourlyProgress} mode="hourly" />
         <OrgDetectProgress progress={orgDetectProgress} />
+        <OrgDetectProgress progress={orgHourlyDetectProgress} mode="hourly" />
       </header>
 
       {selectedSite && selectedSite !== ORG_FOCUS_VALUE && (view === "overview" || view === "findings") && (
@@ -1172,7 +1252,11 @@ export default function App() {
       )}
       <div style={{ position: "relative" }}>
         {wlanLoading && <WlanLoadingOverlay />}
-        {selectedSite === ORG_FOCUS_VALUE && view === "overview" && selectedWlan && (
+        {selectedSite === ORG_FOCUS_VALUE && view === "overview" && (
+          // Org view renders even without a selected WLAN so the Full Alert
+          // Summary tab (which aggregates across every WLAN) can land as the
+          // default without waiting on the auto-select effect. The other four
+          // tabs still read `wlan` and stay blank until a WLAN is selected.
           <OrgOverview apiBase={API_BASE} onSiteSelect={handleSiteSelect} onMacSiteSelect={handleOrgMacSelect} refreshToken={discoveryRefreshToken} wlan={selectedWlan} onLoaded={() => setWlanLoading(false)} detectionInProgress={orgDetectPolling} />
         )}
         {selectedSite && selectedSite !== ORG_FOCUS_VALUE && view === "overview" && selectedWlan && (
@@ -1273,13 +1357,22 @@ export default function App() {
                 <div style={{ color: "#555", fontSize: "11px", marginTop: "4px" }}>Minimum events a MAC must have in the rolling 24hr window to be included in anomaly scoring. Lower for IoT/device WLANs; raise for high-traffic WLANs.</div>
               </div>
 
-              <div style={{ marginBottom: "24px", paddingBottom: "20px", borderBottom: "1px solid #222" }}>
+              <div style={{ marginBottom: "18px" }}>
                 <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: "5px" }}>
                   <div style={{ color: "#888", fontSize: "11px" }}>MIN FAMILY SIZE FOR ALARM GENERATION</div>
                   <div style={{ color: "#7ec8e3", fontSize: "13px", fontWeight: "bold" }}>{generalConfigDraft.alarm_min_family_size ?? 1} MAC{(generalConfigDraft.alarm_min_family_size ?? 1) === 1 ? "" : "s"}</div>
                 </div>
                 <input type="range" min={1} max={50} value={generalConfigDraft.alarm_min_family_size ?? 1} onChange={(e) => setGeneralConfigDraft(d => ({ ...d, alarm_min_family_size: Number(e.target.value) }))} style={{ width: "100%", accentColor: "#7ec8e3", cursor: "pointer" }} />
                 <div style={{ color: "#555", fontSize: "11px", marginTop: "4px" }}>Suppress alarms for device families whose total MAC count is below this threshold. Findings still appear in the UI, but the OrgAlerts feed and webhook dispatch skip them. Set to 1 to disable (every family eligible).</div>
+              </div>
+
+              <div style={{ marginBottom: "24px", paddingBottom: "20px", borderBottom: "1px solid #222" }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: "5px" }}>
+                  <div style={{ color: "#888", fontSize: "11px" }}>HEALTH SCORE THRESHOLD</div>
+                  <div style={{ color: "#7ec8e3", fontSize: "13px", fontWeight: "bold" }}>{((generalConfigDraft.anomaly_health_score_threshold ?? 0.80) * 100).toFixed(0)}%</div>
+                </div>
+                <input type="range" min={0} max={100} value={Math.round((generalConfigDraft.anomaly_health_score_threshold ?? 0.80) * 100)} onChange={(e) => setGeneralConfigDraft(d => ({ ...d, anomaly_health_score_threshold: Number(e.target.value) / 100 }))} style={{ width: "100%", accentColor: "#7ec8e3", cursor: "pointer" }} />
+                <div style={{ color: "#555", fontSize: "11px", marginTop: "4px" }}>Health score below which a family is considered degraded. Both a family-level anomaly AND health must fail for the dual-gate alarm to fire — this gates both the webhook dispatcher and the OrgAlerts UI feed at org and site level.</div>
               </div>
 
               <div style={{ display: "flex", gap: "10px", justifyContent: "flex-end" }}>
@@ -1351,6 +1444,15 @@ export default function App() {
                 <div style={{ color: "#555", fontSize: "11px", marginTop: "4px" }}>Minimum MACs a family must have to participate in site-wide DBSCAN. Smaller families skip DBSCAN but still go through Isolation Forest.</div>
               </div>
 
+              <div style={{ marginBottom: "18px" }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: "5px" }}>
+                  <div style={{ color: "#888", fontSize: "11px" }}>FINDING THRESHOLD</div>
+                  <div style={{ color: "#7ec8e3", fontSize: "13px", fontWeight: "bold" }}>{(anomalyConfigDraft.anomaly_finding_threshold * 100).toFixed(0)}%</div>
+                </div>
+                <input type="range" min={0} max={100} value={Math.round(anomalyConfigDraft.anomaly_finding_threshold * 100)} onChange={(e) => setAnomalyConfigDraft(d => ({ ...d, anomaly_finding_threshold: Number(e.target.value) / 100 }))} style={{ width: "100%", accentColor: "#7ec8e3", cursor: "pointer" }} />
+                <div style={{ color: "#555", fontSize: "11px", marginTop: "4px" }}>Fraction of DBSCAN-flagged MACs within a family required before a finding is generated for that device family. Lower = more findings. Severity is separate (minimal/moderate/significant).</div>
+              </div>
+
               {/* ── Centroid Detection ── */}
               <div style={{ color: "#555", fontSize: "10px", letterSpacing: "0.08em", marginBottom: "12px", marginTop: "4px" }}>CENTROID DETECTION (INTER-FAMILY)</div>
 
@@ -1363,9 +1465,6 @@ export default function App() {
                 <div style={{ color: "#555", fontSize: "11px", marginTop: "4px" }}>Cosine distance from the healthy-reference centroid above which a family is flagged as a behavioral outlier (is_family_outlier). Higher = less sensitive.</div>
               </div>
 
-              {/* ── Centroid Healthy Ref ── */}
-              <div style={{ color: "#555", fontSize: "10px", letterSpacing: "0.08em", marginBottom: "12px", marginTop: "4px" }}>CENTROID HEALTHY REFERENCE</div>
-
               <div style={{ marginBottom: "18px" }}>
                 <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: "5px" }}>
                   <div style={{ color: "#888", fontSize: "11px" }}>HEALTHY REF THRESHOLD</div>
@@ -1373,30 +1472,6 @@ export default function App() {
                 </div>
                 <input type="range" min={0} max={100} value={Math.round((anomalyConfigDraft.anomaly_centroid_healthy_ref_threshold ?? 0.75) * 100)} onChange={(e) => setAnomalyConfigDraft(d => ({ ...d, anomaly_centroid_healthy_ref_threshold: Number(e.target.value) / 100 }))} style={{ width: "100%", accentColor: "#7ec8e3", cursor: "pointer" }} />
                 <div style={{ color: "#555", fontSize: "11px", marginTop: "4px" }}>Families with mean health above this form the healthy reference pool for centroid detection. Below this they are measured against it, not part of it.</div>
-              </div>
-
-              {/* ── Finding Rollup ── */}
-              <div style={{ color: "#555", fontSize: "10px", letterSpacing: "0.08em", marginBottom: "12px", marginTop: "4px" }}>FINDING ROLLUP</div>
-
-              <div style={{ marginBottom: "18px" }}>
-                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: "5px" }}>
-                  <div style={{ color: "#888", fontSize: "11px" }}>FINDING THRESHOLD</div>
-                  <div style={{ color: "#7ec8e3", fontSize: "13px", fontWeight: "bold" }}>{(anomalyConfigDraft.anomaly_finding_threshold * 100).toFixed(0)}%</div>
-                </div>
-                <input type="range" min={0} max={100} value={Math.round(anomalyConfigDraft.anomaly_finding_threshold * 100)} onChange={(e) => setAnomalyConfigDraft(d => ({ ...d, anomaly_finding_threshold: Number(e.target.value) / 100 }))} style={{ width: "100%", accentColor: "#7ec8e3", cursor: "pointer" }} />
-                <div style={{ color: "#555", fontSize: "11px", marginTop: "4px" }}>Fraction of outlier MACs required before a finding is generated for a device family. Lower = more findings. Severity is separate (minimal/moderate/significant).</div>
-              </div>
-
-              {/* ── Health Score ── */}
-              <div style={{ color: "#555", fontSize: "10px", letterSpacing: "0.08em", marginBottom: "12px", marginTop: "4px" }}>HEALTH SCORE</div>
-
-              <div style={{ marginBottom: "18px" }}>
-                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: "5px" }}>
-                  <div style={{ color: "#888", fontSize: "11px" }}>HEALTH SCORE THRESHOLD</div>
-                  <div style={{ color: "#7ec8e3", fontSize: "13px", fontWeight: "bold" }}>{(anomalyConfigDraft.anomaly_health_score_threshold * 100).toFixed(0)}%</div>
-                </div>
-                <input type="range" min={0} max={100} value={Math.round(anomalyConfigDraft.anomaly_health_score_threshold * 100)} onChange={(e) => setAnomalyConfigDraft(d => ({ ...d, anomaly_health_score_threshold: Number(e.target.value) / 100 }))} style={{ width: "100%", accentColor: "#7ec8e3", cursor: "pointer" }} />
-                <div style={{ color: "#555", fontSize: "11px", marginTop: "4px" }}>Health score below which a family is considered degraded. Both anomaly AND health must fail for the webhook dual gate to trigger an alert.</div>
               </div>
 
               {/* ── Markov Chain ── */}

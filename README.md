@@ -145,12 +145,10 @@ The variables below are those that must be set in `.env` before starting.
 | `MIST_SITE_ID` | UUID of the primary site to monitor |
 | `MIST_ORG_ID` | UUID of the org — enables org-wide cross-site detection |
 
-### App Auth & Frontend
+### Frontend
 
 | Variable | Default | Description |
 |---|---|---|
-| `APP_USERNAME` | — | HTTP Basic Auth username for the dashboard |
-| `APP_PASSWORD` | — | HTTP Basic Auth password for the dashboard |
 | `VITE_API_BASE_URL` | `http://localhost:8000` | Backend URL used by the React frontend at build time |
 
 ### Advanced ML Constants
@@ -332,5 +330,5 @@ See [TODO.md](unsupervised_anomaly/TODO.md) for the tracked backlog. Active item
 ## Security Notes
 
 - Data never egresses to third-party LLM providers. All ML is local.
-- The API has HTTP Basic Auth (`APP_USERNAME` / `APP_PASSWORD`). Put it behind a reverse proxy with TLS in production.
+- The API has no built-in authentication. Put it behind a reverse proxy with TLS and access control in production.
 - Redis has no auth by default — bind to localhost or use `requirepass` in production.

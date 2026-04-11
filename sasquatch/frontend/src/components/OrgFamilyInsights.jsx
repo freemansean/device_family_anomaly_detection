@@ -243,6 +243,12 @@ export default function OrgFamilyInsights({ apiBase, refreshToken, onMacSiteSele
           <thead>
             <tr>
               <th
+                style={{ ...thStyle, cursor: "pointer", userSelect: "none" }}
+                onClick={() => handleSort("family")}
+              >
+                Device Family<SortIndicator active={sortKey === "family"} dir={sortDir} />
+              </th>
+              <th
                 style={{ ...thStyle, whiteSpace: "nowrap", cursor: "pointer", userSelect: "none" }}
                 title="Count — total MACs in this device family across all sites."
                 onClick={() => handleSort("count")}
@@ -260,12 +266,6 @@ export default function OrgFamilyInsights({ apiBase, refreshToken, onMacSiteSele
                 onClick={() => handleSort("sites")}
               >
                 Sites<SortIndicator active={sortKey === "sites"} dir={sortDir} />
-              </th>
-              <th
-                style={{ ...thStyle, cursor: "pointer", userSelect: "none" }}
-                onClick={() => handleSort("family")}
-              >
-                Device Family<SortIndicator active={sortKey === "family"} dir={sortDir} />
               </th>
               <th
                 style={{ ...thStyle, whiteSpace: "nowrap", cursor: "pointer", userSelect: "none" }}
@@ -342,26 +342,6 @@ export default function OrgFamilyInsights({ apiBase, refreshToken, onMacSiteSele
               const rowBg = isSaFamily ? SA_BG : undefined;
               return (
                 <tr key={family} style={rowBg ? { background: rowBg } : undefined}>
-                  {/* Count — device family size (MACs across all sites) */}
-                  <td
-                    style={{ ...tdStyle, textAlign: "right", color: "#aaa", fontSize: "11px", fontVariantNumeric: "tabular-nums" }}
-                    title={`${fdata.client_count ?? 0} MACs in ${family} across all sites`}
-                  >
-                    {fdata.client_count ?? 0}
-                  </td>
-
-                  {/* Event count */}
-                  <td style={{ ...tdStyle, textAlign: "right", color: "#555", fontSize: "11px", fontVariantNumeric: "tabular-nums" }}>
-                    {fdata.total_events > 999
-                      ? `${(fdata.total_events / 1000).toFixed(1)}k`
-                      : fdata.total_events}
-                  </td>
-
-                  {/* Site count */}
-                  <td style={{ ...tdStyle, textAlign: "center", color: "#555", fontSize: "11px" }}>
-                    {siteCount}/{sitesTotal}
-                  </td>
-
                   {/* Family name — clickable to drill down */}
                   <td
                     style={{ ...tdStyle, whiteSpace: "nowrap", cursor: "pointer" }}
@@ -381,6 +361,26 @@ export default function OrgFamilyInsights({ apiBase, refreshToken, onMacSiteSele
                         SVC ACCT
                       </span>
                     )}
+                  </td>
+
+                  {/* Count — device family size (MACs across all sites) */}
+                  <td
+                    style={{ ...tdStyle, textAlign: "right", color: "#aaa", fontSize: "11px", fontVariantNumeric: "tabular-nums" }}
+                    title={`${fdata.client_count ?? 0} MACs in ${family} across all sites`}
+                  >
+                    {fdata.client_count ?? 0}
+                  </td>
+
+                  {/* Event count */}
+                  <td style={{ ...tdStyle, textAlign: "right", color: "#555", fontSize: "11px", fontVariantNumeric: "tabular-nums" }}>
+                    {fdata.total_events > 999
+                      ? `${(fdata.total_events / 1000).toFixed(1)}k`
+                      : fdata.total_events}
+                  </td>
+
+                  {/* Site count */}
+                  <td style={{ ...tdStyle, textAlign: "center", color: "#555", fontSize: "11px" }}>
+                    {siteCount}/{sitesTotal}
                   </td>
 
                   {/* IF: Centroid Isolation Forest — whole-family outlier any site */}
@@ -526,13 +526,6 @@ export default function OrgFamilyInsights({ apiBase, refreshToken, onMacSiteSele
             {/* All Other Devices row */}
             {other.length > 0 && (
               <tr style={{ borderTop: "1px solid #2a2a2a" }}>
-                <td style={{ ...tdStyle, textAlign: "right", color: "#555", fontSize: "11px", fontVariantNumeric: "tabular-nums" }}>
-                  {otherClientCount}
-                </td>
-                <td style={{ ...tdStyle, textAlign: "right", color: "#444", fontSize: "11px" }}>
-                  {otherTotal > 999 ? `${(otherTotal / 1000).toFixed(1)}k` : otherTotal}
-                </td>
-                <td style={{ ...tdStyle }} />
                 <td style={{ ...tdStyle, whiteSpace: "nowrap", color: "#555", fontStyle: "italic" }}>
                   <span style={{
                     display: "inline-block", width: 8, height: 8,
@@ -544,6 +537,13 @@ export default function OrgFamilyInsights({ apiBase, refreshToken, onMacSiteSele
                     ({other.length} types)
                   </span>
                 </td>
+                <td style={{ ...tdStyle, textAlign: "right", color: "#555", fontSize: "11px", fontVariantNumeric: "tabular-nums" }}>
+                  {otherClientCount}
+                </td>
+                <td style={{ ...tdStyle, textAlign: "right", color: "#444", fontSize: "11px" }}>
+                  {otherTotal > 999 ? `${(otherTotal / 1000).toFixed(1)}k` : otherTotal}
+                </td>
+                <td style={{ ...tdStyle }} />
                 <td style={{ ...tdStyle, textAlign: "center" }}>
                   <span style={{ color: "#333", fontSize: "10px" }}>—</span>
                 </td>

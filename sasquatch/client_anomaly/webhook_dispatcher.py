@@ -54,8 +54,10 @@ def get_health_score_threshold() -> float:
 
     Resolution: config_overrides.json → env var → hardcoded default (0.80).
     Imported by routes.py so the same value is used for API alert filtering.
+    Lives under the `general` section because it gates alarm generation at
+    both org and site level alongside `alarm_min_family_size`.
     """
-    return config.get("anomaly", "anomaly_health_score_threshold")
+    return config.get("general", "anomaly_health_score_threshold")
 
 
 def get_alarm_min_family_size() -> int:
@@ -224,8 +226,11 @@ def _slim_finding_for_webhook(finding: dict, org_scope: bool) -> dict:
             "service_account_member_families", []
         )
 
-    # Worst-health MACs + TSHOOT enrichment are only populated for site-scope findings
-    # (score_org_wide does not compute them). Preserve them when present.
+    # Worst-health MACs + TSHOOT enrichment are populated for both site- and
+    # org-scope findings. Org-scope entries include a per-MAC `site_id` so the
+    # consumer can correlate each troubled MAC with the specific site it lives
+    # at; site-scope entries omit it (the outer `site_id` already identifies
+    # the site).
     if "worst_health_macs" in finding:
         slim["worst_health_macs"] = finding["worst_health_macs"]
     if "marvis_tshoot" in finding:
@@ -410,25 +415,35 @@ async def evaluate_and_dispatch(
         return True
 
     # Enrich each qualifying finding with TSHOOT results for its worst MACs.
-    # All TSHOOT calls across all findings are dispatched concurrently.
+    # All TSHOOT calls across all findings are dispatched concurrently. For
+    # org-scope dispatch each mac_entry carries its own site_id (set by
+    # score_org_wide) so TSHOOT targets the Mist site where that MAC lives;
+    # site-scope entries have no site_id and fall back to the outer site_id.
     if config["marvis_tshoot_enabled"] and MIST_ORG_ID and MIST_API_TOKEN:
-        # Build a flat list of (finding_index, mac_entry) pairs so we can scatter/gather.
-        tshoot_tasks: list[tuple[int, dict]] = []
+        # Build a flat list of (finding_index, mac_entry, target_site) tuples so
+        # we can scatter/gather.
+        tshoot_tasks: list[tuple[int, dict, str]] = []
         for i, finding in enumerate(qualifying):
             for mac_entry in finding.get("worst_health_macs", []):
-                tshoot_tasks.append((i, mac_entry))
+                target_site = mac_entry.get("site_id") or site_id
+                tshoot_tasks.append((i, mac_entry, target_site))
 
         if tshoot_tasks:
             results = await asyncio.gather(
-                *[_run_client_tshoot(site_id, t[1]["mac"]) for t in tshoot_tasks]
+                *[_run_client_tshoot(t[2], t[1]["mac"]) for t in tshoot_tasks]
             )
             # Group results back onto each finding.
             finding_tshoot: dict[int, list[dict]] = {i: [] for i in range(len(qualifying))}
-            for (i, mac_entry), result in zip(tshoot_tasks, results):
-                finding_tshoot[i].append({
+            for (i, mac_entry, target_site), result in zip(tshoot_tasks, results):
+                entry = {
                     "mac": mac_entry["mac"],
                     "tshoot_results": result.get("results", []),
-                })
+                }
+                # Preserve per-MAC site_id for org-scope consumers so they can
+                # correlate each tshoot block with its sites_affected entry.
+                if org_scope:
+                    entry["site_id"] = target_site
+                finding_tshoot[i].append(entry)
             for i, finding in enumerate(qualifying):
                 finding["marvis_tshoot"] = finding_tshoot[i]
             log.info(
