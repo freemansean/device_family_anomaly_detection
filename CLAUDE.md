@@ -8,26 +8,54 @@ of Project Sasquatch. Read this entirely before writing any code.
 
 ## What This Module Does
 
-Detects anomalous client behavior at a Juniper Mist site by:
+Detects anomalous client behavior across every site in a Juniper Mist org by:
 1. Building an org-wide client device database (MAC → device metadata), refreshed daily.
    The cache is org-scoped: MAC addresses uniquely identify clients across the entire
-   organization, so a single lookup table serves every site.
-2. Pulling client events for the site over a rolling window — manual full collects fetch
-   the last 12 hours, hourly polls top up the trailing 1 hour
-3. Engineering per-MAC behavioral feature vectors
+   organization, so a single lookup table serves every site. Persisted in the SQLite
+   `clients` table.
+2. Pulling client events from the org events endpoint over a rolling window — manual
+   full collects fetch the last 12 hours, hourly polls top up the trailing 1 hour.
+   Events are streamed to SQLite in batches and enriched with device metadata at
+   write time.
+3. Engineering per-MAC behavioral feature vectors (61 dimensions: 59 normalized
+   event-type frequencies + 2 timing features)
 4. Running a four-stage ML detection pipeline (see `anomaly_detector.py`):
-   - **Stage 1 — DBSCAN** (site-wide): flags MACs that don't cluster with any site peer group
-   - **Stage 1b — Family Centroid Distance**: flags entire device families whose L2-normalized centroid sits far (cosine distance) from a healthy-family reference centroid
-   - **Stage 2 — Isolation Forest** (per device family): flags individual MACs anomalous within their family
-   - **Stage 4 — Markov Chain** (see `markov_analyzer.py`): scores event-transition sequences within episodes against a 24hr site baseline and runs a baseline-independent stuck-loop detector. Per-MAC `markov_reason` collapses to two states: `anomaly` (anomalous connection-chain transitions) or `repeated` (stuck failure loop). Families are flagged when ≥ `MARKOV_FAMILY_OUTLIER_RATIO` of clients carry either reason; the dominant reason is rolled up as `markov_family_reason`.
-5. Computing a separate per-family **Health Score** (see `health_scorer.py`): mean of per-MAC
-   failure rates across AUTH, ROAM, DHCP, DNS, and ARP — independent of the anomaly pipeline
-6. Rolling up MAC-level anomalies to device type findings
-7. Exposing findings via a React + FastAPI dashboard
-8. Firing a webhook when a device family carries **any** family-level anomaly label (is_family_outlier, is_family_dbscan_outlier, or is_family_markov_outlier) **and** is unhealthy (health score below threshold) — dual-gate to prevent single-device noise
+   - **Stage 1 — DBSCAN** (population-wide): flags MACs that don't cluster with any
+     peer group. `min_samples` and `eps` are auto-tuned per run from the population
+     size — `min_samples = max(3, n_clients * pct)` and `eps` is the k-distance
+     elbow. Only one operator knob (`anomaly_dbscan_min_samples_pct`).
+   - **Stage 1b — Family Centroid Distance**: flags entire device families whose
+     L2-normalized centroid sits far (cosine distance) from a healthy-family
+     reference centroid built from families with mean health ≥
+     `ANOMALY_CENTROID_HEALTHY_REF_THRESHOLD`.
+   - **Stage 2 — Isolation Forest** (per device family): flags individual MACs
+     anomalous within their family. Families below `MIN_PEERS` borrow MACs from
+     other org sites for the same family.
+   - **Stage 4 — Markov Chain** (see `markov_analyzer.py`): scores event-transition
+     sequences within episodes against a 24hr site baseline and runs a
+     baseline-independent stuck-loop detector that anchors each episode to its
+     opening AP. Per-MAC `markov_reason` collapses to `anomaly` (anomalous chain
+     transitions) or `repeated` (stuck failure loop). Families are flagged when
+     ≥ `MARKOV_FAMILY_OUTLIER_RATIO` of *total family MACs* carry either reason.
+5. Computing a separate per-family **Health Score** (see `health_scorer.py`): mean of
+   per-MAC failure rates across AUTH, ROAM, DHCP, DNS, and ARP — independent of the
+   anomaly pipeline.
+6. Rolling up MAC-level anomalies to device-family findings, both per-site and
+   org-wide (cross-site scoring runs once per WLAN over the combined org population).
+7. Exposing findings via a React + FastAPI dashboard. Dashboard read endpoints serve
+   pre-computed aggregates from a Redis summary cache rebuilt at the tail of every
+   detection cycle (see `summary_cache.py`).
+8. Firing a webhook when a device family carries **any** family-level anomaly label
+   (`is_family_outlier`, `is_family_dbscan_outlier`, or `is_family_markov_outlier`)
+   **and** is unhealthy (health score below threshold) **and** is at least
+   `ALARM_MIN_FAMILY_SIZE` MACs — triple gate to prevent single-device noise.
 
 **This module has NO LLM in the detection path.** Pure ML + rule-based only.
-Client event data must not egress to third-party providers. Do not add any LLM calls to detection or scoring code.
+Client event data must not egress to third-party providers. Do not add any LLM calls
+or external service calls (SendGrid, Anthropic, OpenAI, etc.) to any code path that
+touches client events. The only external services this module talks to are the Mist
+API (events + client cache + Marvis TSHOOT enrichment) and the configured webhook
+target.
 
 ---
 
@@ -50,19 +78,30 @@ The detection strategy: we need to detect anomalies between device groups and fl
 | Layer | Technology |
 |---|---|
 | Backend | FastAPI (Python) |
-| Frontend | React |
-| Cache / State | Redis |
-| Scheduling | APScheduler |
-| ML | scikit-learn (IsolationForest, DBSCAN) |
+| Frontend | React (Vite) |
+| Persistent storage | SQLite via `aiosqlite` (events, clients, alert sessions) |
+| Derived state cache | Redis (features, anomalies, findings, health, summary cache, locks) |
+| Scheduling | APScheduler (in-process) |
+| ML | scikit-learn (IsolationForest, DBSCAN, PCA, NearestNeighbors) |
 | Feature Engineering | pandas, numpy |
 | Mist API Client | httpx (async) |
 | Alerting | httpx webhook POST (configurable target) |
+| Configuration | env vars + per-key GUI overrides in `config_overrides.json` |
 
-This module is part of the larger Project Sasquatch codebase which already uses:
-- Redis for alarm caching and 24hr history
-- SendGrid for email output
-- Anthropic SDK (Claude Haiku for triage, Claude Sonnet for RCA)
-- A shared Python context object flowing across pipeline stages
+**Storage split** — SQLite is the system of record for everything that must
+survive a Redis flush or restart: client events (7-day retention), the
+org-wide client cache, alert session history. Redis holds derived state with
+TTLs (feature vectors, anomaly scores, findings, health scores, the
+dashboard summary cache), plus operational primitives (the global pipeline
+mutex and progress keys). When in doubt: if losing it would be a real data
+loss, it lives in SQLite; if losing it would just trigger a recompute, it
+lives in Redis.
+
+**No LLM, no third-party data egress.** Client event data must not be sent
+to any external provider. This module deliberately does NOT use SendGrid,
+the Anthropic SDK, or any other external service beyond the Mist API and
+the configured webhook target. See "What NOT to Build" at the bottom of
+this file.
 
 Match existing patterns in the codebase where they exist.
 
@@ -81,6 +120,8 @@ Update it when you identify new problems or resolve existing ones.
 sasquatch/
 ├── client_anomaly/
 │   ├── __init__.py
+│   ├── db.py                    # SQLite schema, migrations, async access layer (events + clients tables)
+│   ├── config.py                # env + config_overrides.json resolution; single source of truth for tunables
 │   ├── client_cache.py          # Daily org-wide client list refresh → SQLite
 │   ├── event_collector.py       # Streaming event pull (12hr full / 1hr poll) + MAC enrichment → SQLite (batched flushes)
 │   ├── feature_engineer.py      # Per-MAC feature vector construction
@@ -89,6 +130,7 @@ sasquatch/
 │   ├── health_scorer.py         # Per-family health score (separate from anomaly pipeline)
 │   ├── webhook_dispatcher.py    # Dual-gate alert dispatch (anomaly + health)
 │   ├── alert_tracker.py         # Persistent alert session history (7-day, per-site)
+│   ├── summary_cache.py         # Pre-computed dashboard aggregates (org/site overview, alerts, findings)
 │   ├── scheduler.py             # APScheduler job definitions
 │   └── api/
 │       ├── __init__.py
@@ -110,12 +152,113 @@ sasquatch/
 
 ---
 
+## SQLite Schema
+
+SQLite is the system of record for client events and the org-wide client
+cache. Lives at `sasquatch/client_anomaly/sasquatch.db` (configurable via
+`SASQUATCH_DB_PATH`). All access goes through `db.py`, which holds a
+single shared `aiosqlite` connection and runs lightweight forward-only
+migrations on startup.
+
+**`events` table** — every Mist client event collected for any site, with
+the enriched device metadata attached at write time:
+
+```sql
+CREATE TABLE events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    org_id TEXT NOT NULL DEFAULT '',
+    site_id TEXT NOT NULL,
+    mac TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    timestamp REAL NOT NULL,
+    bssid TEXT NOT NULL DEFAULT '',
+    device_family TEXT,
+    device_model TEXT,
+    device_manufacturer TEXT,
+    wlan TEXT,
+    event_category TEXT,
+    raw_json TEXT NOT NULL,
+    UNIQUE(mac, event_type, timestamp, bssid)
+);
+CREATE INDEX idx_events_site_ts ON events(site_id, timestamp);
+CREATE INDEX idx_events_mac ON events(mac, timestamp);
+CREATE INDEX idx_events_org_ts ON events(org_id, timestamp);
+CREATE INDEX idx_events_wlan ON events(site_id, wlan);
+```
+
+The `UNIQUE(mac, event_type, timestamp, bssid)` constraint makes inserts
+idempotent: re-collecting an overlapping window is a safe no-op. Retention
+is 7 days, enforced by `db.purge_old_events()` running daily at 03:00.
+
+**`clients` table** — org-scoped client cache, one row per MAC across the
+entire org. Refreshed daily by `client_cache.refresh_client_cache_org()`:
+
+```sql
+CREATE TABLE clients (
+    mac TEXT PRIMARY KEY,
+    org_id TEXT NOT NULL DEFAULT '',
+    family TEXT NOT NULL,
+    model TEXT,
+    os TEXT,
+    manufacturer TEXT,
+    random_mac BOOLEAN DEFAULT FALSE,
+    last_ssid TEXT,
+    last_ap TEXT,
+    last_site_id TEXT,
+    last_username TEXT,
+    last_username_norm TEXT,
+    updated_at REAL NOT NULL
+);
+CREATE INDEX idx_clients_org ON clients(org_id);
+CREATE INDEX idx_clients_family ON clients(family);
+CREATE INDEX idx_clients_last_site ON clients(last_site_id);
+CREATE INDEX idx_clients_username_norm ON clients(last_username_norm);
+```
+
+`mac` is the natural primary key — MACs are unique across the org, so a
+single row serves every site. `last_site_id` is the most recent site Mist
+saw the client at and is what `/sites/{site_id}/clients` filters on.
+`last_username` / `last_username_norm` back the service-account virtual
+families (see "Service-Account Virtual Families" below).
+
+**`client_refresh_log` table** — a one-row-per-org bookkeeping table:
+
+```sql
+CREATE TABLE client_refresh_log (
+    org_id TEXT PRIMARY KEY,
+    refreshed_at REAL NOT NULL,
+    client_count INTEGER NOT NULL DEFAULT 0
+);
+```
+
+Used by the daily `client_refresh_job` to expose "last refreshed" in the
+admin UI and by the event collector startup check (the cache must have
+been written at least once before any collect runs).
+
+**Migrations** — `db._init_schema()` runs all `CREATE TABLE IF NOT EXISTS`
+DDL on startup, then runs forward-only migration helpers
+(`_migrate_clients_to_org_scope`, `_migrate_clients_add_last_username`)
+that detect missing columns/indexes via `PRAGMA table_info` and apply
+in-place `ALTER TABLE`. There is no migration framework — keep
+migrations idempotent and additive.
+
+**Public API in `db.py`** (all async unless noted):
+- Events: `insert_events`, `get_events`, `get_event_count`, `get_wlans`,
+  `get_site_ids_with_events`, `reenrich_events`, `delete_events_for_site`,
+  `purge_old_events`
+- Clients: `upsert_clients_org`, `get_org_client_cache`,
+  `has_org_client_cache`, `search_clients_by_mac_prefix`,
+  `delete_clients_for_org`, `get_service_account_usernames`,
+  `normalize_username` (sync)
+
+---
+
 ## Redis Key Schema
 
 | Key | TTL | Contents |
 |---|---|---|
-| _(client cache moved to SQLite — see SQLite Schema below)_ | — | Stored in the `clients` table, org-scoped, MAC PRIMARY KEY |
-| _(events moved to SQLite — see SQLite Schema below)_ | — | Stored in the `events` table, 7-day retention purged by `db.purge_old_events` |
+| _(client cache lives in SQLite — see SQLite Schema above)_ | — | Stored in the `clients` table, org-scoped, MAC PRIMARY KEY |
+| _(events live in SQLite — see SQLite Schema above)_ | — | Stored in the `events` table, 7-day retention purged by `db.purge_old_events` |
 | _(wlans derived from SQLite events table on demand)_ | — | `db.get_wlans(site_id)` issues `SELECT DISTINCT wlan` against the events table |
 | `sasquatch:event_type_index` | 7 days | JSON array: ordered list of known Mist client event type strings |
 | `sasquatch:features:{site_id}:{wlan_key}` | 24hr | JSON dict: MAC → feature vector dict |
@@ -161,6 +304,74 @@ that responsibility.
 ---
 
 ## Module Specifications
+
+### `config.py`
+
+**Purpose:** Single source of truth for every tunable knob in the
+detection pipeline. Every consumer reads through `config.get(section, key)`
+or `config.get_section(section)` — no module reads `os.getenv` directly
+for an anomaly setting.
+
+**Resolution order (first match wins):**
+1. `config_overrides.json` (per-key GUI overrides, persisted across restarts)
+2. Environment variable (e.g. `ANOMALY_IF_CONTAMINATION`)
+3. Hardcoded default in the `DEFAULTS` dict
+
+The override file lives at
+`sasquatch/client_anomaly/config_overrides.json` and is read on every
+`get()` call (no in-process caching), so admin changes from the GUI take
+effect immediately on the next pipeline run without a service restart.
+Config changes do **not** invalidate the dashboard summary cache —
+threshold changes only take effect on the next detection cycle, when the
+cache is rebuilt.
+
+**Sections:** `general`, `anomaly`, `markov`, `health`, `webhook`. Each
+section in `DEFAULTS` declares a `{key: {default, env, cast}}` map that
+the resolver uses to coerce types and validate.
+
+**Public API:**
+- `get(section, key) -> int | float | str` — single-key resolved value
+- `get_section(section) -> dict` — full resolved section, used by the
+  GET `/api/v1/anomaly-config` endpoint
+- `get_section_defaults(section) -> dict` — hardcoded defaults only,
+  used by validation bounds in the POST `/api/v1/anomaly-config` handler
+
+When adding a new tunable: add it to `DEFAULTS`, expose it in the GUI
+config panel, add validation bounds in `routes.set_anomaly_config`, and
+update the smoke test in `scripts/smoke_test_config.py`.
+
+---
+
+### `db.py`
+
+**Purpose:** Async SQLite access layer. Owns the schema (see "SQLite
+Schema" above), runs forward-only migrations on startup, and exposes
+typed read/write helpers for the `events`, `clients`, and
+`client_refresh_log` tables.
+
+**Connection model:** A single `aiosqlite` connection is shared across
+the entire process via `db.get_connection()`. SQLite serializes writes,
+so a single connection is the simplest correct model — no pool, no
+per-request open/close. The connection is closed cleanly on app
+shutdown via `db.close()`.
+
+**Schema initialization:** `_init_schema()` runs all `CREATE TABLE IF
+NOT EXISTS` and `CREATE INDEX IF NOT EXISTS` statements, then runs
+forward-only migration helpers that detect missing columns/indexes via
+`PRAGMA table_info` and apply in-place `ALTER TABLE`. There is no
+migration framework — keep migrations idempotent and additive. Never
+write a migration that drops or renames a column.
+
+**Public API:** see "SQLite Schema" section above for the full list.
+The most commonly used helpers from outside `db.py`:
+- `get_events(site_id, wlan, since)` — flat list of enriched event
+  dicts, used by feature engineering and the heatmap endpoints
+- `get_org_client_cache(org_id)` — full org client map, used everywhere
+  events are enriched and by all per-site client filtering
+- `purge_old_events()` — daily retention job target, called by the
+  `sqlite_retention_job` APScheduler entry
+
+---
 
 ### `client_cache.py`
 
