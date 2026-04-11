@@ -48,6 +48,7 @@ GUI_CONTROLS: list[tuple[str, str, float | int]] = [
     ("general", "anomaly_min_mac_events", 42),
     ("general", "alarm_min_family_size", 3),
     ("general", "anomaly_health_score_threshold", 0.62),
+    ("general", "alarm_dbscan_markov_ratio", 0.33),
     # Anomaly tab — Isolation Forest
     ("anomaly", "anomaly_if_contamination", 0.17),
     ("anomaly", "anomaly_min_peers", 7),
@@ -59,8 +60,6 @@ GUI_CONTROLS: list[tuple[str, str, float | int]] = [
     # Anomaly tab — Centroid detection
     ("anomaly", "anomaly_centroid_dist_threshold", 0.42),
     ("anomaly", "anomaly_centroid_healthy_ref_threshold", 0.66),
-    # Anomaly tab — Finding rollup (rendered inside DBSCAN section in the GUI)
-    ("anomaly", "anomaly_finding_threshold", 0.27),
     # Anomaly tab — Markov
     ("anomaly", "markov_family_outlier_ratio", 0.37),
     ("anomaly", "markov_stuck_loop_threshold", 0.55),

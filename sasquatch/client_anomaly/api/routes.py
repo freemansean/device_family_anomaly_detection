@@ -552,6 +552,14 @@ async def set_general_config(body: dict):
         # general config because it gates alarm generation alongside
         # alarm_min_family_size at both org and site level.
         "anomaly_health_score_threshold": (0.0, 1.0),
+        # Service-alarm device-percentage threshold. A family fires an alarm
+        # via the service-alarm gate when at least this fraction of its MACs
+        # have individually tripped a service alarm.
+        "alarm_service_device_pct": (0.0, 1.0),
+        # Fraction of family clients flagged by DBSCAN-or-Markov required to
+        # fire an alarm via the rollup gate. Inter-family centroid detection
+        # remains independently sufficient.
+        "alarm_dbscan_markov_ratio": (0.0, 1.0),
     }
     for key, (lo, hi) in int_bounds.items():
         if key in body:
@@ -592,7 +600,6 @@ async def set_anomaly_config(body: dict):
         "anomaly_if_contamination": (0.01, 0.5),
         "anomaly_dbscan_pca_variance": (0.5, 1.0),
         "anomaly_dbscan_family_noise_threshold": (0.0, 1.0),
-        "anomaly_finding_threshold": (0.0, 1.0),
         "anomaly_centroid_dist_threshold": (0.0, 2.0),
         "anomaly_centroid_healthy_ref_threshold": (0.0, 1.0),
         "markov_family_outlier_ratio": (0.0, 1.0),
@@ -690,9 +697,17 @@ async def build_org_summary(redis_client, site_map: dict[str, str], wlan: str) -
     raw_org = pipeline_results[n * 2]
     org_findings = json.loads(raw_org) if raw_org else []
 
-    from ..webhook_dispatcher import get_alarm_min_family_size, get_health_score_threshold
+    from ..webhook_dispatcher import (
+        family_passes_dbscan_markov_gate,
+        get_alarm_dbscan_markov_ratio,
+        get_alarm_min_family_size,
+        get_alarm_service_device_pct,
+        get_health_score_threshold,
+    )
     _SUMMARY_HEALTH_THRESHOLD = get_health_score_threshold()
     _SUMMARY_MIN_FAMILY_SIZE = int(get_alarm_min_family_size())
+    _SUMMARY_SERVICE_DEVICE_PCT = float(get_alarm_service_device_pct())
+    _SUMMARY_DBSCAN_MARKOV_RATIO = float(get_alarm_dbscan_markov_ratio())
 
     result = []
     for sid, site_name in sites_sorted:
@@ -701,13 +716,21 @@ async def build_org_summary(redis_client, site_map: dict[str, str], wlan: str) -
         event_count = events_per_site.get(sid, 0)
         # alert_count: families that are both anomalous (in findings) AND unhealthy.
         # "Unhealthy" matches the webhook dispatch gate: health_score below
-        # threshold OR at least one service_alarms entry present. Tiny families
+        # threshold OR enough devices in the family have individually tripped a
+        # service alarm to meet the device-percentage floor. Tiny families
         # below alarm_min_family_size are suppressed to stay in sync with
         # webhook dispatch and the OrgAlerts feed.
         def _is_alert(f: dict) -> bool:
+            if not family_passes_dbscan_markov_gate(f, _SUMMARY_DBSCAN_MARKOV_RATIO):
+                return False
             fam_health = health.get(f.get("device_family"), {})
             score_bad = fam_health.get("health_score", 1.0) < _SUMMARY_HEALTH_THRESHOLD
-            service_bad = len(fam_health.get("service_alarms") or []) > 0
+            service_alarms_list = fam_health.get("service_alarms") or []
+            mac_alarm_ratio = float(fam_health.get("mac_alarm_ratio", 0.0) or 0.0)
+            service_bad = (
+                len(service_alarms_list) > 0
+                and mac_alarm_ratio >= _SUMMARY_SERVICE_DEVICE_PCT
+            )
             return (
                 (score_bad or service_bad)
                 and (f.get("total_mac_count", 0) or 0) >= _SUMMARY_MIN_FAMILY_SIZE
@@ -754,9 +777,13 @@ async def build_org_summary(redis_client, site_map: dict[str, str], wlan: str) -
         "org_minimal_count": sum(1 for f in org_findings if f.get("severity") == "minimal"),
         "org_alert_count": sum(
             1 for f in org_findings
-            if (
+            if family_passes_dbscan_markov_gate(f, _SUMMARY_DBSCAN_MARKOV_RATIO)
+            and (
                 f.get("health_score", 1.0) < _SUMMARY_HEALTH_THRESHOLD
-                or len(f.get("service_alarms") or []) > 0
+                or (
+                    len(f.get("service_alarms") or []) > 0
+                    and float(f.get("mac_alarm_ratio", 0.0) or 0.0) >= _SUMMARY_SERVICE_DEVICE_PCT
+                )
             )
             and (f.get("total_mac_count", 0) or 0) >= _SUMMARY_MIN_FAMILY_SIZE
         ),
@@ -1199,9 +1226,17 @@ async def build_org_alerts(redis_client, site_map: dict[str, str], wlan: str) ->
     Mist API calls. Called by the route handler (cache miss path) and the
     pipeline writer (post-detection cache fill).
     """
-    from ..webhook_dispatcher import get_alarm_min_family_size, get_health_score_threshold
+    from ..webhook_dispatcher import (
+        family_passes_dbscan_markov_gate,
+        get_alarm_dbscan_markov_ratio,
+        get_alarm_min_family_size,
+        get_alarm_service_device_pct,
+        get_health_score_threshold,
+    )
     _ALERT_HEALTH_THRESHOLD = get_health_score_threshold()
     _ALARM_MIN_FAMILY_SIZE = int(get_alarm_min_family_size())
+    _ALARM_SERVICE_DEVICE_PCT = float(get_alarm_service_device_pct())
+    _ALARM_DBSCAN_MARKOV_RATIO = float(get_alarm_dbscan_markov_ratio())
 
     sites_sorted = sorted(site_map.items(), key=lambda x: x[1].lower())
     pipe = redis_client.pipeline()
@@ -1223,43 +1258,47 @@ async def build_org_alerts(redis_client, site_map: dict[str, str], wlan: str) ->
     raw_org = pipeline_results[n * 2]
     org_findings = json.loads(raw_org) if raw_org else []
 
-    # Org-wide alerts: org findings where any family-level anomaly flag is set AND unhealthy.
-    # "Unhealthy" matches the webhook dispatch gate: health_score below threshold
-    # OR at least one service_alarms entry present (>50% of active MACs failing in a
-    # service category). Any of centroid IF, DBSCAN past threshold, or Markov qualifies
-    # — not just centroid. Tiny families below alarm_min_family_size are suppressed.
+    # Org-wide alerts: family must qualify via the centroid OR the
+    # DBSCAN-or-Markov rollup gate, AND be unhealthy by health score or
+    # service-alarm device-pct, AND meet the alarm_min_family_size floor.
+    # Mirrors webhook_dispatcher.evaluate_and_dispatch.
     org_alerts = [
         f for f in org_findings
-        if (
+        if family_passes_dbscan_markov_gate(f, _ALARM_DBSCAN_MARKOV_RATIO)
+        and (
             f.get("health_score", 1.0) < _ALERT_HEALTH_THRESHOLD
-            or len(f.get("service_alarms") or []) > 0
+            or (
+                len(f.get("service_alarms") or []) > 0
+                and float(f.get("mac_alarm_ratio", 0.0) or 0.0) >= _ALARM_SERVICE_DEVICE_PCT
+            )
         )
         and (f.get("total_mac_count", 0) or 0) >= _ALARM_MIN_FAMILY_SIZE
-        and (
-            f.get("is_family_outlier")
-            or f.get("is_family_dbscan_outlier")
-            or f.get("is_family_markov_outlier")
-        )
     ]
     for f in org_alerts:
         for sa in f.get("sites_affected", []):
             sa["site_name"] = site_map.get(sa["site_id"], sa["site_id"])
 
     # Per-site alerts: per-site findings cross-referenced with per-site health.
-    # "Unhealthy" matches the webhook dispatch gate: health_score below threshold
-    # OR at least one service_alarms entry present. Tiny families below
-    # alarm_min_family_size are suppressed.
+    # Same gate as org_alerts above.
     site_alerts = []
     for sid, site_name in sites_sorted:
         findings = findings_by_site[sid]
         health = health_by_site[sid]
         alerts = []
         for f in findings:
+            if not family_passes_dbscan_markov_gate(f, _ALARM_DBSCAN_MARKOV_RATIO):
+                continue
             family_health = health.get(f.get("device_family"), {})
             fam_health_score = family_health.get("health_score", 1.0)
             fam_service_alarms = family_health.get("service_alarms") or []
+            fam_mac_alarm_ratio = float(family_health.get("mac_alarm_ratio", 0.0) or 0.0)
+            unhealthy_by_score = fam_health_score < _ALERT_HEALTH_THRESHOLD
+            unhealthy_by_service = (
+                len(fam_service_alarms) > 0
+                and fam_mac_alarm_ratio >= _ALARM_SERVICE_DEVICE_PCT
+            )
             if (
-                (fam_health_score < _ALERT_HEALTH_THRESHOLD or len(fam_service_alarms) > 0)
+                (unhealthy_by_score or unhealthy_by_service)
                 and (f.get("total_mac_count", 0) or 0) >= _ALARM_MIN_FAMILY_SIZE
             ):
                 alerts.append({
@@ -1268,6 +1307,7 @@ async def build_org_alerts(redis_client, site_map: dict[str, str], wlan: str) ->
                     "health_components": family_health.get("components"),
                     "service_alarms": fam_service_alarms,
                     "service_health": family_health.get("service_health") or {},
+                    "mac_alarm_ratio": fam_mac_alarm_ratio,
                 })
         if alerts:
             site_alerts.append({
@@ -1325,9 +1365,17 @@ async def build_org_alerts_full(redis_client, site_map: dict[str, str]) -> dict:
     no Mist API calls. Called by the route handler (cache miss path) and the
     pipeline writer (post-detection cache fill).
     """
-    from ..webhook_dispatcher import get_alarm_min_family_size, get_health_score_threshold
+    from ..webhook_dispatcher import (
+        family_passes_dbscan_markov_gate,
+        get_alarm_dbscan_markov_ratio,
+        get_alarm_min_family_size,
+        get_alarm_service_device_pct,
+        get_health_score_threshold,
+    )
     _ALERT_HEALTH_THRESHOLD = get_health_score_threshold()
     _ALARM_MIN_FAMILY_SIZE = int(get_alarm_min_family_size())
+    _ALARM_SERVICE_DEVICE_PCT = float(get_alarm_service_device_pct())
+    _ALARM_DBSCAN_MARKOV_RATIO = float(get_alarm_dbscan_markov_ratio())
 
     wlans = await get_wlans(site_id=None)
 
@@ -1364,17 +1412,17 @@ async def build_org_alerts_full(redis_client, site_map: dict[str, str]) -> dict:
 
         # Org-wide alerts for this WLAN (same gate as /org/alerts)
         for f in org_findings_for_wlan:
+            if not family_passes_dbscan_markov_gate(f, _ALARM_DBSCAN_MARKOV_RATIO):
+                continue
             unhealthy = (
                 f.get("health_score", 1.0) < _ALERT_HEALTH_THRESHOLD
-                or len(f.get("service_alarms") or []) > 0
-            )
-            anomalous = (
-                f.get("is_family_outlier")
-                or f.get("is_family_dbscan_outlier")
-                or f.get("is_family_markov_outlier")
+                or (
+                    len(f.get("service_alarms") or []) > 0
+                    and float(f.get("mac_alarm_ratio", 0.0) or 0.0) >= _ALARM_SERVICE_DEVICE_PCT
+                )
             )
             meets_floor = (f.get("total_mac_count", 0) or 0) >= _ALARM_MIN_FAMILY_SIZE
-            if unhealthy and anomalous and meets_floor:
+            if unhealthy and meets_floor:
                 tagged = {**f, "wlan": f.get("wlan") or wlan}
                 for sa in tagged.get("sites_affected", []):
                     sa["site_name"] = site_map.get(sa["site_id"], sa["site_id"])
@@ -1385,12 +1433,18 @@ async def build_org_alerts_full(redis_client, site_map: dict[str, str]) -> dict:
             findings = findings_by_site[sid]
             health = health_by_site[sid]
             for f in findings:
+                if not family_passes_dbscan_markov_gate(f, _ALARM_DBSCAN_MARKOV_RATIO):
+                    continue
                 family_health = health.get(f.get("device_family"), {})
                 fam_health_score = family_health.get("health_score", 1.0)
                 fam_service_alarms = family_health.get("service_alarms") or []
+                fam_mac_alarm_ratio = float(family_health.get("mac_alarm_ratio", 0.0) or 0.0)
                 unhealthy = (
                     fam_health_score < _ALERT_HEALTH_THRESHOLD
-                    or len(fam_service_alarms) > 0
+                    or (
+                        len(fam_service_alarms) > 0
+                        and fam_mac_alarm_ratio >= _ALARM_SERVICE_DEVICE_PCT
+                    )
                 )
                 meets_floor = (f.get("total_mac_count", 0) or 0) >= _ALARM_MIN_FAMILY_SIZE
                 if unhealthy and meets_floor:
@@ -1401,6 +1455,7 @@ async def build_org_alerts_full(redis_client, site_map: dict[str, str]) -> dict:
                         "health_components": family_health.get("components"),
                         "service_alarms": fam_service_alarms,
                         "service_health": family_health.get("service_health") or {},
+                        "mac_alarm_ratio": fam_mac_alarm_ratio,
                     })
 
     site_alerts = []

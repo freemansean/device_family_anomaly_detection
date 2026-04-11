@@ -45,10 +45,12 @@ Detects anomalous client behavior across every site in a Juniper Mist org by:
 7. Exposing findings via a React + FastAPI dashboard. Dashboard read endpoints serve
    pre-computed aggregates from a Redis summary cache rebuilt at the tail of every
    detection cycle (see `summary_cache.py`).
-8. Firing a webhook when a device family carries **any** family-level anomaly label
-   (`is_family_outlier`, `is_family_dbscan_outlier`, or `is_family_markov_outlier`)
-   **and** is unhealthy (health score below threshold) **and** is at least
-   `ALARM_MIN_FAMILY_SIZE` MACs — triple gate to prevent single-device noise.
+8. Firing a webhook when a device family qualifies via **either** the inter-family
+   centroid detector (`is_family_outlier`, independently sufficient) **or** the
+   DBSCAN-or-Markov rollup gate (the per-MAC union of `is_dbscan_outlier` and
+   `is_markov_outlier` reaches `ALARM_DBSCAN_MARKOV_RATIO` of total family clients)
+   **and** is unhealthy (health score below threshold or service-alarm device
+   percentage met) **and** is at least `ALARM_MIN_FAMILY_SIZE` MACs.
 
 **This module has NO LLM in the detection path.** Pure ML + rule-based only.
 Client event data must not egress to third-party providers. Do not add any LLM calls
@@ -604,17 +606,16 @@ If MAC is not in client cache, attempt OUI lookup from the first 3 octets of the
 to get manufacturer. Set `device_family = "Unknown"`, `device_model = "Unknown"`.
 Do not drop events for unknown MACs — they still contribute to site-wide DBSCAN.
 
-**RSSI filter on failure events:** During enrichment, `_enrich_batch` drops any event
-whose `rssi` is below `ANOMALY_RSSI_MIN_THRESHOLD` (default `-87`) **and** whose event
-type is in the failure-only allowlist (`AUTH_FAILURE` + `ROAM_FAILURE` +
-`CLIENT_ASSOCIATION_FAILURE` categories — 11 types total). Successful events and
-non-auth event types (DHCP, DNS, ARP, captive portal, disassoc) always pass through
-regardless of signal strength — if they happened, the RF link was good enough.
-A previous implementation blanket-dropped every event with `rssi < threshold`,
-which was over-aggressive. The filter is threaded through a `filter_stats` dict
-and a single INFO summary at end of collect reports `weak_signal_skipped` counts.
-Set `ANOMALY_RSSI_MIN_THRESHOLD=-120` (below the noise floor) to effectively disable
-the filter.
+**RSSI filter (all event types):** During enrichment, `_enrich_batch` drops any
+event whose `rssi` is below `ANOMALY_RSSI_MIN_THRESHOLD` (default `-87`),
+regardless of event type. At the RF fringe every outcome is unreliable —
+successes may be racing retransmits, DHCP/DNS latencies inflate, and transient
+failures cannot be distinguished from coverage artifacts. Events with
+`rssi is None` (synthetic / boundary markers like `MARVIS_EVENT_STA_LEAVING`)
+always pass through since they have no signal-strength to evaluate. The filter
+is threaded through a `filter_stats` dict and a single INFO summary at end of
+collect reports `weak_signal_skipped` counts. Set `ANOMALY_RSSI_MIN_THRESHOLD=-120`
+(below the noise floor) to effectively disable the filter.
 
 **Transmission-failure filter on auth events:** `_enrich_batch` also drops auth-family
 events whose `status_code` is the radio-layer no-ack signal — the AP never received
@@ -896,7 +897,7 @@ admin-tunable input (`anomaly_dbscan_min_samples_pct`, integer 1–10 mapped to
 0.01–0.10, default 3 → 3%); eps is selected each run by the k-distance elbow
 ("knee") method and is not exposed in the GUI. There is no min_family_size
 pre-filter — every real MAC participates in DBSCAN, and small-family
-suppression is the job of the Finding Threshold downstream. DBSCAN sets
+suppression is the job of `ALARM_MIN_FAMILY_SIZE` downstream. DBSCAN sets
 `dbscan_label`, `is_dbscan_outlier`, and `dbscan_family_noise_ratio` on each
 MAC record. These values are stored on anomaly records and used by the
 frontend, but DBSCAN noise ratio no longer determines which families are
@@ -1023,7 +1024,15 @@ and episode-sequence scoring paths were removed; the baseline persists only
 After all stages, roll up to device family findings:
 - For each device family: count `is_outlier` MACs / total MACs in family
 - `is_outlier = is_if_outlier OR is_dbscan_outlier OR is_family_outlier OR is_markov_outlier`
-- If outlier_ratio >= `ANOMALY_FINDING_THRESHOLD` (default 0.2), generate a finding
+- A finding is generated whenever the family has any outlier MAC, a Markov family
+  flag, or a centroid (`is_family_outlier`) flag. There is **no detector-side outlier-
+  ratio gate** — every family with signal surfaces in the Findings UI so operators
+  can browse low-ratio findings. Alarm escalation (webhook + OrgAlerts feed) is
+  governed separately by the General Config alarm gates: `ALARM_DBSCAN_MARKOV_RATIO`
+  (per-MAC union of DBSCAN and Markov), centroid bypass (`is_family_outlier`),
+  health score, service-alarm device percentage, and `ALARM_MIN_FAMILY_SIZE`.
+- Each finding carries `dbscan_or_markov_outlier_count` / `dbscan_or_markov_outlier_ratio`
+  so the alarm gate can apply the rollup ratio without re-reading per-MAC anomaly records.
 - Minimum family size to generate a finding:
   - Families that used org-level IF pooling: **MIN_PEERS** (`ANOMALY_MIN_PEERS`, default 3) — higher bar because cross-site data was borrowed; avoids hallucinated site findings driven by org noise
   - All others (site-local IF or IF skipped): **`ANOMALY_FINDING_MIN_SIZE`** (default 2) — even 2 devices flagged by centroid detection is real site signal worth reporting
@@ -1084,6 +1093,27 @@ health score itself.
 
 **Score ranges:** 1.0 = no failures observed. 0.0 = all outcome-bearing events are failures.
 Default alert threshold: `ANOMALY_HEALTH_SCORE_THRESHOLD = 0.75`.
+
+**Per-service rollup and device-alarm ratio:** Alongside the aggregate health
+score, `compute_family_health` also computes per-service health and
+maintains two parallel device-alarm tallies used by the alarm gates:
+
+- **Per-service** — for each of auth/roam/dhcp/dns/arp the family record
+  carries `service_health[svc]` (mean of per-MAC service success ratio across
+  active MACs only), `service_alarm_counts[svc] = {active, unhealthy}`, and
+  `service_alarms` — the list of services where `unhealthy / active >
+  FAMILY_SERVICE_ALARM_THRESHOLD` (50%). A MAC is "active" in a service when
+  it has any events in that service bucket; a MAC is "unhealthy" in that
+  service when its individual `success / (success + failure)` falls below
+  `SERVICE_HEALTH_THRESHOLD` (50%).
+- **Device-level** — `mac_alarm_count` is the count of MACs in the family
+  that tripped at least one per-MAC service alarm (any service below
+  `SERVICE_HEALTH_THRESHOLD`); `mac_alarm_ratio = mac_alarm_count / mac_count`.
+  This is what the new `ALARM_SERVICE_DEVICE_PCT` General Config knob gates
+  on. The org-level rollup in `score_org_wide` sums the per-site
+  `mac_alarm_count` over the per-site `mac_count`, so the org alarm
+  threshold applies to the full org-wide family population, not a single
+  site.
 
 **Key functions:**
 - `compute_family_health(features)` — pure computation, no I/O, testable in isolation
@@ -1179,17 +1209,34 @@ render each row correctly without re-deriving the suffix logic.
 **Purpose:** Apply the alert gates and POST qualifying findings to the webhook URL.
 
 **Alert gates — all conditions must be true to fire the webhook:**
-1. `finding["is_family_outlier"] == True` — the centroid distance detector flagged the
-   whole family as behaviorally different from the healthy reference. Single-device IF or
-   DBSCAN outliers are visible in the UI but never trigger the webhook.
-2. `family health_score < ANOMALY_HEALTH_SCORE_THRESHOLD` — the family is also measurably
-   failing, not just behaviorally unusual.
-3. `finding["total_mac_count"] >= ALARM_MIN_FAMILY_SIZE` — the family is large enough to
-   be worth alerting on. Default `1` (i.e. no suppression); operators raise this via the
-   General Config tab to mute small-population families. Findings below the floor still
-   appear in the UI; only the webhook + org/site alert feeds suppress them. The same
-   floor is applied in `get_org_alerts` and `get_org_summary` so UI alert badges stay in
-   sync with webhook dispatch.
+1. **Anomaly gate** — the family qualifies via **either**:
+   - `finding["is_family_outlier"] == True` — the inter-family centroid detector
+     flagged the whole family as behaviorally different from the healthy
+     reference. **Independently sufficient** — bypasses the rollup ratio.
+   - **OR** the DBSCAN-or-Markov rollup ratio: the per-MAC union of
+     `is_dbscan_outlier` and `is_markov_outlier` reaches `ALARM_DBSCAN_MARKOV_RATIO`
+     (default 0.20) of `total_mac_count`. A single client flagged by both
+     detectors counts once. Each finding carries `dbscan_or_markov_outlier_count`
+     so the gate applies without re-reading per-MAC anomaly records.
+
+   The shared helper `webhook_dispatcher.family_passes_dbscan_markov_gate(finding,
+   ratio)` implements both branches and is imported by `routes.py` so
+   `get_org_alerts`, `get_org_summary`, and `get_org_alerts_full` use the exact
+   same gate as the webhook dispatcher.
+2. **Health gate** — `family health_score < ANOMALY_HEALTH_SCORE_THRESHOLD` **OR**
+   the service-alarm device-percentage gate fires (`alarm_service_device_pct` of
+   the family's MACs have individually tripped a service alarm). Confirms the
+   behavioral signal is accompanied by measurable failure degradation.
+3. **Family-size gate** — `finding["total_mac_count"] >= ALARM_MIN_FAMILY_SIZE`.
+   Default `1` (i.e. no suppression); operators raise this via the General Config
+   tab to mute small-population families. Findings below the floor still appear
+   in the UI; only the webhook + org/site alert feeds suppress them.
+
+All four General Config alarm knobs (`alarm_dbscan_markov_ratio`,
+`anomaly_health_score_threshold`, `alarm_service_device_pct`,
+`alarm_min_family_size`) live under the `general` section because they gate
+alarm generation, not the detection pipeline itself. Detection-side knobs
+remain under the `anomaly` section in `config.py`.
 
 Finding severity (`minimal` / `moderate` / `significant`) is computed and stored on
 findings for the UI, but is **not** emitted in the webhook payload — downstream
@@ -1688,7 +1735,6 @@ ANOMALY_IF_CONTAMINATION=0.05
 # min_samples = max(3, int(n_clients * pct))
 # eps         = k-distance elbow per run (no env var)
 ANOMALY_DBSCAN_MIN_SAMPLES_PCT=3
-ANOMALY_FINDING_THRESHOLD=0.2
 ANOMALY_MIN_PEERS=5
 ANOMALY_MIN_MAC_EVENTS=20
 ANOMALY_CENTROID_DIST_THRESHOLD=0.35   # cosine distance (L2-normalized unit vectors) above which a family centroid is flagged as is_family_outlier
@@ -1710,13 +1756,24 @@ ANOMALY_HEALTH_SCORE_THRESHOLD=0.75
 # the main findings UI — only alerting is muted.
 ALARM_MIN_FAMILY_SIZE=1
 
-# Event collector — drop failure events whose RSSI is below this floor (dBm).
-# Only applies to auth/roam/association failure event types; successful events and
-# non-auth types pass through regardless. Set to -120 (below noise floor) to disable.
+# DBSCAN-or-Markov rollup alarm gate. A device family fires an alarm via this
+# path when the per-MAC union of is_dbscan_outlier and is_markov_outlier reaches
+# this fraction of total_mac_count (a single client flagged by both detectors
+# counts once). Inter-family centroid (is_family_outlier) is independent of this
+# gate and remains independently sufficient to fire an alarm. Lives under the
+# General Config tab in the GUI; applies to both webhook dispatch and the
+# OrgAlerts feed at site and org level.
+ALARM_DBSCAN_MARKOV_RATIO=0.20
+
+# Event collector — drop any event whose RSSI is below this floor (dBm),
+# regardless of type. Events with no rssi field (synthetic/boundary markers)
+# always pass through. Set to -120 (below noise floor) to disable.
 ANOMALY_RSSI_MIN_THRESHOLD=-87
 
-# Webhook — gates: is_family_outlier AND health_score < threshold AND total_mac_count >= ALARM_MIN_FAMILY_SIZE.
-# Any severity triggers dispatch — severity is informational only.
+# Webhook — gates: (is_family_outlier OR DBSCAN/Markov per-MAC union >= ALARM_DBSCAN_MARKOV_RATIO)
+# AND (health_score < ANOMALY_HEALTH_SCORE_THRESHOLD OR service-alarm device pct met)
+# AND total_mac_count >= ALARM_MIN_FAMILY_SIZE. Any severity triggers dispatch —
+# severity is informational only.
 ANOMALY_WEBHOOK_URL=https://project-sasquatch-production.up.railway.app/webhook/anomaly
 
 # Frontend

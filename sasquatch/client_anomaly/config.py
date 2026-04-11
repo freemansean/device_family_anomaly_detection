@@ -44,6 +44,24 @@ DEFAULTS = {
         # (alongside alarm_min_family_size) because it gates alarm generation at
         # both org and site level, not the anomaly detection pipeline itself.
         "anomaly_health_score_threshold": {"default": 0.80, "env": "ANOMALY_HEALTH_SCORE_THRESHOLD", "cast": float},
+        # Service-alarm device-percentage threshold for dual-gate alarm
+        # generation. A device family is "service-alarming" when at least this
+        # fraction of its MACs have individually tripped a service alarm
+        # (one or more of auth/roam/dhcp/dns/arp below SERVICE_HEALTH_THRESHOLD).
+        # Lives under General Config alongside anomaly_health_score_threshold —
+        # both gate webhook dispatch and the org/site alert feeds. Default 0.0
+        # preserves the prior "any service alarm fires" behavior.
+        "alarm_service_device_pct": {"default": 0.0, "env": "ALARM_SERVICE_DEVICE_PCT", "cast": float},
+        # Fraction of clients in a device family that must be flagged as
+        # anomalous by *either* DBSCAN or Markov before an alarm fires for that
+        # family. The union is taken per-MAC: a single client flagged by both
+        # detectors counts once. Inter-family centroid detection
+        # (is_family_outlier) is independent of this gate and remains
+        # independently sufficient to fire an alarm. Applies at both org and
+        # site level, gating both webhook dispatch and the OrgAlerts UI feed.
+        # Default 0.20 = at least 20% of family clients must be DBSCAN/Markov-
+        # flagged before alarming on the rollup signal.
+        "alarm_dbscan_markov_ratio": {"default": 0.20, "env": "ALARM_DBSCAN_MARKOV_RATIO", "cast": float},
         # RSSI floor (dBm) below which *failure* events are discarded during
         # enrichment. Clients at the fringe of RF coverage generate auth/roam
         # failure events that reflect poor signal, not device-level behavior —
@@ -79,8 +97,6 @@ DEFAULTS = {
         "anomaly_centroid_healthy_ref_threshold": {"default": 0.75, "env": "ANOMALY_CENTROID_HEALTHY_REF_THRESHOLD", "cast": float},
         # Min healthy families for healthy-only reference mode
         "anomaly_centroid_healthy_ref_min": {"default": 2, "env": "ANOMALY_CENTROID_HEALTHY_REF_MIN", "cast": int},
-        # Finding rollup outlier ratio threshold
-        "anomaly_finding_threshold": {"default": 0.2, "env": "ANOMALY_FINDING_THRESHOLD", "cast": float},
         # Min family size for site-level finding generation
         "anomaly_finding_min_size": {"default": 2, "env": "ANOMALY_FINDING_MIN_SIZE", "cast": int},
         # Markov: fraction of family clients that must be outliers
