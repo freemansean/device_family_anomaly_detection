@@ -616,6 +616,19 @@ and a single INFO summary at end of collect reports `weak_signal_skipped` counts
 Set `ANOMALY_RSSI_MIN_THRESHOLD=-120` (below the noise floor) to effectively disable
 the filter.
 
+**Transmission-failure filter on auth events:** `_enrich_batch` also drops auth-family
+events whose `status_code` is the radio-layer no-ack signal — the AP never received
+the client's frame, so there is no actual auth decision against the device. The filter
+covers two event types and the sign convention differs between them:
+
+- `MARVIS_EVENT_CLIENT_AUTH_FAILURE` reports the code as **`-79`**
+- `MARVIS_EVENT_CLIENT_MAC_AUTH_FAILURE` reports the same condition as **`+79`**
+
+Both indicate poor RF coverage, not device-level auth behavior, and counting them as
+auth failures inflates failure ratios and depresses health scores for devices in
+marginal coverage. The mapping lives in `_TRANSMISSION_FAILURE_IGNORED` and is rendered
+into the same end-of-collect summary line as the RSSI filter (`transmission_failure_skipped`).
+
 **Event type reference:** The complete known Mist client event taxonomy (sourced from
 `GET /api/v1/const/client_events`) contains 59 event types. Store this list at service
 startup — it defines the dimensions of the frequency vector used for ML input.
@@ -928,6 +941,22 @@ mode ran each cycle.
 Anomaly records and findings carry `centroid_dist_score` (higher = more anomalous) so
 the distance value is always observable. There is no `centroid_detection_method` field
 anymore — the method is always cosine distance.
+
+**Hidden catch-all families:** `Unknown` and `IoT (Unknown)` are heterogeneous
+buckets for devices where Mist returned no fingerprint and the OUI lookup also
+failed. Mixing unrelated devices into one "family" produces noisy centroid /
+IF / Markov signal that is not actionable, so the set defined in
+`anomaly_detector.HIDDEN_FAMILIES` is suppressed at three rollup points:
+
+- Site finding rollup (`anomaly_detector.score`)
+- Org-wide finding rollup (`anomaly_detector.score_org_wide`)
+- Per-family health scoring (`health_scorer.compute_family_health` —
+  duplicates the set as `_HIDDEN_FAMILIES` to avoid a circular import back
+  into `anomaly_detector`)
+
+The frontend cluster viz components apply the same set client-side, and
+individual MACs in these families are still visible in MAC drilldowns and
+the raw anomaly records — only the family-level rollup is suppressed.
 
 **Stage 2 — Isolation Forest (per device family):**
 
@@ -1322,8 +1351,8 @@ detection cycle. Must not raise — failures are logged and swallowed.
 
 ### `summary_cache.py`
 
-**Purpose:** Pre-computed dashboard aggregates so the GUI's Site Overview,
-Device Family Overview, Findings, and Alerts pages serve out of a single
+**Purpose:** Pre-computed dashboard aggregates so the GUI's Site WLAN Family
+Insights, Org Family Insights, Findings, and Alerts pages serve out of a single
 Redis GET between detection cycles. Polling cadence on those pages is 30–60s;
 detection runs hourly; without this layer the same expensive aggregation
 runs ~60–120 times per real data change.
@@ -1542,11 +1571,22 @@ computed as a mac_count-weighted average of per-site health scores across all si
 
 ### React Frontend
 
-**1. Site Overview (`SiteOverview.jsx`)**
+**1. Site WLAN Family Insights (`SiteOverview.jsx`)**
+- Tab is labelled "Site WLAN Family Insights" (was "Site Overview"). The component
+  filename is unchanged for git-history continuity.
 - Heatmap: rows = device families, columns = event categories, cell = failure ratio
 - Color scale: green (0%) → yellow → red (100%)
 - Anomaly badge per device family row (`family` / `significant` / `moderate` / OK)
 - **Health column**: bar + percentage showing family health score (green ≥85%, yellow 75–85%, orange 55–75%, red <55%). Hover for per-category breakdown.
+- **PCA column**: per-row checkbox controlling which families render in the
+  adjacent `ClusterViz`. Selection is seeded once per dataset to
+  `{flagged families} ∪ {top 3 by client count}` and reset whenever the WLAN or
+  site changes. The "uncheck all PCA" link clears the selection. ClusterViz
+  itself owns no toggle state — the table is the single source of truth.
+- The Markov badge fires from the canonical rollup
+  (`anomalous_macs / total_family_macs ≥ markov_family_outlier_ratio` AND
+  `total ≥ anomaly_finding_min_size`), matching `markov_analyzer.run_markov_analysis`
+  so the badge can never light up unless a finding would actually fire.
 - Data source: `events/summary` + `findings` + `health` (three concurrent fetches)
 - Auto-refreshes every 60s
 
@@ -1554,6 +1594,11 @@ computed as a mac_count-weighted average of per-site health scores across all si
 - Same heatmap layout but aggregated across all org sites
 - Anomaly badge reflects worst finding across all sites for that family
 - **Health column**: mac_count-weighted average health score from all sites (each device equal vote). Hover tooltip shows per-category failure rates.
+- **PCA column**: same checkbox-driven selection as the site view, controlling
+  the embedded `OrgClusterViz`. When the table passes an explicit selection,
+  the org viz honors it as-is and skips the `MIN_DISPLAY_CLIENTS` declutter
+  (the user opted that family in by hand). When no selection is passed it
+  falls back to the legacy size threshold.
 - No "Device Family Behavior Explanation" / Shapley column — that detail belongs in drilldowns
 - Data source: `/api/v1/org/family-insights`
 
@@ -1593,7 +1638,9 @@ computed as a mac_count-weighted average of per-site health scores across all si
 **6. Org Overview (`OrgOverview.jsx`)**
 - Four tabs, left-to-right: **Org Alerts** (default, red accent), **Org Overview**, **Org Family Insights**, **Findings**
 - "Org Alerts" tab styled with red border/background (`#e05555`) to distinguish it from the blue-accented tabs.
-- **Org Overview tab**: Site cards sorted by `event_count` descending (highest-traffic sites first); sites with no data sort to the bottom. Site card alert state uses the dual-gate: a site is "Alert" (red) only when `alert_count > 0`.
+- **Org Overview tab**: Site cards only — no embedded PCA. The org PCA lives
+  inside the Org Family Insights tab where the table-driven family selection
+  can control it. Cards sorted by `event_count` descending (highest-traffic sites first); sites with no data sort to the bottom. Site card alert state uses the dual-gate: a site is "Alert" (red) only when `alert_count > 0`.
 - Site card anomaly severity badges use the green color spectrum (not red/amber)
 - Header badges show **org-wide finding counts** from `sasquatch:org_findings:{wlan}` — not aggregates of per-site data. Counts are returned by `GET /org/summary` in `org_significant_count`, `org_moderate_count`, `org_minimal_count`, `org_alert_count`, `org_finding_count`.
 
@@ -1703,6 +1750,13 @@ global mutex so a poll cannot overlap with a manual collect or detect run.
 
 The org-level pipeline uses the same `score_org_wide()` function in
 `anomaly_detector.py` and the same dual alert gate in `webhook_dispatcher.py`.
+
+**Org PCA outlier source:** `GET /api/v1/org/cluster-viz` reads outlier flags
+from `sasquatch:org_anomalies:{site}:{wlan}` (written by `score_org_wide`),
+not the per-site `anomalies` key. A MAC is therefore circled on the Org PCA
+only when it is an outlier against the combined org-wide population of its
+family — the same pool the Org Findings tab fires on. Reading the per-site
+key would double-count site-local outliers that the org rollup discards.
 
 ---
 
