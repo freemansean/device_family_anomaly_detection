@@ -67,12 +67,10 @@ DEFAULTS = {
         "anomaly_min_peers": {"default": 3, "env": "ANOMALY_MIN_PEERS", "cast": int},
         # PCA variance retained for DBSCAN
         "anomaly_dbscan_pca_variance": {"default": 0.95, "env": "ANOMALY_DBSCAN_PCA_VARIANCE", "cast": float},
-        # DBSCAN epsilon
-        "anomaly_dbscan_eps": {"default": 2.5, "env": "ANOMALY_DBSCAN_EPS", "cast": float},
-        # DBSCAN min_samples
-        "anomaly_dbscan_min_samples": {"default": 5, "env": "ANOMALY_DBSCAN_MIN_SAMPLES", "cast": int},
-        # Min family size for DBSCAN participation
-        "anomaly_dbscan_min_family_size": {"default": 2, "env": "ANOMALY_DBSCAN_MIN_FAMILY_SIZE", "cast": int},
+        # DBSCAN min_samples is auto-tuned per run as max(3, n_clients * pct).
+        # `pct` is configured here as an integer 1–10, mapped at runtime to
+        # 0.01–0.10. Default 3 → 0.03 (3% of n_clients, floor of 3).
+        "anomaly_dbscan_min_samples_pct": {"default": 3, "env": "ANOMALY_DBSCAN_MIN_SAMPLES_PCT", "cast": int},
         # DBSCAN family noise threshold
         "anomaly_dbscan_family_noise_threshold": {"default": 0.5, "env": "ANOMALY_DBSCAN_FAMILY_NOISE_THRESHOLD", "cast": float},
         # Cosine distance threshold for family flagging (Stage 1b)

@@ -242,6 +242,14 @@ def detect_stuck_loop(mac_events: list[dict]) -> tuple[bool, str | None, float]:
     _cfg("markov_stuck_loop_threshold") of all transitions AND at least one side must
     be a failure type/category.
 
+    Episode-AP anchoring: each successful auth/association/roam boundary event
+    establishes the "episode AP". Subsequent events whose `ap` differs from the
+    episode AP are dropped before pair counting. This discards goodbye events
+    (e.g. STA_LEAVING on the previous AP after a successful reassociation to a
+    new one) while preserving legitimate follow-up traffic (GW_ARP_OK, DNS_OK)
+    on the starting AP. Events missing `ap` are kept, so older unenriched data
+    is not silently dropped.
+
     Returns:
       (is_stuck, dominant_pair_label, dominant_pair_fraction)
       dominant_pair_label is "TYPE_A→TYPE_B" or "CAT_A→CAT_B" when stuck.
@@ -250,11 +258,25 @@ def detect_stuck_loop(mac_events: list[dict]) -> tuple[bool, str | None, float]:
         return False, None, 0.0
 
     sorted_events = sorted(mac_events, key=lambda e: e.get("timestamp", 0))
+
+    filtered: list[dict] = []
+    episode_ap: str = ""
+    for event in sorted_events:
+        etype = event.get("type", "")
+        ev_ap = event.get("ap") or ""
+        if etype in EPISODE_BOUNDARY_EVENTS:
+            episode_ap = ev_ap
+            filtered.append(event)
+            continue
+        if episode_ap and ev_ap and ev_ap != episode_ap:
+            continue
+        filtered.append(event)
+
     pair_counts: Counter = Counter()
     cat_pair_counts: Counter = Counter()
-    for k in range(len(sorted_events) - 1):
-        a = sorted_events[k].get("type", "")
-        b = sorted_events[k + 1].get("type", "")
+    for k in range(len(filtered) - 1):
+        a = filtered[k].get("type", "")
+        b = filtered[k + 1].get("type", "")
         if a and b:
             pair_counts[(a, b)] += 1
             cat_a = _EVENT_TYPE_TO_CATEGORY.get(a, "OTHER")
@@ -574,14 +596,15 @@ async def run_markov_analysis(
     for mac, mac_evts in mac_raw_events.items():
         mac_results[mac] = analyze_mac(mac_evts, log_prob_matrix, event_type_to_idx)
 
-    # Family-level Markov rollup. Evaluatable = MACs with enough scoreable
-    # episodes OR a stuck-loop signal. Stuck-loop devices often have zero
-    # proper episodes (they never associate cleanly), so without the union
-    # they would never contribute to the family ratio.
+    # Family-level Markov rollup. The ratio is anomalous MACs over TOTAL family
+    # MACs so the operator-facing "Family Outlier Ratio" slider means what it
+    # says ("X% of the family"). Evaluatable is still tracked for reporting so
+    # the UI can show "5 flagged / 7 evaluated / 19 total" if needed.
     family_markov: dict[str, dict] = {}
     min_scoreable = _cfg("markov_min_scoreable_episodes")
     family_ratio_threshold = _cfg("markov_family_outlier_ratio")
     for family, family_macs in family_groups.items():
+        total = len(family_macs)
         evaluatable = [
             m for m in family_macs
             if m in mac_results and (
@@ -590,7 +613,7 @@ async def run_markov_analysis(
             )
         ]
 
-        if not evaluatable:
+        if total == 0:
             family_markov[family] = {
                 "is_family_markov_outlier": False,
                 "markov_family_reason": None,
@@ -603,7 +626,7 @@ async def run_markov_analysis(
         anomalous_macs = [
             m for m in evaluatable if mac_results[m]["is_markov_outlier"]
         ]
-        ratio = len(anomalous_macs) / len(evaluatable)
+        ratio = len(anomalous_macs) / total
         is_family_outlier = ratio >= family_ratio_threshold
 
         # Pick the family reason from the dominant per-MAC reason among the
@@ -630,9 +653,9 @@ async def run_markov_analysis(
         if is_family_outlier:
             log.info(
                 "[markov] Family [%s] flagged (%s): %d/%d MACs (%.0f%%) "
-                "[site=%s wlan=%s]",
-                family, family_reason, len(anomalous_macs), len(evaluatable),
-                ratio * 100, site_id, wlan,
+                "(%d evaluatable) [site=%s wlan=%s]",
+                family, family_reason, len(anomalous_macs), total,
+                ratio * 100, len(evaluatable), site_id, wlan,
             )
 
     mac_results["__family_markov__"] = family_markov

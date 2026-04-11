@@ -253,6 +253,17 @@ export default function App() {
 
   // Utilities dropdown
   const [utilDropdownOpen, setUtilDropdownOpen] = useState(false);
+  const utilDropdownRef = useRef(null);
+  useEffect(() => {
+    if (!utilDropdownOpen) return;
+    function handleOutside(e) {
+      if (utilDropdownRef.current && !utilDropdownRef.current.contains(e.target)) {
+        setUtilDropdownOpen(false);
+      }
+    }
+    document.addEventListener("mousedown", handleOutside);
+    return () => document.removeEventListener("mousedown", handleOutside);
+  }, [utilDropdownOpen]);
 
   // Unified config modal
   const [configModalOpen, setConfigModalOpen] = useState(false);
@@ -787,9 +798,7 @@ export default function App() {
   function handleOpenAnomalyConfig() {
     setAnomalyConfigDraft(anomalyConfig ? { ...anomalyConfig } : {
       anomaly_if_contamination: 0.05,
-      anomaly_dbscan_eps: 2.5,
-      anomaly_dbscan_min_samples: 5,
-      anomaly_dbscan_min_family_size: 2,
+      anomaly_dbscan_min_samples_pct: 3,
       anomaly_finding_threshold: 0.2,
       anomaly_min_peers: 3,
       anomaly_centroid_dist_threshold: 0.35,
@@ -987,10 +996,9 @@ export default function App() {
           )}
 
           {/* Utilities Dropdown */}
-          <div style={{ position: "relative" }}>
+          <div style={{ position: "relative" }} ref={utilDropdownRef}>
             <button
               onClick={() => setUtilDropdownOpen(o => !o)}
-              onBlur={() => setTimeout(() => setUtilDropdownOpen(false), 150)}
               style={{ background: "#222", color: "#888", border: "1px solid #444", padding: "4px 8px", borderRadius: "4px", cursor: "pointer", fontSize: "13px", fontFamily: "monospace" }}
             >
               Utilities ▾
@@ -998,18 +1006,29 @@ export default function App() {
             {utilDropdownOpen && (
               <div style={{ position: "absolute", top: "100%", left: 0, zIndex: 100, background: "#1a1a1a", border: "1px solid #444", borderRadius: "4px", marginTop: "2px", minWidth: "180px", boxShadow: "0 4px 12px rgba(0,0,0,0.5)" }}>
                 {[
+                  { key: "collect", label: "Build Cache", handler: handleCollectEvents, loadLabel: "Building…", okLabel: "Built ✓", confirmLabel: "Are you sure?", blockedByActiveOp: true },
+                  { key: "detect", label: "Run Detection", handler: handleDetect, loadLabel: "Detecting…", okLabel: "Done ✓", blockedByActiveOp: true },
                   { key: "clientRefresh", label: "Client Refresh", handler: handleClientRefresh, loadLabel: "Refreshing…", okLabel: "Refreshed ✓" },
+                  { key: "flush", label: "Flush Data", handler: handleFlush, loadLabel: "Flushing…", okLabel: "Flushed ✓", confirmLabel: "Confirm Flush?" },
                 ].map(item => {
                   const s = actionState[item.key];
-                  const busy = s === "loading";
-                  const label = busy ? item.loadLabel : s === "ok" ? item.okLabel : s === "error" ? "Error ✗" : item.label;
+                  const busy = s === "loading" || (item.blockedByActiveOp && !!activeOperation);
+                  const confirming = s === "confirm";
+                  const label = busy ? item.loadLabel : confirming ? item.confirmLabel : s === "ok" ? item.okLabel : s === "error" ? "Error ✗" : item.label;
+                  const color = s === "ok" ? "#2d7a4f" : s === "error" ? "#e05555" : confirming ? "#c08030" : busy ? "#555" : "#ccc";
                   return (
                     <div
                       key={item.key}
-                      onMouseDown={() => { if (!busy) { item.handler(); setUtilDropdownOpen(false); } }}
+                      onMouseDown={() => {
+                        if (busy) return;
+                        item.handler();
+                        // Keep the dropdown open while awaiting the second confirm click;
+                        // close immediately for non-confirming or already-confirmed actions.
+                        if (!item.confirmLabel || confirming) setUtilDropdownOpen(false);
+                      }}
                       onMouseEnter={e => { if (!busy) e.currentTarget.style.background = "#252525"; }}
                       onMouseLeave={e => e.currentTarget.style.background = "transparent"}
-                      style={{ padding: "7px 12px", cursor: busy ? "default" : "pointer", fontSize: "12px", fontFamily: "monospace", color: s === "ok" ? "#2d7a4f" : s === "error" ? "#e05555" : busy ? "#555" : "#ccc", borderBottom: "1px solid #2a2a2a" }}
+                      style={{ padding: "7px 12px", cursor: busy ? "default" : "pointer", fontSize: "12px", fontFamily: "monospace", color, borderBottom: "1px solid #2a2a2a" }}
                     >
                       {label}
                     </div>
@@ -1040,40 +1059,6 @@ export default function App() {
 
         {/* Action bar */}
         <div style={{ marginTop: "10px", display: "flex", gap: "8px", alignItems: "center", flexWrap: "wrap" }}>
-
-          {/* Build Cache — org-wide (refresh clients, then collect events) */}
-          {(() => {
-            const s = actionState.collect;
-            const busy = s === "loading" || !!activeOperation;
-            return (
-              <button
-                onClick={handleCollectEvents}
-                disabled={busy}
-                title={activeOperation ? `Blocked: ${activeOperation} in progress` : "Refresh client cache, then collect events from all org sites"}
-                style={actionBtnStyle(s === "confirm" ? "warn" : s)}
-              >
-                {s === "loading" ? "Building…" : s === "confirm" ? "Are you sure?" : s === "ok" ? "Built ✓" : s === "error" ? "Error ✗" : "Build Cache"}
-              </button>
-            );
-          })()}
-
-          {/* Run Detection — org-wide */}
-          {(() => {
-            const s = actionState.detect;
-            const busy = s === "loading" || !!activeOperation;
-            return (
-              <button
-                onClick={handleDetect}
-                disabled={busy}
-                title={activeOperation ? `Blocked: ${activeOperation} in progress` : "Run org-wide anomaly detection pipeline"}
-                style={actionBtnStyle(s)}
-              >
-                {s === "loading" ? "Detecting…" : s === "ok" ? "Done ✓" : s === "error" ? "Error ✗" : "Run Detection"}
-              </button>
-            );
-          })()}
-
-          <div style={{ width: "1px", height: "24px", background: "#2a2a2a" }} />
 
           {/* Event Polling Toggle */}
           {(() => {
@@ -1121,22 +1106,6 @@ export default function App() {
                 }}
               >
                 {s === "loading" ? "…" : s === "error" ? "Error ✗" : on ? "Auto Detect: On" : "Auto Detect: Off"}
-              </button>
-            );
-          })()}
-
-          <div style={{ width: "1px", height: "24px", background: "#2a2a2a" }} />
-
-          {/* Flush Events */}
-          {(() => {
-            const s = actionState.flush;
-            return (
-              <button
-                onClick={handleFlush}
-                disabled={s === "loading"}
-                style={actionBtnStyle(s === "confirm" ? "warn" : s)}
-              >
-                {s === "loading" ? "Flushing…" : s === "confirm" ? "Confirm Flush?" : s === "ok" ? "Flushed ✓" : s === "error" ? "Error ✗" : "Flush Events"}
               </button>
             );
           })()}
@@ -1419,29 +1388,11 @@ export default function App() {
 
               <div style={{ marginBottom: "18px" }}>
                 <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: "5px" }}>
-                  <div style={{ color: "#888", fontSize: "11px" }}>DBSCAN EPSILON (EPS)</div>
-                  <div style={{ color: "#7ec8e3", fontSize: "13px", fontWeight: "bold" }}>{anomalyConfigDraft.anomaly_dbscan_eps.toFixed(1)}</div>
+                  <div style={{ color: "#888", fontSize: "11px" }}>DBSCAN MIN SAMPLES (% OF CLIENTS)</div>
+                  <div style={{ color: "#7ec8e3", fontSize: "13px", fontWeight: "bold" }}>{(anomalyConfigDraft.anomaly_dbscan_min_samples_pct ?? 3)}% ({((anomalyConfigDraft.anomaly_dbscan_min_samples_pct ?? 3) / 100).toFixed(2)})</div>
                 </div>
-                <input type="range" min={1} max={100} value={Math.round(anomalyConfigDraft.anomaly_dbscan_eps * 10)} onChange={(e) => setAnomalyConfigDraft(d => ({ ...d, anomaly_dbscan_eps: Number(e.target.value) / 10 }))} style={{ width: "100%", accentColor: "#7ec8e3", cursor: "pointer" }} />
-                <div style={{ color: "#555", fontSize: "11px", marginTop: "4px" }}>Neighborhood radius in PCA-reduced feature space. Higher = looser clusters (fewer noise/outlier points). Re-tune with a k-distance plot.</div>
-              </div>
-
-              <div style={{ marginBottom: "18px" }}>
-                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: "5px" }}>
-                  <div style={{ color: "#888", fontSize: "11px" }}>DBSCAN MIN SAMPLES</div>
-                  <div style={{ color: "#7ec8e3", fontSize: "13px", fontWeight: "bold" }}>{anomalyConfigDraft.anomaly_dbscan_min_samples}</div>
-                </div>
-                <input type="range" min={2} max={30} value={anomalyConfigDraft.anomaly_dbscan_min_samples} onChange={(e) => setAnomalyConfigDraft(d => ({ ...d, anomaly_dbscan_min_samples: Number(e.target.value) }))} style={{ width: "100%", accentColor: "#7ec8e3", cursor: "pointer" }} />
-                <div style={{ color: "#555", fontSize: "11px", marginTop: "4px" }}>Minimum neighbors required for a point to be a DBSCAN core point. Lower = easier cluster formation (fewer orphan noise points).</div>
-              </div>
-
-              <div style={{ marginBottom: "18px" }}>
-                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: "5px" }}>
-                  <div style={{ color: "#888", fontSize: "11px" }}>DBSCAN MIN FAMILY SIZE</div>
-                  <div style={{ color: "#7ec8e3", fontSize: "13px", fontWeight: "bold" }}>{anomalyConfigDraft.anomaly_dbscan_min_family_size}</div>
-                </div>
-                <input type="range" min={1} max={20} value={anomalyConfigDraft.anomaly_dbscan_min_family_size} onChange={(e) => setAnomalyConfigDraft(d => ({ ...d, anomaly_dbscan_min_family_size: Number(e.target.value) }))} style={{ width: "100%", accentColor: "#7ec8e3", cursor: "pointer" }} />
-                <div style={{ color: "#555", fontSize: "11px", marginTop: "4px" }}>Minimum MACs a family must have to participate in site-wide DBSCAN. Smaller families skip DBSCAN but still go through Isolation Forest.</div>
+                <input type="range" min={1} max={10} value={anomalyConfigDraft.anomaly_dbscan_min_samples_pct ?? 3} onChange={(e) => setAnomalyConfigDraft(d => ({ ...d, anomaly_dbscan_min_samples_pct: Number(e.target.value) }))} style={{ width: "100%", accentColor: "#7ec8e3", cursor: "pointer" }} />
+                <div style={{ color: "#555", fontSize: "11px", marginTop: "4px" }}>DBSCAN min_samples is auto-tuned per run from population size: <code>max(3, n_clients × pct)</code>. This slider sets <code>pct</code> (1–10 → 0.01–0.10). Small sites get a tight floor of 3; larger sites scale up automatically. Epsilon is auto-selected each run via the k-distance elbow method — no manual tuning required.</div>
               </div>
 
               <div style={{ marginBottom: "18px" }}>
