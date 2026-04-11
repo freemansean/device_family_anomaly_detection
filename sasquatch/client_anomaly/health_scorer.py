@@ -198,6 +198,9 @@ def compute_family_health(features: dict[str, dict]) -> dict[str, dict]:
     family_service_health_vals: dict[str, dict[str, list[float]]] = defaultdict(
         lambda: {svc: [] for svc in SERVICES}
     )
+    # Count of MACs in each family that individually tripped at least one
+    # service alarm — used by the device-percentage alarm gate.
+    family_mac_alarm_count: dict[str, int] = defaultdict(int)
 
     for record in features.values():
         vec = record.get("vector", {})
@@ -212,12 +215,16 @@ def compute_family_health(features: dict[str, dict]) -> dict[str, dict]:
         family_total_events[family] += record.get("event_count", 0)
 
         svc_health = mac_service_health(vec)
+        mac_tripped = False
         for svc, info in svc_health.items():
             if info["active"]:
                 family_service_active[family][svc] += 1
                 family_service_health_vals[family][svc].append(info["health"])
                 if info["health"] < SERVICE_HEALTH_THRESHOLD:
                     family_service_unhealthy[family][svc] += 1
+                    mac_tripped = True
+        if mac_tripped:
+            family_mac_alarm_count[family] += 1
 
     results: dict[str, dict] = {}
     for family, scores in family_scores.items():
@@ -242,12 +249,16 @@ def compute_family_health(features: dict[str, dict]) -> dict[str, dict]:
             if a > 0 and (u / a) > FAMILY_SERVICE_ALARM_THRESHOLD:
                 service_alarms.append(svc)
 
+        mac_alarm_count = family_mac_alarm_count[family]
+        mac_alarm_ratio = round(mac_alarm_count / n, 4) if n > 0 else 0.0
         results[family] = {
             "health_score": health_score,
             "components": components,
             "service_health": service_health,
             "service_alarm_counts": service_alarm_counts,
             "service_alarms": service_alarms,
+            "mac_alarm_count": mac_alarm_count,
+            "mac_alarm_ratio": mac_alarm_ratio,
             "total_events": family_total_events[family],
             "mac_count": n,
         }

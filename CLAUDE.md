@@ -1750,6 +1750,15 @@ MARKOV_STUCK_LOOP_MIN_EVENTS=20        # minimum events before stuck-loop detect
 # Range: 0.0 (all failing) to 1.0 (no failures). Tune down if too noisy.
 ANOMALY_HEALTH_SCORE_THRESHOLD=0.75
 
+# Service-alarm device-percentage gate. A family fires an alarm via the
+# service-alarm path when at least this fraction of its MACs have individually
+# tripped a service alarm (any of auth/roam/dhcp/dns/arp below the per-MAC
+# SERVICE_HEALTH_THRESHOLD). Lives under General Config alongside
+# ANOMALY_HEALTH_SCORE_THRESHOLD in the "Health Thresholds for Alarm Generation"
+# panel; both gate the webhook dispatcher and the org/site alert feeds. Default
+# 0.0 preserves the prior "any tripped device fires" behavior.
+ALARM_SERVICE_DEVICE_PCT=0.0
+
 # Alarm suppression — skip findings whose total family MAC count is below this floor.
 # Applies to webhook dispatch AND UI alert feeds (/org/alerts, /org/summary).
 # Set to 1 to disable suppression (default). Findings below the floor still appear in
