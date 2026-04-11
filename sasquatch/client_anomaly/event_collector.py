@@ -114,12 +114,26 @@ IGNORED_EVENT_TYPES: frozenset[str] = frozenset({
     "MARVIS_EVENT_CLIENT_DHCPV6_STUCK",
 })
 
-# MARVIS_EVENT_CLIENT_AUTH_FAILURE events with these status codes are transmission
-# failures at the radio layer (frame not acknowledged) — the AP never received the
-# client's frame, so there is no auth decision. These are caused by poor RF coverage,
-# not device-level authentication behavior. Counting them as AUTH_FAILURE inflates
-# failure ratios and depresses health scores for devices in marginal coverage areas.
-_AUTH_FAILURE_IGNORED_STATUS_CODES: frozenset[int] = frozenset({-79})
+# Auth-family events with these status codes are transmission failures at the radio
+# layer (frame not acknowledged) — the AP never received the client's frame, so there
+# is no auth decision. These are caused by poor RF coverage, not device-level
+# authentication behavior. Counting them as auth failures inflates failure ratios and
+# depresses health scores for devices in marginal coverage areas.
+#
+# MARVIS_EVENT_CLIENT_AUTH_FAILURE reports the code as negative (-79); the
+# MAC-auth variant reports it as positive (79). Both are the same signal.
+_TRANSMISSION_FAILURE_IGNORED: dict[str, frozenset[int]] = {
+    "MARVIS_EVENT_CLIENT_AUTH_FAILURE": frozenset({-79}),
+    "MARVIS_EVENT_CLIENT_MAC_AUTH_FAILURE": frozenset({79}),
+}
+
+
+def _transmission_filter_summary() -> str:
+    parts = [
+        f"{etype}={sorted(codes)}"
+        for etype, codes in _TRANSMISSION_FAILURE_IGNORED.items()
+    ]
+    return ", ".join(parts)
 
 # Events with RSSI weaker than the configured threshold are discarded during
 # enrichment — but ONLY when the event type is an auth/roam/association failure.
@@ -588,10 +602,8 @@ def _enrich_batch(
         event_type = event.get("type", "")
         if event_type in IGNORED_EVENT_TYPES:
             continue
-        if (
-            event_type == "MARVIS_EVENT_CLIENT_AUTH_FAILURE"
-            and event.get("status_code") in _AUTH_FAILURE_IGNORED_STATUS_CODES
-        ):
+        ignored_codes = _TRANSMISSION_FAILURE_IGNORED.get(event_type)
+        if ignored_codes is not None and event.get("status_code") in ignored_codes:
             transmission_failure_skipped += 1
             continue
         if event_type in _RSSI_FILTER_EVENT_TYPES:
@@ -833,9 +845,8 @@ async def _collect_org_streaming(
         f"[org] {label} filter summary: "
         f"{filter_stats['weak_signal_skipped']} failure events dropped "
         f"(rssi < {rssi_threshold} dBm, only auth/roam/association failures); "
-        f"{filter_stats['transmission_failure_skipped']} AUTH_FAILURE events "
-        f"dropped (status_code in {set(_AUTH_FAILURE_IGNORED_STATUS_CODES)}, "
-        f"transmission failures)"
+        f"{filter_stats['transmission_failure_skipped']} auth events "
+        f"dropped (transmission failures: {_transmission_filter_summary()})"
     )
     return site_counts
 
