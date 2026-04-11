@@ -24,12 +24,11 @@ function scaleCoords(points) {
   }));
 }
 
-export default function ClusterViz({ siteId, apiBase, onMacSelect, refreshToken, wlan }) {
+export default function ClusterViz({ siteId, apiBase, onMacSelect, refreshToken, wlan, selectedFamilies }) {
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [tooltip, setTooltip] = useState(null);
-  const [hiddenFamilies, setHiddenFamilies] = useState(new Set());
   const svgRef = useRef(null);
 
   const load = useCallback(() => {
@@ -59,27 +58,18 @@ export default function ClusterViz({ siteId, apiBase, onMacSelect, refreshToken,
 
   const HIDDEN_FAMILIES = new Set(["Unknown", "IoT (Unknown)"]);
   const scaled = scaleCoords(
-    data.points.filter((p) => !HIDDEN_FAMILIES.has(p.device_family))
+    data.points.filter((p) =>
+      !HIDDEN_FAMILIES.has(p.device_family)
+      && (!selectedFamilies || selectedFamilies.has(p.device_family))
+    )
   );
 
   // Unique families sorted for legend
   const families = [...new Set(scaled.map((p) => p.device_family))].sort();
 
-  // DBSCAN cluster IDs (excluding -1 noise)
-  const clusterIds = [...new Set(scaled.map((p) => p.dbscan_label).filter((l) => l != null && l >= 0))].sort((a, b) => a - b);
-
   const [ev0, ev1] = data.explained_variance || [];
 
-  function toggleFamily(family) {
-    setHiddenFamilies((prev) => {
-      const next = new Set(prev);
-      if (next.has(family)) next.delete(family);
-      else next.add(family);
-      return next;
-    });
-  }
-
-  const visiblePoints = scaled.filter((p) => !hiddenFamilies.has(p.device_family));
+  const visiblePoints = scaled;
 
   function handleDotClick(point) {
     if (onMacSelect) onMacSelect(point.mac);
@@ -162,47 +152,27 @@ export default function ClusterViz({ siteId, apiBase, onMacSelect, refreshToken,
         })()}
       </svg>
 
-      {/* Legend — click to toggle family visibility */}
+      {/* Legend — selection is controlled by the PCA column in the Site Family Insights table */}
       <div style={{ marginTop: "8px", display: "flex", flexWrap: "wrap", gap: "6px 12px" }}>
-        <div
-          onClick={() => setHiddenFamilies(new Set(families))}
-          style={{
-            fontSize: "10px",
-            color: "#555",
-            cursor: "pointer",
-            padding: "0 4px",
-            borderRight: "1px solid #333",
-            marginRight: "4px",
-            lineHeight: "16px",
-          }}
-        >
-          deselect all
-        </div>
         {families.map((family) => {
-          const hidden = hiddenFamilies.has(family);
           const color = familyColor(family);
           return (
             <div
               key={family}
-              onClick={() => toggleFamily(family)}
               style={{
                 display: "flex",
                 alignItems: "center",
                 gap: "4px",
                 fontSize: "10px",
-                color: hidden ? "#444" : "#888",
-                cursor: "pointer",
-                opacity: hidden ? 0.5 : 1,
-                transition: "opacity 0.15s, color 0.15s",
+                color: "#888",
               }}
             >
               <div style={{
                 width: 8,
                 height: 8,
                 borderRadius: "50%",
-                background: hidden ? "#333" : color,
+                background: color,
                 flexShrink: 0,
-                transition: "background 0.15s",
               }} />
               {family}
             </div>

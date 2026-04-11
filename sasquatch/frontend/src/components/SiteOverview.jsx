@@ -99,13 +99,47 @@ export default function SiteOverview({ siteId, apiBase, onMacSelect, onFamilySel
   const [lastRefresh, setLastRefresh] = useState(null);
   const [sortKey, setSortKey] = useState("anomaly");
   const [sortDir, setSortDir] = useState("desc");
+  const [pcaFamilies, setPcaFamilies] = useState(null);
+  const [pcaSeeded, setPcaSeeded] = useState(false);
 
   useEffect(() => {
     setSummary(null);
     setFindings([]);
     setHealth({});
     setError(null);
-  }, [siteId]);
+    setPcaSeeded(false);
+    setPcaFamilies(null);
+  }, [siteId, wlan]);
+
+  // Seed default PCA selection once per load: families flagged by IF/DB/Markov plus
+  // the top 3 largest by device count at this site.
+  useEffect(() => {
+    if (pcaSeeded || !summary?.families) return;
+    const HIDDEN = new Set(["Unknown", "IoT (Unknown)"]);
+    const counts = summary.family_client_counts || {};
+    const candidates = Object.keys(summary.families).filter(f => !HIDDEN.has(f));
+    const findingByFam = {};
+    for (const f of findings) findingByFam[f.device_family] = f;
+    const flagged = candidates.filter(f => {
+      const fn = findingByFam[f];
+      const markovOutlier = summary.family_markov?.[f]?.is_family_markov_outlier
+        ?? fn?.is_family_markov_outlier ?? false;
+      return !!fn?.is_family_outlier || !!fn?.dbscan_severity || markovOutlier;
+    });
+    const topByCount = [...candidates]
+      .sort((a, b) => (counts[b] ?? 0) - (counts[a] ?? 0))
+      .slice(0, 3);
+    setPcaFamilies(new Set([...flagged, ...topByCount]));
+    setPcaSeeded(true);
+  }, [summary, findings, pcaSeeded]);
+
+  const togglePca = (family) => {
+    setPcaFamilies(prev => {
+      const next = new Set(prev ?? []);
+      if (next.has(family)) next.delete(family); else next.add(family);
+      return next;
+    });
+  };
 
   const load = useCallback(() => {
     setLoading(true);
@@ -133,8 +167,8 @@ export default function SiteOverview({ siteId, apiBase, onMacSelect, onFamilySel
   }, [load]);
 
   if (loading && !summary) {
-    // Skeleton: 7 fixed cols (Family, Count, IF, DB, Markov, Health, Service Alarm) + 15 CATEGORIES = 22 columns
-    const skeletonColWidths = [110, 44, 44, 62, 62, 80, 100, ...Array(15).fill(18)];
+    // Skeleton: 8 fixed cols (Family, PCA, Count, IF, DB, Markov, Health, Service Alarm) + 15 CATEGORIES = 23 columns
+    const skeletonColWidths = [110, 30, 44, 44, 62, 62, 80, 100, ...Array(15).fill(18)];
     const shimmer = "sq-site-shimmer 1.5s ease-in-out infinite";
     return (
       <div>
@@ -267,9 +301,22 @@ export default function SiteOverview({ siteId, apiBase, onMacSelect, onFamilySel
   return (
     <div>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "12px" }}>
-        <h2 style={{ margin: 0, fontSize: "15px", color: "#aaa" }}>
-          Site Overview — {summary.total_events?.toLocaleString()} events
-        </h2>
+        <div style={{ display: "flex", alignItems: "baseline", gap: "12px" }}>
+          <h2 style={{ margin: 0, fontSize: "15px", color: "#aaa" }}>
+            Site WLAN Family Insights — {summary.total_events?.toLocaleString()} events
+          </h2>
+          <span
+            onClick={() => setPcaFamilies(new Set())}
+            style={{
+              color: "#666", fontSize: "11px", cursor: "pointer",
+              textDecoration: "underline", textDecorationColor: "#333",
+              userSelect: "none",
+            }}
+            title="Uncheck all families from the PCA visualization"
+          >
+            uncheck all PCA
+          </span>
+        </div>
         <span style={{ fontSize: "12px", color: "#999" }}>
           Refreshed {lastRefresh} · auto-refresh 60s
         </span>
@@ -285,6 +332,12 @@ export default function SiteOverview({ siteId, apiBase, onMacSelect, onFamilySel
                 onClick={() => handleSort("family")}
               >
                 Device Family<SortIndicator active={sortKey === "family"} dir={sortDir} />
+              </th>
+              <th
+                style={{ ...thStyle, whiteSpace: "nowrap", textAlign: "center" }}
+                title="PCA — include this family in the PCA cluster view on the right."
+              >
+                PCA
               </th>
               <th
                 style={{ ...thStyle, whiteSpace: "nowrap", cursor: "pointer", userSelect: "none" }}
@@ -412,6 +465,19 @@ export default function SiteOverview({ siteId, apiBase, onMacSelect, onFamilySel
                         SVC ACCT
                       </span>
                     )}
+                  </td>
+                  {/* PCA: include this family in the cluster viz */}
+                  <td
+                    style={{ ...tdStyle, textAlign: "center", cursor: "pointer" }}
+                    onClick={() => togglePca(family)}
+                    title={`Include ${family} in PCA visualization`}
+                  >
+                    <input
+                      type="checkbox"
+                      readOnly
+                      checked={pcaFamilies?.has(family) ?? false}
+                      style={{ cursor: "pointer", accentColor: "#2a5a7a", pointerEvents: "none" }}
+                    />
                   </td>
                   {/* Count — MACs in this family at this site */}
                   <td
@@ -561,6 +627,9 @@ export default function SiteOverview({ siteId, apiBase, onMacSelect, onFamilySel
                     ({otherClientCount} clients, {otherFamilies.length} types)
                   </span>
                 </td>
+                <td style={{ ...tdStyle, textAlign: "center" }}>
+                  <span style={{ color: "#888", fontSize: "10px" }}>—</span>
+                </td>
                 <td style={{ ...tdStyle, textAlign: "right", color: "#888", fontSize: "11px", fontVariantNumeric: "tabular-nums" }}>
                   {otherClientCount}
                 </td>
@@ -612,7 +681,7 @@ export default function SiteOverview({ siteId, apiBase, onMacSelect, onFamilySel
         </div>
 
         <div style={{ flex: "0 0 380px", width: "380px" }}>
-          <ClusterViz siteId={siteId} apiBase={apiBase} onMacSelect={onMacSelect} refreshToken={refreshToken} wlan={wlan} />
+          <ClusterViz siteId={siteId} apiBase={apiBase} onMacSelect={onMacSelect} refreshToken={refreshToken} wlan={wlan} selectedFamilies={pcaFamilies} />
         </div>
       </div>
 
