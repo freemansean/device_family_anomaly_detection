@@ -70,6 +70,35 @@ def _clean_token(value: str) -> str:
     return cleaned
 
 
+def unknown_family_label(mfg: str) -> str:
+    """Build the ``Unknown/<vendor>`` sub-bucket label used as a fallback
+    family when Mist gives us no fingerprint fields.
+
+    Accepts the raw IEEE OUI manufacturer string (or anything else): trims
+    corporate suffixes the cheap way (split at the first comma) and caps the
+    visible label at 24 chars on a word boundary so peer-group keys stay
+    readable in the GUI. Returns the bare ``"Unknown"`` string when the input
+    has no usable signal — collapsing every signal-free MAC into one bucket
+    is correct, since they have nothing else in common.
+
+    Shared between ``client_cache._build_client_record`` (cache-write path)
+    and ``event_collector._enrich_event`` (cache-miss path) so the two
+    paths can never drift.
+    """
+    raw = (mfg or "").strip()
+    if not raw or raw.lower() in {"unknown", ""}:
+        return "Unknown"
+    # Drop everything from the first comma ("Nokia ..., Ltd." → "Nokia ...").
+    base = raw.split(",")[0].strip()
+    if not base:
+        return "Unknown"
+    if len(base) > 24:
+        # Truncate at the last word boundary within 24 chars so the key
+        # doesn't end mid-word (e.g. "Extreme Networks" not "Extreme Network").
+        base = base[:24].rsplit(" ", 1)[0] or base[:24]
+    return f"Unknown/{base}"
+
+
 def _os_major(os_str: str) -> str:
     """Collapse OS strings to major-version granularity.
 
@@ -101,6 +130,13 @@ def classify_family(client: dict) -> str:
     Falls back to a single-token family (manufacturer or OS alone) when Mist
     only provides one field, or to the OUI-derived manufacturer that
     `_build_client_record()` injects as `mfg` when Mist provides nothing.
+
+    Last resort: when nothing survives cleaning (raw mfg was "Private", OS
+    was "iot", every field was empty, etc.), bucket the device under
+    ``Unknown/<raw_mfg>`` if there is any raw mfg signal at all — that
+    keeps Apple-block private MACs from colliding with Cisco-block private
+    MACs in the alerts feed. Only when there is literally no manufacturer
+    signal does the family collapse to bare ``"Unknown"``.
     """
     mfg = _clean_token(client.get("mfg") or "")
     model = _clean_token(client.get("last_model") or "")
@@ -113,7 +149,9 @@ def classify_family(client: dict) -> str:
     parts = [p for p in (mfg, model, os_str) if p]
     if parts:
         return " | ".join(parts)
-    return "Unknown"
+    return unknown_family_label(
+        client.get("mfg") or client.get("mfg_fallback") or ""
+    )
 
 
 async def _check_rate_limit(resp: httpx.Response, page: int, label: str) -> None:
@@ -153,17 +191,28 @@ def _build_client_record(client: dict, mac: str = "") -> dict:
     # classify_family() has something to match against (e.g. "Awair" IoT devices
     # that Mist tracks as clients but has no manufacturer string for).
     _mfg_raw = (client.get("mfg") or "").strip()
-    # Treat Mist's placeholder strings as empty — they carry no information.
+    # Treat Mist's placeholder strings as empty for the *primary* mfg slot —
+    # they carry no fingerprint signal — but keep the original around as
+    # `_mfg_fallback` so classify_family can still use it as an Unknown/<bucket>
+    # sub-key when nothing else survives.
     _MFG_PLACEHOLDERS = {"unknown", "unknown manufacturer", "private", ""}
     mfg = "" if _mfg_raw.lower() in _MFG_PLACEHOLDERS else _mfg_raw
+    _mfg_fallback = ""
     if not mfg and mac:
         oui_result = oui_lookup(mac)
         if oui_result != "Unknown":
             mfg = oui_result
+        else:
+            # OUI gave us nothing usable either. Keep the raw Mist mfg
+            # ("Private", etc.) as a fallback so we don't collapse every
+            # signal-free MAC into a single bucket.
+            _mfg_fallback = _mfg_raw
     # Inject resolved mfg back into the dict so classify_family sees it.
     enriched_client = dict(client)
     if mfg:
         enriched_client["mfg"] = mfg
+    elif _mfg_fallback:
+        enriched_client["mfg_fallback"] = _mfg_fallback
     # The Mist clients/search endpoint exposes the most recent authenticated
     # username for each client in `last_username`. Captured here so that
     # feature engineering can roll up shared usernames into service-account

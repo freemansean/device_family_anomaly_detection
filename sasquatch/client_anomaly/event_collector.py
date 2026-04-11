@@ -28,6 +28,7 @@ import httpx
 import redis.asyncio as aioredis
 
 from .client_cache import get_client_cache
+from .client_cache import unknown_family_label
 from .oui_lookup import lookup as oui_lookup
 from . import db
 
@@ -474,29 +475,33 @@ def _enrich_event(event: dict, client_cache: dict[str, dict]) -> dict:
     enriched["wlan"] = ssid if ssid else None
 
     if client_meta:
-        enriched["device_family"] = client_meta.get("family", "Unknown")
+        family = client_meta.get("family", "Unknown")
+        manufacturer = client_meta.get("manufacturer", "Unknown")
+        # Cache-hit but the cache stored a bare "Unknown" (Mist had no
+        # fingerprint and OUI also returned nothing usable at write time).
+        # Try OUI again here — the local OUI database may have been updated
+        # since the cache was last written, and either way it's cheap. Any
+        # vendor we recover lands in an Unknown/<vendor> sub-bucket via the
+        # shared helper so cache-hit and cache-miss labels stay identical.
+        if family == "Unknown":
+            oui_mfg = _oui_lookup(mac)
+            if oui_mfg != "Unknown":
+                family = unknown_family_label(oui_mfg)
+                if not manufacturer or manufacturer == "Unknown":
+                    manufacturer = oui_mfg
+        enriched["device_family"] = family
         enriched["device_model"] = client_meta.get("model", "Unknown")
-        enriched["device_manufacturer"] = client_meta.get("manufacturer", "Unknown")
+        enriched["device_manufacturer"] = manufacturer
         enriched["last_username"] = client_meta.get("last_username", "")
     else:
+        # Cache miss — fall back to OUI for both the manufacturer label and
+        # the family sub-bucket. unknown_family_label() handles the bucket
+        # name format (and returns bare "Unknown" when OUI gave nothing).
         mfg = _oui_lookup(mac)
         enriched["device_manufacturer"] = mfg
         enriched["device_model"] = "Unknown"
         enriched["last_username"] = ""
-        # Sub-group cache-miss MACs by OUI manufacturer so they are scored against
-        # like-with-like peers rather than collapsed into a single "Unknown" bucket.
-        # Strip everything from the first comma onward (drops ", Inc.", ", Ltd.", etc.)
-        # and cap at 24 chars so peer-group keys stay readable.
-        if mfg != "Unknown":
-            # Drop everything from the first comma ("Nokia ..., Ltd." → "Nokia ...").
-            # Then truncate at the last word boundary within 24 chars so the key
-            # doesn't end mid-word (e.g. "Extreme Networks" not "Extreme Network").
-            base = mfg.split(",")[0].strip()
-            if len(base) > 24:
-                base = base[:24].rsplit(" ", 1)[0]
-            enriched["device_family"] = f"Unknown/{base}"
-        else:
-            enriched["device_family"] = "Unknown"
+        enriched["device_family"] = unknown_family_label(mfg)
 
     return enriched
 
