@@ -1,6 +1,5 @@
 import { useState, useEffect } from "react";
 import { apiFetch } from "../api";
-import OrgClusterViz from "./OrgClusterViz";
 import OrgFamilyInsights from "./OrgFamilyInsights";
 import OrgFindingsFeed from "./OrgFindingsFeed";
 import OrgAlerts from "./OrgAlerts";
@@ -204,28 +203,22 @@ export default function OrgOverview({ apiBase, onSiteSelect, onMacSiteSelect, re
             <div style={{ color: "#e05555", marginBottom: "16px" }}>Error loading org summary: {error}</div>
           )}
 
-          {/* Two-column layout: PCA chart + site cards */}
-          <div style={{ display: "flex", gap: "28px", alignItems: "flex-start" }}>
-            <div style={{ flexShrink: 0 }}>
-              <OrgClusterViz apiBase={apiBase} onMacSiteSelect={onMacSiteSelect} refreshToken={refreshToken} wlan={wlan} />
-            </div>
-            <div style={{ flex: 1, minWidth: 0 }}>
-              {!loading && sites.length === 0 && !error && (
-                <div style={{ color: "#555", padding: "24px 0" }}>
-                  No sites found. Check that MIST_ORG_ID is configured.
-                </div>
-              )}
-              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(240px, 1fr))", gap: "8px" }}>
-                {sites.map(site => (
-                  <SiteCard key={site.site_id} site={site} onClick={() => onSiteSelect(site.site_id)} />
-                ))}
+          <div>
+            {!loading && sites.length === 0 && !error && (
+              <div style={{ color: "#555", padding: "24px 0" }}>
+                No sites found. Check that MIST_ORG_ID is configured.
               </div>
-              {hiddenSiteCount > 0 && (
-                <div style={{ color: "#555", fontSize: "11px", marginTop: "12px", textAlign: "center", fontStyle: "italic" }}>
-                  Showing top {sites.length} of {allSites.length} sites (ranked by alerts, then event volume). Use the Site dropdown above to jump to the {hiddenSiteCount} site{hiddenSiteCount === 1 ? "" : "s"} not listed.
-                </div>
-              )}
+            )}
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(240px, 1fr))", gap: "8px" }}>
+              {sites.map(site => (
+                <SiteCard key={site.site_id} site={site} onClick={() => onSiteSelect(site.site_id)} />
+              ))}
             </div>
+            {hiddenSiteCount > 0 && (
+              <div style={{ color: "#555", fontSize: "11px", marginTop: "12px", textAlign: "center", fontStyle: "italic" }}>
+                Showing top {sites.length} of {allSites.length} sites (ranked by alerts, then event volume). Use the Site dropdown above to jump to the {hiddenSiteCount} site{hiddenSiteCount === 1 ? "" : "s"} not listed.
+              </div>
+            )}
           </div>
         </div>
       )}

@@ -48,13 +48,12 @@ function subsample(points, max) {
   return [...outliers, ...sampled];
 }
 
-export default function OrgClusterViz({ apiBase, onMacSiteSelect, refreshToken, wlan }) {
+export default function OrgClusterViz({ apiBase, onMacSiteSelect, refreshToken, wlan, selectedFamilies }) {
   const [data, setData]             = useState(null);
   const [loading, setLoading]       = useState(true);
   const [error, setError]           = useState(null);
   const [tooltip, setTooltip]       = useState(null);
   const [colorMode, setColorMode]   = useState("family"); // "family" | "site"
-  const [hiddenKeys, setHiddenKeys] = useState(new Set());
   const svgRef = useRef(null);
 
   const load = useCallback(() => {
@@ -71,9 +70,6 @@ export default function OrgClusterViz({ apiBase, onMacSiteSelect, refreshToken, 
     const iv = setInterval(load, 90_000);
     return () => clearInterval(iv);
   }, [load]);
-
-  // Reset hidden keys when color mode changes.
-  useEffect(() => { setHiddenKeys(new Set()); }, [colorMode]);
 
   if (loading && !data) return (
     <div style={{ color: "#555", fontSize: "12px", padding: "12px 0" }}>Loading org cluster view…</div>
@@ -95,9 +91,13 @@ export default function OrgClusterViz({ apiBase, onMacSiteSelect, refreshToken, 
     }
   }
 
-  const filtered = data.points.filter(
-    p => !HIDDEN_FAMILIES.has(p.device_family) && (familyCounts[p.device_family] ?? 0) >= MIN_DISPLAY_CLIENTS
-  );
+  // When the caller passes an explicit selection, honor it as-is (don't apply the
+  // min-size declutter — the user explicitly opted that family in via checkbox).
+  const filtered = data.points.filter(p => {
+    if (HIDDEN_FAMILIES.has(p.device_family)) return false;
+    if (selectedFamilies) return selectedFamilies.has(p.device_family);
+    return (familyCounts[p.device_family] ?? 0) >= MIN_DISPLAY_CLIENTS;
+  });
 
   const sampled = subsample(filtered, MAX_RENDER_POINTS);
   const scaled  = scaleCoords(sampled);
@@ -114,18 +114,7 @@ export default function OrgClusterViz({ apiBase, onMacSiteSelect, refreshToken, 
 
   const pointColor = p => colorMode === "family" ? familyColor(p.device_family) : siteColor(p.site_id);
 
-  const visiblePoints = scaled.filter(p => {
-    const key = colorMode === "family" ? p.device_family : p.site_id;
-    return !hiddenKeys.has(key);
-  });
-
-  function toggleKey(key) {
-    setHiddenKeys(prev => {
-      const next = new Set(prev);
-      next.has(key) ? next.delete(key) : next.add(key);
-      return next;
-    });
-  }
+  const visiblePoints = scaled;
 
   const [ev0, ev1] = data.explained_variance || [];
   const sampledNote = filtered.length > MAX_RENDER_POINTS
@@ -234,27 +223,17 @@ export default function OrgClusterViz({ apiBase, onMacSiteSelect, refreshToken, 
         })()}
       </svg>
 
-      {/* Legend */}
+      {/* Legend — selection is controlled by the PCA column in the Family Insights table */}
       <div style={{ marginTop: "8px", display: "flex", flexWrap: "wrap", gap: "5px 10px", maxHeight: "56px", overflowY: "auto" }}>
-        <div
-          onClick={() => setHiddenKeys(new Set(legendItems.map(l => l.key)))}
-          style={{ fontSize: "10px", color: "#555", cursor: "pointer", padding: "0 4px", borderRight: "1px solid #2a2a2a", marginRight: "2px", lineHeight: "16px" }}
-        >
-          deselect all
-        </div>
-        {legendItems.map(item => {
-          const hidden = hiddenKeys.has(item.key);
-          return (
-            <div
-              key={item.key}
-              onClick={() => toggleKey(item.key)}
-              style={{ display: "flex", alignItems: "center", gap: "4px", fontSize: "10px", color: hidden ? "#444" : "#888", cursor: "pointer", opacity: hidden ? 0.5 : 1, transition: "opacity 0.15s" }}
-            >
-              <div style={{ width: 7, height: 7, borderRadius: "50%", background: hidden ? "#333" : item.color, flexShrink: 0, transition: "background 0.15s" }} />
-              {item.label}
-            </div>
-          );
-        })}
+        {legendItems.map(item => (
+          <div
+            key={item.key}
+            style={{ display: "flex", alignItems: "center", gap: "4px", fontSize: "10px", color: "#888" }}
+          >
+            <div style={{ width: 7, height: 7, borderRadius: "50%", background: item.color, flexShrink: 0 }} />
+            {item.label}
+          </div>
+        ))}
         <div style={{ display: "flex", alignItems: "center", gap: "4px", fontSize: "10px", color: "#888" }}>
           <div style={{ width: 7, height: 7, borderRadius: "50%", border: "1.5px solid #e05555", flexShrink: 0 }} />
           outlier

@@ -109,6 +109,8 @@ export default function OrgFamilyInsights({ apiBase, refreshToken, onMacSiteSele
   const [selectedFamily, setSelectedFamily] = useState(null);
   const [sortKey, setSortKey]         = useState("anomaly");
   const [sortDir, setSortDir]         = useState("desc");
+  const [pcaFamilies, setPcaFamilies] = useState(null); // null until seeded from data
+  const [pcaSeeded, setPcaSeeded]     = useState(false);
 
   const load = useCallback(() => {
     setLoading(true);
@@ -123,6 +125,42 @@ export default function OrgFamilyInsights({ apiBase, refreshToken, onMacSiteSele
     const interval = setInterval(load, 60_000);
     return () => clearInterval(interval);
   }, [load]);
+
+  // Drop stale data + unseed when the WLAN changes so the default selection
+  // recomputes against fresh data. Clearing `data` prevents the seed effect
+  // from firing against the previous WLAN's families.
+  useEffect(() => {
+    setData(null);
+    setPcaSeeded(false);
+    setPcaFamilies(null);
+  }, [wlan]);
+
+  // Seed default PCA selection once per dataset load: any family flagged IF/DB/Markov
+  // plus the top 3 largest device families by client_count.
+  useEffect(() => {
+    if (pcaSeeded || !data?.families) return;
+    const fams = data.families;
+    const HIDDEN = new Set(["Unknown", "IoT (Unknown)"]);
+    const candidates = Object.keys(fams).filter(f => !HIDDEN.has(f));
+    const flagged = candidates.filter(f =>
+      fams[f].is_family_outlier_any_site
+      || fams[f].worst_dbscan_severity
+      || fams[f].is_family_markov_outlier_any_site
+    );
+    const topByCount = [...candidates]
+      .sort((a, b) => (fams[b].client_count ?? 0) - (fams[a].client_count ?? 0))
+      .slice(0, 3);
+    setPcaFamilies(new Set([...flagged, ...topByCount]));
+    setPcaSeeded(true);
+  }, [data, pcaSeeded]);
+
+  const togglePca = (family) => {
+    setPcaFamilies(prev => {
+      const next = new Set(prev ?? []);
+      if (next.has(family)) next.delete(family); else next.add(family);
+      return next;
+    });
+  };
 
   if (selectedFamily) {
     return (
@@ -235,6 +273,17 @@ export default function OrgFamilyInsights({ apiBase, refreshToken, onMacSiteSele
         <span style={{ color: "#555", fontSize: "12px" }}>
           {display.length} device families · {sites_with_data}/{total_sites} sites with data
         </span>
+        <span
+          onClick={() => setPcaFamilies(new Set())}
+          style={{
+            color: "#666", fontSize: "11px", cursor: "pointer",
+            textDecoration: "underline", textDecorationColor: "#333",
+            userSelect: "none",
+          }}
+          title="Uncheck all families from the PCA visualization"
+        >
+          uncheck all PCA
+        </span>
       </div>
 
       <div style={{ display: "flex", gap: "16px", alignItems: "flex-start" }}>
@@ -247,6 +296,12 @@ export default function OrgFamilyInsights({ apiBase, refreshToken, onMacSiteSele
                 onClick={() => handleSort("family")}
               >
                 Device Family<SortIndicator active={sortKey === "family"} dir={sortDir} />
+              </th>
+              <th
+                style={{ ...thStyle, whiteSpace: "nowrap", textAlign: "center" }}
+                title="PCA — include this family in the PCA cluster view on the right."
+              >
+                PCA
               </th>
               <th
                 style={{ ...thStyle, whiteSpace: "nowrap", cursor: "pointer", userSelect: "none" }}
@@ -361,6 +416,20 @@ export default function OrgFamilyInsights({ apiBase, refreshToken, onMacSiteSele
                         SVC ACCT
                       </span>
                     )}
+                  </td>
+
+                  {/* PCA: include this family in the cluster viz */}
+                  <td
+                    style={{ ...tdStyle, textAlign: "center", cursor: "pointer" }}
+                    onClick={() => togglePca(family)}
+                    title={`Include ${family} in PCA visualization`}
+                  >
+                    <input
+                      type="checkbox"
+                      readOnly
+                      checked={pcaFamilies?.has(family) ?? false}
+                      style={{ cursor: "pointer", accentColor: "#2a5a7a", pointerEvents: "none" }}
+                    />
                   </td>
 
                   {/* Count — device family size (MACs across all sites) */}
@@ -537,6 +606,9 @@ export default function OrgFamilyInsights({ apiBase, refreshToken, onMacSiteSele
                     ({other.length} types)
                   </span>
                 </td>
+                <td style={{ ...tdStyle, textAlign: "center" }}>
+                  <span style={{ color: "#333", fontSize: "10px" }}>—</span>
+                </td>
                 <td style={{ ...tdStyle, textAlign: "right", color: "#555", fontSize: "11px", fontVariantNumeric: "tabular-nums" }}>
                   {otherClientCount}
                 </td>
@@ -583,7 +655,13 @@ export default function OrgFamilyInsights({ apiBase, refreshToken, onMacSiteSele
       </div>
 
       <div style={{ flex: "0 0 600px", width: "600px" }}>
-        <OrgClusterViz apiBase={apiBase} onMacSiteSelect={onMacSiteSelect} refreshToken={refreshToken} wlan={wlan} />
+        <OrgClusterViz
+          apiBase={apiBase}
+          onMacSiteSelect={onMacSiteSelect}
+          refreshToken={refreshToken}
+          wlan={wlan}
+          selectedFamilies={pcaFamilies}
+        />
       </div>
       </div>
 

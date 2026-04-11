@@ -1196,7 +1196,7 @@ export default function App() {
       {selectedSite && selectedSite !== ORG_FOCUS_VALUE && (view === "overview" || view === "findings") && (
         <div style={{ display: "flex", gap: "8px", marginBottom: "18px" }}>
           {["overview", "findings"].map((v) => {
-            const label = v === "overview" ? "Site Overview" : "Findings";
+            const label = v === "overview" ? "Site WLAN Family Insights" : "Findings";
             const active = view === v;
             return (
               <button
