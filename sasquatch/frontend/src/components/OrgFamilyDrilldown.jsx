@@ -282,6 +282,10 @@ export default function OrgFamilyDrilldown({ family, apiBase, onMacSiteSelect, o
                       <SortTh key={cat} col={cat}>{CATEGORY_LABELS[cat]}</SortTh>
                     ))}
                     <SortTh col="total_events">Total</SortTh>
+                    {/* Metadata */}
+                    <th style={thStyle}>Model</th>
+                    <th style={thStyle}>OS</th>
+                    <th style={thStyle}>Manufacturer</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -399,6 +403,9 @@ export default function OrgFamilyDrilldown({ family, apiBase, onMacSiteSelect, o
                         <td style={{ ...tdStyle, color: "#ccc", textAlign: "right", fontWeight: "500" }}>
                           {row.total_events}
                         </td>
+                        <td style={{ ...tdStyle, color: "#999" }}>{row.client_metadata?.model || "—"}</td>
+                        <td style={{ ...tdStyle, color: "#999" }}>{row.client_metadata?.os || "—"}</td>
+                        <td style={{ ...tdStyle, color: "#999" }}>{row.client_metadata?.manufacturer || "—"}</td>
                       </tr>
                     );
                   })}

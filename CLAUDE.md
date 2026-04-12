@@ -1092,7 +1092,7 @@ still computed and stored in `components` for tooltip display, but does not affe
 health score itself.
 
 **Score ranges:** 1.0 = no failures observed. 0.0 = all outcome-bearing events are failures.
-Default alert threshold: `ANOMALY_HEALTH_SCORE_THRESHOLD = 0.75`.
+Default alert threshold: `ANOMALY_HEALTH_SCORE_THRESHOLD = 0.30`.
 
 **Per-service rollup and device-alarm ratio:** Alongside the aggregate health
 score, `compute_family_health` also computes per-service health and
@@ -1736,7 +1736,7 @@ ANOMALY_IF_CONTAMINATION=0.05
 # eps         = k-distance elbow per run (no env var)
 ANOMALY_DBSCAN_MIN_SAMPLES_PCT=3
 ANOMALY_MIN_PEERS=5
-ANOMALY_MIN_MAC_EVENTS=20
+ANOMALY_MIN_MAC_EVENTS=10
 ANOMALY_CENTROID_DIST_THRESHOLD=0.35   # cosine distance (L2-normalized unit vectors) above which a family centroid is flagged as is_family_outlier
 ANOMALY_CENTROID_HEALTHY_REF_THRESHOLD=0.75  # families below this health are excluded from the centroid reference pool
 ANOMALY_CENTROID_HEALTHY_REF_MIN=2     # minimum healthy families to activate healthy-only reference; otherwise falls back to all-family reference
@@ -1748,7 +1748,7 @@ MARKOV_STUCK_LOOP_MIN_EVENTS=20        # minimum events before stuck-loop detect
 # Health Score (health_scorer.py)
 # Families with health_score below this value are considered degraded for webhook gating.
 # Range: 0.0 (all failing) to 1.0 (no failures). Tune down if too noisy.
-ANOMALY_HEALTH_SCORE_THRESHOLD=0.75
+ANOMALY_HEALTH_SCORE_THRESHOLD=0.30
 
 # Service-alarm device-percentage gate. A family fires an alarm via the
 # service-alarm path when at least this fraction of its MACs have individually
@@ -1756,14 +1756,15 @@ ANOMALY_HEALTH_SCORE_THRESHOLD=0.75
 # SERVICE_HEALTH_THRESHOLD). Lives under General Config alongside
 # ANOMALY_HEALTH_SCORE_THRESHOLD in the "Health Thresholds for Alarm Generation"
 # panel; both gate the webhook dispatcher and the org/site alert feeds. Default
-# 0.0 preserves the prior "any tripped device fires" behavior.
-ALARM_SERVICE_DEVICE_PCT=0.0
+# 0.50 requires at least half of the family's MACs to have tripped.
+ALARM_SERVICE_DEVICE_PCT=0.50
 
 # Alarm suppression — skip findings whose total family MAC count is below this floor.
 # Applies to webhook dispatch AND UI alert feeds (/org/alerts, /org/summary).
-# Set to 1 to disable suppression (default). Findings below the floor still appear in
-# the main findings UI — only alerting is muted.
-ALARM_MIN_FAMILY_SIZE=1
+# Default 10 suppresses families smaller than 10 MACs; set to 1 to disable
+# suppression and let every family through. Findings below the floor still
+# appear in the main findings UI — only alerting is muted.
+ALARM_MIN_FAMILY_SIZE=10
 
 # DBSCAN-or-Markov rollup alarm gate. A device family fires an alarm via this
 # path when the per-MAC union of is_dbscan_outlier and is_markov_outlier reaches
@@ -1772,7 +1773,7 @@ ALARM_MIN_FAMILY_SIZE=1
 # gate and remains independently sufficient to fire an alarm. Lives under the
 # General Config tab in the GUI; applies to both webhook dispatch and the
 # OrgAlerts feed at site and org level.
-ALARM_DBSCAN_MARKOV_RATIO=0.20
+ALARM_DBSCAN_MARKOV_RATIO=0.70
 
 # Event collector — drop any event whose RSSI is below this floor (dBm),
 # regardless of type. Events with no rssi field (synthetic/boundary markers)

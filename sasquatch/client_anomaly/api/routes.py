@@ -525,7 +525,7 @@ def _load_config_overrides() -> dict:
 def _save_config_section(section: str, values: dict) -> None:
     """Merge `values` into the named section of config_overrides.json and write to disk."""
     overrides = _load_config_overrides()
-    overrides[section] = values
+    overrides[section] = {**overrides.get(section, {}), **values}
     _CONFIG_OVERRIDES_FILE.write_text(json.dumps(overrides, indent=2))
 
 
