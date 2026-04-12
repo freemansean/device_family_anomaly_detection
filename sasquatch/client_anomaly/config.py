@@ -30,28 +30,30 @@ DEFAULTS = {
         # How often (hours) to run org-wide cross-site detection
         "org_detection_interval_hours": {"default": 1, "env": "ORG_DETECTION_INTERVAL_HOURS", "cast": int},
         # Minimum events per MAC to be included in ML feature matrix
-        "anomaly_min_mac_events": {"default": 5, "env": "ANOMALY_MIN_MAC_EVENTS", "cast": int},
+        "anomaly_min_mac_events": {"default": 10, "env": "ANOMALY_MIN_MAC_EVENTS", "cast": int},
         # Suppress alarms for device families whose total MAC count is below this
         # threshold. Small families can trip the detector on a single quirky device
         # — raising this floor lets operators quiet that noise without touching the
         # detection pipeline itself. Applies to both webhook dispatch and the
-        # OrgAlerts UI feed. Set to 1 to disable (default — every family eligible).
-        "alarm_min_family_size": {"default": 1, "env": "ALARM_MIN_FAMILY_SIZE", "cast": int},
+        # OrgAlerts UI feed. Default 10 suppresses families smaller than 10
+        # MACs; set to 1 to disable and let every family through.
+        "alarm_min_family_size": {"default": 10, "env": "ALARM_MIN_FAMILY_SIZE", "cast": int},
         # Health score threshold for dual-gate alarm generation. Device families
         # with health_score below this value are considered degraded and — if also
         # flagged by any family-level anomaly detector — trigger an alert via the
         # webhook dispatcher and the OrgAlerts UI feed. Lives under General Config
         # (alongside alarm_min_family_size) because it gates alarm generation at
         # both org and site level, not the anomaly detection pipeline itself.
-        "anomaly_health_score_threshold": {"default": 0.80, "env": "ANOMALY_HEALTH_SCORE_THRESHOLD", "cast": float},
+        "anomaly_health_score_threshold": {"default": 0.30, "env": "ANOMALY_HEALTH_SCORE_THRESHOLD", "cast": float},
         # Service-alarm device-percentage threshold for dual-gate alarm
         # generation. A device family is "service-alarming" when at least this
         # fraction of its MACs have individually tripped a service alarm
         # (one or more of auth/roam/dhcp/dns/arp below SERVICE_HEALTH_THRESHOLD).
         # Lives under General Config alongside anomaly_health_score_threshold —
-        # both gate webhook dispatch and the org/site alert feeds. Default 0.0
-        # preserves the prior "any service alarm fires" behavior.
-        "alarm_service_device_pct": {"default": 0.0, "env": "ALARM_SERVICE_DEVICE_PCT", "cast": float},
+        # both gate webhook dispatch and the org/site alert feeds. Default 0.50
+        # requires at least half of the family's MACs to have tripped a per-MAC
+        # service alarm before the service-alarm path fires.
+        "alarm_service_device_pct": {"default": 0.50, "env": "ALARM_SERVICE_DEVICE_PCT", "cast": float},
         # Fraction of clients in a device family that must be flagged as
         # anomalous by *either* DBSCAN or Markov before an alarm fires for that
         # family. The union is taken per-MAC: a single client flagged by both
@@ -59,9 +61,9 @@ DEFAULTS = {
         # (is_family_outlier) is independent of this gate and remains
         # independently sufficient to fire an alarm. Applies at both org and
         # site level, gating both webhook dispatch and the OrgAlerts UI feed.
-        # Default 0.20 = at least 20% of family clients must be DBSCAN/Markov-
+        # Default 0.70 = at least 70% of family clients must be DBSCAN/Markov-
         # flagged before alarming on the rollup signal.
-        "alarm_dbscan_markov_ratio": {"default": 0.20, "env": "ALARM_DBSCAN_MARKOV_RATIO", "cast": float},
+        "alarm_dbscan_markov_ratio": {"default": 0.70, "env": "ALARM_DBSCAN_MARKOV_RATIO", "cast": float},
         # RSSI floor (dBm) below which *failure* events are discarded during
         # enrichment. Clients at the fringe of RF coverage generate auth/roam
         # failure events that reflect poor signal, not device-level behavior —

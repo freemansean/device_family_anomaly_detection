@@ -35,7 +35,7 @@ import httpx
 import redis.asyncio as aioredis
 
 from . import alert_tracker, config
-from .anomaly_detector import get_findings, get_org_findings
+from .anomaly_detector import HIDDEN_FAMILIES, get_findings, get_org_findings
 from .client_cache import get_client_cache
 from .health_scorer import get_health
 
@@ -52,7 +52,7 @@ REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 def get_health_score_threshold() -> float:
     """Read health score threshold via the centralised config module.
 
-    Resolution: config_overrides.json → env var → hardcoded default (0.80).
+    Resolution: config_overrides.json → env var → hardcoded default (0.30).
     Imported by routes.py so the same value is used for API alert filtering.
     Lives under the `general` section because it gates alarm generation at
     both org and site level alongside `alarm_min_family_size`.
@@ -65,7 +65,7 @@ def get_alarm_service_device_pct() -> float:
 
     A family fires an alarm via the service-alarm path when at least this
     fraction of its MACs have individually tripped a service alarm. Default
-    0.0 preserves the prior behavior (any service alarm fires). Imported by
+    0.50 (at least half of the family must be tripped). Imported by
     routes.py so the same gate is used for API alert filtering.
     """
     return config.get("general", "alarm_service_device_pct")
@@ -78,7 +78,7 @@ def get_alarm_dbscan_markov_ratio() -> float:
     clients flagged by *either* DBSCAN or Markov is at or above this value.
     Inter-family centroid detection (is_family_outlier) is independent of
     this gate and remains independently sufficient to fire an alarm.
-    Resolution: config_overrides.json → env var → hardcoded default (0.20).
+    Resolution: config_overrides.json → env var → hardcoded default (0.70).
     Imported by routes.py so the same ratio is used for API alert filtering.
     """
     return config.get("general", "alarm_dbscan_markov_ratio")
@@ -91,7 +91,14 @@ def family_passes_dbscan_markov_gate(finding: dict, ratio: float) -> bool:
     Centroid (is_family_outlier) is independently sufficient. Otherwise the
     per-MAC union of DBSCAN and Markov flags must reach `ratio` of the
     family's total client count.
+
+    HIDDEN_FAMILIES ("Unknown", "IoT (Unknown)") are heterogeneous catch-all
+    buckets and never eligible for alarms, regardless of any other signal.
+    This is the single alarm chokepoint shared by webhook dispatch and the
+    /org/alerts + /org/alerts-full feeds, so exclusion here covers every path.
     """
+    if finding.get("device_family") in HIDDEN_FAMILIES:
+        return False
     if finding.get("is_family_outlier", False):
         return True
     total = finding.get("total_mac_count", 0) or 0
@@ -106,7 +113,7 @@ def get_alarm_min_family_size() -> int:
 
     Families with `total_mac_count` below this threshold are suppressed from
     both webhook dispatch and the OrgAlerts API feed, even if they otherwise
-    pass the dual gate. Default 1 (no suppression — every family eligible).
+    pass the dual gate. Default 10 (suppress families smaller than 10 MACs).
     Resolution: config_overrides.json → env var → hardcoded default.
     Imported by routes.py so the same floor is used for API alert filtering.
     """

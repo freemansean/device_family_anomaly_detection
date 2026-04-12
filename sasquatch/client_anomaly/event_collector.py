@@ -120,11 +120,11 @@ IGNORED_EVENT_TYPES: frozenset[str] = frozenset({
 # authentication behavior. Counting them as auth failures inflates failure ratios and
 # depresses health scores for devices in marginal coverage areas.
 #
-# MARVIS_EVENT_CLIENT_AUTH_FAILURE reports the code as negative (-79); the
-# MAC-auth variant reports it as positive (79). Both are the same signal.
+# Mist reports this code with inconsistent sign across event types and over time,
+# so both signs are ignored for every affected event type.
 _TRANSMISSION_FAILURE_IGNORED: dict[str, frozenset[int]] = {
-    "MARVIS_EVENT_CLIENT_AUTH_FAILURE": frozenset({-79}),
-    "MARVIS_EVENT_CLIENT_MAC_AUTH_FAILURE": frozenset({79}),
+    "MARVIS_EVENT_CLIENT_AUTH_FAILURE": frozenset({79, -79}),
+    "MARVIS_EVENT_CLIENT_MAC_AUTH_FAILURE": frozenset({79, -79}),
 }
 
 
@@ -136,29 +136,14 @@ def _transmission_filter_summary() -> str:
     return ", ".join(parts)
 
 # Events with RSSI weaker than the configured threshold are discarded during
-# enrichment — but ONLY when the event type is an auth/roam/association failure.
-# Rationale: a failure event from a client at the fringe of RF coverage likely
-# reflects poor signal, not device-level behavior. Successful events and
-# non-auth types (DHCP, DNS, ARP, etc.) pass through regardless of signal
-# strength: if they happened, the RF link was good enough. The threshold is
-# read from `config.get("general", "anomaly_rssi_min_threshold")` (env var
-# `ANOMALY_RSSI_MIN_THRESHOLD`, default -87 dBm).
-_RSSI_FILTER_EVENT_TYPES: frozenset[str] = frozenset({
-    # AUTH_FAILURE
-    "MARVIS_EVENT_CLIENT_AUTH_FAILURE",
-    "MARVIS_EVENT_CLIENT_AUTH_DENIED",
-    "MARVIS_EVENT_CLIENT_MAC_AUTH_FAILURE",
-    "MARVIS_EVENT_SAE_AUTH_FAILURE",
-    "SA_QUERY_TIMEOUT",
-    # ASSOCIATION_FAILURE (flat list, not in EVENT_CATEGORIES)
-    "CLIENT_ASSOCIATION_FAILURE",
-    # ROAM_FAILURE
-    "MARVIS_EVENT_CLIENT_FBT_FAILURE",
-    "MARVIS_EVENT_CLIENT_AUTH_FAILURE_OKC",
-    "MARVIS_EVENT_CLIENT_AUTH_FAILURE_11R",
-    "MARVIS_EVENT_WLC_FT_KEY_NOT_FOUND",
-    "CLIENT_REASSOCIATION_FAILURE",
-})
+# enrichment, regardless of event type. Rationale: at the RF fringe, every
+# event outcome is unreliable — successes may be racing retransmits, DHCP/DNS
+# latencies inflate, and transient failures cannot be distinguished from
+# coverage artifacts. Events without an `rssi` field (None) are always passed
+# through since they are typically synthetic or boundary markers (e.g.
+# MARVIS_EVENT_STA_LEAVING) and have no signal-strength to evaluate. The
+# threshold is read from `config.get("general", "anomaly_rssi_min_threshold")`
+# (env var `ANOMALY_RSSI_MIN_THRESHOLD`, default -87 dBm).
 
 # Known Mist client event types — used to define the ML feature vector dimensions.
 # Fetched live from /api/v1/const/client_events at startup and cached in Redis,
@@ -581,11 +566,9 @@ def _enrich_batch(
     Mist API variant duplicates (has_pcap variants, pcap_url JWT rotation) are
     collapsed by _dedup_events before enrichment.
 
-    RSSI filtering is narrow: only auth/roam/association failure events
-    (`_RSSI_FILTER_EVENT_TYPES`) with `rssi < rssi_threshold` are dropped.
-    Successful events and non-auth types (DHCP, DNS, ARP, etc.) pass through
-    regardless of signal strength — the fact that they happened is evidence
-    the link was good enough.
+    RSSI filtering is blanket: any event with `rssi < rssi_threshold` is
+    dropped regardless of type. Events with `rssi is None` (synthetic /
+    boundary markers like MARVIS_EVENT_STA_LEAVING) always pass through.
 
     If `stats` is provided, the in/out counters for this batch are added to
     the accumulator keys `transmission_failure_skipped` and
@@ -606,11 +589,10 @@ def _enrich_batch(
         if ignored_codes is not None and event.get("status_code") in ignored_codes:
             transmission_failure_skipped += 1
             continue
-        if event_type in _RSSI_FILTER_EVENT_TYPES:
-            rssi = event.get("rssi")
-            if rssi is not None and rssi < rssi_threshold:
-                weak_signal_skipped += 1
-                continue
+        rssi = event.get("rssi")
+        if rssi is not None and rssi < rssi_threshold:
+            weak_signal_skipped += 1
+            continue
         if event_type and event_type not in known_types:
             unknown_types.add(event_type)
         mac = (event.get("mac") or "").replace(":", "").lower()
@@ -843,8 +825,8 @@ async def _collect_org_streaming(
     )
     log.info(
         f"[org] {label} filter summary: "
-        f"{filter_stats['weak_signal_skipped']} failure events dropped "
-        f"(rssi < {rssi_threshold} dBm, only auth/roam/association failures); "
+        f"{filter_stats['weak_signal_skipped']} events dropped "
+        f"(rssi < {rssi_threshold} dBm, all types); "
         f"{filter_stats['transmission_failure_skipped']} auth events "
         f"dropped (transmission failures: {_transmission_filter_summary()})"
     )

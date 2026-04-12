@@ -769,11 +769,11 @@ export default function App() {
   function handleOpenGeneralConfig() {
     setGeneralConfigDraft(generalConfig ? { ...generalConfig } : {
       org_detection_interval_hours: 1,
-      anomaly_min_mac_events: 5,
-      alarm_min_family_size: 1,
-      anomaly_health_score_threshold: 0.80,
-      alarm_service_device_pct: 0.0,
-      alarm_dbscan_markov_ratio: 0.20,
+      anomaly_min_mac_events: 10,
+      alarm_min_family_size: 10,
+      anomaly_health_score_threshold: 0.30,
+      alarm_service_device_pct: 0.50,
+      alarm_dbscan_markov_ratio: 0.70,
     });
     setGeneralConfigSaveState("idle");
   }
@@ -1330,9 +1330,9 @@ export default function App() {
               <div style={{ marginBottom: "18px" }}>
                 <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: "5px" }}>
                   <div style={{ color: "#888", fontSize: "11px" }}>MIN FAMILY SIZE FOR ALARM GENERATION</div>
-                  <div style={{ color: "#7ec8e3", fontSize: "13px", fontWeight: "bold" }}>{generalConfigDraft.alarm_min_family_size ?? 1} MAC{(generalConfigDraft.alarm_min_family_size ?? 1) === 1 ? "" : "s"}</div>
+                  <div style={{ color: "#7ec8e3", fontSize: "13px", fontWeight: "bold" }}>{generalConfigDraft.alarm_min_family_size ?? 10} MAC{(generalConfigDraft.alarm_min_family_size ?? 10) === 1 ? "" : "s"}</div>
                 </div>
-                <input type="range" min={1} max={50} value={generalConfigDraft.alarm_min_family_size ?? 1} onChange={(e) => setGeneralConfigDraft(d => ({ ...d, alarm_min_family_size: Number(e.target.value) }))} style={{ width: "100%", accentColor: "#7ec8e3", cursor: "pointer" }} />
+                <input type="range" min={1} max={50} value={generalConfigDraft.alarm_min_family_size ?? 10} onChange={(e) => setGeneralConfigDraft(d => ({ ...d, alarm_min_family_size: Number(e.target.value) }))} style={{ width: "100%", accentColor: "#7ec8e3", cursor: "pointer" }} />
                 <div style={{ color: "#555", fontSize: "11px", marginTop: "4px" }}>Suppress alarms for device families whose total MAC count is below this threshold. Findings still appear in the UI, but the OrgAlerts feed and webhook dispatch skip them. Set to 1 to disable (every family eligible).</div>
               </div>
 
@@ -1342,27 +1342,27 @@ export default function App() {
                 <div style={{ marginBottom: "18px" }}>
                   <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: "5px" }}>
                     <div style={{ color: "#888", fontSize: "11px" }}>HEALTH SCORE THRESHOLD</div>
-                    <div style={{ color: "#7ec8e3", fontSize: "13px", fontWeight: "bold" }}>{((generalConfigDraft.anomaly_health_score_threshold ?? 0.80) * 100).toFixed(0)}%</div>
+                    <div style={{ color: "#7ec8e3", fontSize: "13px", fontWeight: "bold" }}>{((generalConfigDraft.anomaly_health_score_threshold ?? 0.30) * 100).toFixed(0)}%</div>
                   </div>
-                  <input type="range" min={0} max={100} value={Math.round((generalConfigDraft.anomaly_health_score_threshold ?? 0.80) * 100)} onChange={(e) => setGeneralConfigDraft(d => ({ ...d, anomaly_health_score_threshold: Number(e.target.value) / 100 }))} style={{ width: "100%", accentColor: "#7ec8e3", cursor: "pointer" }} />
+                  <input type="range" min={0} max={100} value={Math.round((generalConfigDraft.anomaly_health_score_threshold ?? 0.30) * 100)} onChange={(e) => setGeneralConfigDraft(d => ({ ...d, anomaly_health_score_threshold: Number(e.target.value) / 100 }))} style={{ width: "100%", accentColor: "#7ec8e3", cursor: "pointer" }} />
                   <div style={{ color: "#555", fontSize: "11px", marginTop: "4px" }}>Health score below which a family is considered degraded. Both a family-level anomaly AND health must fail for the dual-gate alarm to fire — this gates both the webhook dispatcher and the OrgAlerts UI feed at org and site level.</div>
                 </div>
 
                 <div style={{ marginBottom: "18px" }}>
                   <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: "5px" }}>
                     <div style={{ color: "#888", fontSize: "11px" }}>SERVICE ALARM — DEVICES IN FAMILY</div>
-                    <div style={{ color: "#7ec8e3", fontSize: "13px", fontWeight: "bold" }}>{((generalConfigDraft.alarm_service_device_pct ?? 0.0) * 100).toFixed(0)}%</div>
+                    <div style={{ color: "#7ec8e3", fontSize: "13px", fontWeight: "bold" }}>{((generalConfigDraft.alarm_service_device_pct ?? 0.50) * 100).toFixed(0)}%</div>
                   </div>
-                  <input type="range" min={0} max={100} value={Math.round((generalConfigDraft.alarm_service_device_pct ?? 0.0) * 100)} onChange={(e) => setGeneralConfigDraft(d => ({ ...d, alarm_service_device_pct: Number(e.target.value) / 100 }))} style={{ width: "100%", accentColor: "#7ec8e3", cursor: "pointer" }} />
+                  <input type="range" min={0} max={100} value={Math.round((generalConfigDraft.alarm_service_device_pct ?? 0.50) * 100)} onChange={(e) => setGeneralConfigDraft(d => ({ ...d, alarm_service_device_pct: Number(e.target.value) / 100 }))} style={{ width: "100%", accentColor: "#7ec8e3", cursor: "pointer" }} />
                   <div style={{ color: "#555", fontSize: "11px", marginTop: "4px" }}>Minimum percentage of devices within a family that must individually have seen a service alarm (auth/roam/dhcp/dns/arp below the per-MAC service health floor) before the service-alarm path fires. Gates both the webhook dispatcher and the org/site alert feeds. Set to 0% to alarm on any tripped device.</div>
                 </div>
 
                 <div>
                   <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: "5px" }}>
                     <div style={{ color: "#888", fontSize: "11px" }}>DBSCAN / MARKOV — DEVICES IN FAMILY</div>
-                    <div style={{ color: "#7ec8e3", fontSize: "13px", fontWeight: "bold" }}>{((generalConfigDraft.alarm_dbscan_markov_ratio ?? 0.20) * 100).toFixed(0)}%</div>
+                    <div style={{ color: "#7ec8e3", fontSize: "13px", fontWeight: "bold" }}>{((generalConfigDraft.alarm_dbscan_markov_ratio ?? 0.70) * 100).toFixed(0)}%</div>
                   </div>
-                  <input type="range" min={0} max={100} value={Math.round((generalConfigDraft.alarm_dbscan_markov_ratio ?? 0.20) * 100)} onChange={(e) => setGeneralConfigDraft(d => ({ ...d, alarm_dbscan_markov_ratio: Number(e.target.value) / 100 }))} style={{ width: "100%", accentColor: "#7ec8e3", cursor: "pointer" }} />
+                  <input type="range" min={0} max={100} value={Math.round((generalConfigDraft.alarm_dbscan_markov_ratio ?? 0.70) * 100)} onChange={(e) => setGeneralConfigDraft(d => ({ ...d, alarm_dbscan_markov_ratio: Number(e.target.value) / 100 }))} style={{ width: "100%", accentColor: "#7ec8e3", cursor: "pointer" }} />
                   <div style={{ color: "#555", fontSize: "11px", marginTop: "4px" }}>Minimum percentage of clients in a device family that must be flagged as anomalous by <strong>either</strong> DBSCAN or Markov before an alarm fires for that family. The two detector flags are unioned per client (a single device flagged by both still counts once). Gates both the webhook dispatcher and the org/site alert feeds. Inter-family centroid detection (is_family_outlier) is independent of this gate and remains independently sufficient to fire an alarm.</div>
                 </div>
               </div>
