@@ -270,12 +270,14 @@ async def _run_org_pipeline_body(
 
     Sequence:
       1. Build features + score health for all sites/WLANs
-      2. Run org-wide anomaly detection → write org findings → dispatch org webhook
-      3. Run per-site anomaly detection (iterate each site) → dispatch per-site webhooks
+      2. Run per-site anomaly detection (Markov runs here, writes per-site anomaly records)
+      3. Run org-wide anomaly detection (merges Markov from per-site records) → write org findings
+      4. Dispatch org + per-site webhooks
+      5. Pre-compute dashboard summary cache
 
-    Org findings appear in Redis as soon as phase 2 completes (frontend auto-refreshes).
-    Per-site findings appear incrementally as each site completes in phase 3.
-    If the pipeline fails mid-site, previously completed sites retain their results.
+    Per-site scoring runs BEFORE org-wide scoring so that score_org_wide() can
+    merge fresh per-site Markov results from the current cycle (previously org
+    scoring ran first, causing Markov data to lag by one pipeline cycle).
 
     progress_callback: optional async callable(dict) to write progress updates.
     site_map: {site_id: site_name} for progress messages.
@@ -338,7 +340,61 @@ async def _run_org_pipeline_body(
                 log.exception(f"[org pipeline] Feature build failed for site {sid}")
                 wlans_by_site.setdefault(sid, [])
 
-        # ── Phase 3: Org-wide anomaly detection ──────────────────────────
+        all_wlans: set[str] = set()
+        for wlans in wlans_by_site.values():
+            all_wlans.update(wlans)
+
+        # ── Phase 3: Per-site anomaly detection (sequential) ────────────
+        # Runs BEFORE org-wide scoring so that per-site Markov results are
+        # available for score_org_wide() to merge. Previously this ran after
+        # org scoring (as "Phase 4"), which meant org anomaly records lagged
+        # per-site Markov data by one cycle — the MacDrilldown fallback to
+        # org anomalies would show empty Markov fields.
+        await _progress({
+            "phase": "site_scoring",
+            "current_site": None,
+            "sites_complete": 0,
+            "total_sites": total_sites,
+            "org_complete": False,
+        })
+
+        # Counters for the end-of-phase summary. A (site, wlan) combo lands in
+        # exactly one bucket: scored (score() returned > 0), skipped_empty_features
+        # (score() returned 0 — features key exists but dict is empty, see
+        # anomaly_detector.score() skip path), or failed (score() raised). Tracked
+        # so the silent-skip gap between features keys and anomalies keys is
+        # observable at a glance (see TODO Phase 4 investigation).
+        phase3_wlans_scored = 0
+        phase3_wlans_skipped_empty_features = 0
+        phase3_wlans_failed = 0
+        phase3_sites_with_any_scored: set[str] = set()
+
+        for i, sid in enumerate(site_ids):
+            site_name = site_map.get(sid, sid[:8])
+            await _progress({
+                "phase": "site_scoring",
+                "current_site": site_name,
+                "sites_complete": i,
+                "total_sites": total_sites,
+                "org_complete": False,
+            })
+
+            wlans = wlans_by_site.get(sid, [])
+            for wlan in wlans:
+                try:
+                    n_scored = await score(sid, wlan)
+                    if n_scored > 0:
+                        phase3_wlans_scored += 1
+                        phase3_sites_with_any_scored.add(sid)
+                    else:
+                        phase3_wlans_skipped_empty_features += 1
+                except Exception:
+                    phase3_wlans_failed += 1
+                    log.exception(f"[org pipeline] Per-site scoring failed for site={sid} wlan={wlan}")
+
+        # ── Phase 4: Org-wide anomaly detection ──────────────────────────
+        # Runs after per-site scoring so score_org_wide() can read fresh
+        # per-site Markov results from the current cycle.
         await _progress({
             "phase": "org_scoring",
             "current_site": None,
@@ -346,10 +402,6 @@ async def _run_org_pipeline_body(
             "total_sites": total_sites,
             "org_complete": False,
         })
-
-        all_wlans: set[str] = set()
-        for wlans in wlans_by_site.values():
-            all_wlans.update(wlans)
 
         org_total_macs: dict[str, int] = {}
         for wlan in sorted(all_wlans):
@@ -376,58 +428,24 @@ async def _run_org_pipeline_body(
             except Exception:
                 log.exception(f"[org pipeline] Org webhook dispatch failed for wlan={wlan}")
 
-        await _progress({
-            "phase": "site_scoring",
-            "current_site": None,
-            "sites_complete": 0,
-            "total_sites": total_sites,
-            "org_complete": True,
-        })
-
-        # ── Phase 4: Per-site anomaly detection (sequential) ─────────────
-        # Counters for the end-of-phase summary. A (site, wlan) combo lands in
-        # exactly one bucket: scored (score() returned > 0), skipped_empty_features
-        # (score() returned 0 — features key exists but dict is empty, see
-        # anomaly_detector.score() skip path), or failed (score() raised). Tracked
-        # so the silent-skip gap between features keys and anomalies keys is
-        # observable at a glance (see TODO Phase 4 investigation).
-        phase4_wlans_scored = 0
-        phase4_wlans_skipped_empty_features = 0
-        phase4_wlans_failed = 0
-        phase4_sites_with_any_scored: set[str] = set()
-
+        # Dispatch per-site webhooks (after org scoring so all anomaly records
+        # are complete before any webhook fires)
         for i, sid in enumerate(site_ids):
-            site_name = site_map.get(sid, sid[:8])
-            await _progress({
-                "phase": "site_scoring",
-                "current_site": site_name,
-                "sites_complete": i,
-                "total_sites": total_sites,
-                "org_complete": True,
-            })
-
             wlans = wlans_by_site.get(sid, [])
             for wlan in wlans:
                 try:
-                    n_scored = await score(sid, wlan)
-                    if n_scored > 0:
-                        phase4_wlans_scored += 1
-                        phase4_sites_with_any_scored.add(sid)
-                    else:
-                        phase4_wlans_skipped_empty_features += 1
                     await evaluate_and_dispatch(sid, wlan=wlan)
                 except Exception:
-                    phase4_wlans_failed += 1
-                    log.exception(f"[org pipeline] Per-site scoring failed for site={sid} wlan={wlan}")
+                    log.exception(f"[org pipeline] Per-site webhook dispatch failed for site={sid} wlan={wlan}")
 
-        total_wlans = phase4_wlans_scored + phase4_wlans_skipped_empty_features + phase4_wlans_failed
+        total_wlans = phase3_wlans_scored + phase3_wlans_skipped_empty_features + phase3_wlans_failed
         log.info(
-            "[org pipeline] Phase 4 summary: sites_scored=%d/%d wlans_scored=%d/%d "
+            "[org pipeline] Per-site scoring summary: sites_scored=%d/%d wlans_scored=%d/%d "
             "wlans_skipped_empty_features=%d wlans_failed=%d",
-            len(phase4_sites_with_any_scored), total_sites,
-            phase4_wlans_scored, total_wlans,
-            phase4_wlans_skipped_empty_features,
-            phase4_wlans_failed,
+            len(phase3_sites_with_any_scored), total_sites,
+            phase3_wlans_scored, total_wlans,
+            phase3_wlans_skipped_empty_features,
+            phase3_wlans_failed,
         )
 
         # ── Phase 5: Pre-compute dashboard summary cache ─────────────────
