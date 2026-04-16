@@ -136,8 +136,8 @@ function AlertCard({ finding, onFamilyClick }) {
           )}
           {finding.is_family_outlier && (
             <span style={{ background: "#2a1a3a", color: "#b06ad4", border: "1px solid #6a3a8a", borderRadius: "3px", padding: "2px 7px", fontSize: "10px" }}
-              title="Centroid IF/distance: whole family's collective behavior differs from other families">
-              Centroid
+              title="Family cosine distance: whole family's collective behavior differs from other families">
+              Family
             </span>
           )}
           {finding.is_family_dbscan_outlier && (
