@@ -55,7 +55,6 @@ from sklearn.preprocessing import StandardScaler
 from . import config
 from .event_collector import get_events, sanitize_wlan_key
 from .feature_engineer import (
-    FEATURE_KEYS,
     SERVICE_ACCOUNT_SUFFIX,
     build_posthoc_features,
     get_features,
@@ -116,12 +115,23 @@ def _severity(outlier_ratio: float) -> str:
     return "minimal"
 
 
-def _extract_vector_array(feature_records: list[dict]) -> np.ndarray:
-    """Convert list of feature record dicts to a numpy array."""
+def _extract_vector_array(
+    feature_records: list[dict], vector_key: str
+) -> np.ndarray:
+    """Convert list of feature record dicts to a numpy array.
+
+    `vector_key` selects which vector to extract — "event_vector" for IF,
+    "category_vector" for DBSCAN. Key ordering is taken from the first
+    record; build_features writes both vectors with stable key ordering
+    (CATEGORY_FEATURE_KEYS / event_type_index respectively), so all rows
+    share the same dimensionality.
+    """
     if not feature_records:
         return np.empty((0, 0))
-    keys = list(feature_records[0]["vector"].keys())
-    return np.array([[r["vector"].get(k, 0.0) for k in keys] for r in feature_records])
+    keys = list(feature_records[0][vector_key].keys())
+    return np.array(
+        [[r[vector_key].get(k, 0.0) for k in keys] for r in feature_records]
+    )
 
 
 def _run_isolation_forest(
@@ -129,9 +139,13 @@ def _run_isolation_forest(
 ) -> dict[str, dict]:
     """
     Run Isolation Forest on a group of MACs (same device family).
+    Operates on event_vector (~59-dim per-event-type frequencies) so two
+    family members failing at distinct event types (e.g. 11r-FBT vs OKC
+    auth failure) score as different rather than collapsing into the
+    same ROAM_FAILURE bucket the category vector would merge them into.
     Returns per-MAC dict with if_score and is_if_outlier.
     """
-    X = _extract_vector_array(feature_records)
+    X = _extract_vector_array(feature_records, "event_vector")
     if X.shape[0] < _cfg("anomaly_min_peers"):
         return {
             mac: {"if_score": None, "is_if_outlier": False}
@@ -206,11 +220,15 @@ def _run_dbscan(macs: list[str], feature_records: list[dict]) -> dict[str, dict]
     """
     Run DBSCAN across all MACs in the WLAN/org scope.
 
-    PCA reduction is applied before DBSCAN to mitigate the curse of dimensionality:
-    Euclidean distance degrades in 61-dimensional space (all points tend toward the
-    same inter-point distance), and the sparse frequency vectors make this worse.
-    PCA is not applied before Isolation Forest — IF splits on one random feature at
-    a time and handles high-dimensional sparse vectors without distance degradation.
+    Operates on category_vector (14-dim semantic buckets + concentration features).
+    DBSCAN is a population-wide cluster scan — semantic granularity is the right
+    level here: clients should cluster by which kinds of behaviors they exhibit,
+    not by which specific event subtypes they happen to fire. Per-event-type
+    detail belongs to the per-family IF / centroid passes.
+
+    PCA reduction is applied to keep Euclidean distance well-behaved on the
+    sparse 14-dim category vectors. n_components=0.95 typically collapses to
+    a handful of components, making Euclidean distance meaningful again.
 
     Auto-tuning: min_samples is derived from the size of the input population
     (`max(3, int(n_clients * pct))` — `pct` configurable via the GUI, 0.01–0.10),
@@ -228,15 +246,14 @@ def _run_dbscan(macs: list[str], feature_records: list[dict]) -> dict[str, dict]
     if n_clients < min_samples:
         return {mac: {"dbscan_label": -1, "is_dbscan_outlier": True} for mac in macs}
 
-    X = _extract_vector_array(feature_records)
+    X = _extract_vector_array(feature_records, "category_vector")
 
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X)
 
     # Reduce dimensionality before DBSCAN. n_components=0.95 keeps enough components
-    # to explain 95% of variance. For sparse 61-dim frequency vectors this typically
-    # collapses to 8–15 components, making Euclidean distance meaningful again.
-    # Cap at n_samples - 1 so PCA doesn't fail on small populations.
+    # to explain 95% of variance. Cap at n_samples - 1 so PCA doesn't fail on small
+    # populations.
     max_components = min(X_scaled.shape[0] - 1, X_scaled.shape[1])
     pca = PCA(n_components=min(_cfg("anomaly_dbscan_pca_variance"), max_components), random_state=_random_state())
     X_reduced = pca.fit_transform(X_scaled)
@@ -381,12 +398,33 @@ def _run_family_centroid_distance(
     Returns {} if fewer than 2 qualifying families exist (a reference centroid
     and a target family are both required).
     """
+    # Operates on event_vector (~59-dim per-event-type frequencies). Category-level
+    # centroids would collapse families that fail at different specific event types
+    # into the same point — exactly the signal this detector exists to surface.
+    # event_vector keys are stable across MACs within a single build (built from
+    # the same event_type_index), so the first present record defines key order.
+    event_keys: list[str] | None = None
+    for fam_macs in family_groups.values():
+        for mac in fam_macs:
+            rec = features.get(mac)
+            if rec and rec.get("event_vector"):
+                event_keys = list(rec["event_vector"].keys())
+                break
+        if event_keys:
+            break
+    if not event_keys:
+        log.info(
+            "Centroid distance [%s]: skipped — no event_vector found on any record",
+            wlan,
+        )
+        return {}
+
     qualifying: list[tuple[str, np.ndarray]] = []
     for family, macs in family_groups.items():
         if len(macs) < 2:
             continue
         vectors = np.array([
-            [features[mac]["vector"].get(k, 0.0) for k in FEATURE_KEYS]
+            [features[mac]["event_vector"].get(k, 0.0) for k in event_keys]
             for mac in macs
             if mac in features
         ])
@@ -454,6 +492,36 @@ def _run_family_centroid_distance(
         {f: f"{s:.4f}" for f, s in sorted(dist_scores.items(), key=lambda x: -x[1])},
     )
     return dist_scores
+
+
+def _family_mean_health(
+    groups: dict[str, list[str]],
+    feature_map: dict[str, dict],
+    log_prefix: str,
+    wlan: str,
+) -> dict[str, float]:
+    """Compute per-family mean health from `category_vector` on each member.
+
+    Used before `_run_family_centroid_distance` to feed it the healthy-reference
+    pool. Keys in `groups` may be MACs (site scope) or composite keys (org scope)
+    — the lookup into `feature_map` uses whatever key the group carries.
+    Missing-from-features members are skipped; a family with no members present
+    in `feature_map` scores as 1.0 (no evidence of failure).
+    """
+    health: dict[str, float] = {}
+    for family, members in groups.items():
+        scores = [
+            _mac_health_score(feature_map[m]["category_vector"])[0]
+            for m in members
+            if m in feature_map
+        ]
+        health[family] = sum(scores) / len(scores) if scores else 1.0
+    log.info(
+        "%sFamily health scores [%s]: %s",
+        log_prefix, wlan,
+        {f: f"{s:.2f}" for f, s in sorted(health.items(), key=lambda x: x[1])},
+    )
+    return health
 
 
 async def score(
@@ -662,15 +730,7 @@ async def score(
         # Compute per-family mean health so the centroid detection can build a
         # healthy-only reference (families with low health are excluded from the
         # reference population but are still scored against it).
-        family_health: dict[str, float] = {}
-        for _fam, _macs in family_groups.items():
-            _scores = [_mac_health_score(features[m]["vector"])[0] for m in _macs if m in features]
-            family_health[_fam] = sum(_scores) / len(_scores) if _scores else 1.0
-        log.info(
-            "Family health scores [%s]: %s",
-            wlan,
-            {f: f"{s:.2f}" for f, s in sorted(family_health.items(), key=lambda x: x[1])},
-        )
+        family_health = _family_mean_health(family_groups, features, "", wlan)
 
         # Cosine distance from the healthy-reference centroid is the sole
         # family-level (is_family_outlier) signal. IF is no longer used here.
@@ -843,16 +903,16 @@ async def score(
             outlier_weight_sum = sum(anomalies[m]["volume_concentration_weight"] for m in outlier_macs)
             weighted_outlier_score = outlier_weight_sum / total_weight
 
-            outlier_vecs = [features[m]["vector"] for m in outlier_macs]
+            outlier_vecs = [features[m]["category_vector"] for m in outlier_macs]
             normal_macs = [m for m in family_macs if not anomalies[m]["is_outlier"]]
-            normal_vecs = [features[m]["vector"] for m in normal_macs]
+            normal_vecs = [features[m]["category_vector"] for m in normal_macs]
 
             # For family-wide outliers the entire family is flagged, leaving normal_vecs
             # empty. Fall back to the rest of the site population as the baseline so
             # top_features reflects how this family differs from all other devices.
             if not normal_vecs and outlier_vecs:
                 family_mac_set = set(family_macs)
-                normal_vecs = [features[m]["vector"] for m in features if m not in family_mac_set]
+                normal_vecs = [features[m]["category_vector"] for m in features if m not in family_mac_set]
 
             top_features = _top_contributing_features(outlier_vecs, normal_vecs)
 
@@ -881,7 +941,7 @@ async def score(
             # devices experiencing the most failures — independent of outlier scoring.
             # The displayed `mac` is always the real MAC, even for sa families.
             mac_health_scores = {
-                m: _mac_health_score(features[m]["vector"])
+                m: _mac_health_score(features[m]["category_vector"])
                 for m in family_macs
             }
             worst_health_macs = sorted(
@@ -1113,18 +1173,8 @@ async def score_org_wide(
     # --- Family centroid detection across all org families ---
     # Compute per-family mean health from feature vectors so the centroid detection
     # can build a healthy-only reference. Unhealthy families are still scored against it.
-    org_family_health: dict[str, float] = {}
-    for _fam, _cks in org_family_groups.items():
-        _scores = [
-            _mac_health_score(composite_features[k]["vector"])[0]
-            for k in _cks
-            if k in composite_features
-        ]
-        org_family_health[_fam] = sum(_scores) / len(_scores) if _scores else 1.0
-    log.info(
-        "[org] Family health scores [%s]: %s",
-        wlan,
-        {f: f"{s:.2f}" for f, s in sorted(org_family_health.items(), key=lambda x: x[1])},
+    org_family_health = _family_mean_health(
+        org_family_groups, composite_features, "[org] ", wlan
     )
 
     centroid_dist_scores = _run_family_centroid_distance(
@@ -1203,7 +1253,11 @@ async def score_org_wide(
                 continue
             try:
                 site_anoms: dict[str, dict] = json.loads(site_anoms_raw)
-            except Exception:
+            except (json.JSONDecodeError, TypeError) as exc:
+                log.warning(
+                    "[org-markov-merge] Failed to parse anomalies for site=%s wlan=%s: %s",
+                    site_id_m, wlan, exc,
+                )
                 continue
             for mac_m, rec in site_anoms.items():
                 ck = f"{site_id_m}:{mac_m}"
@@ -1225,10 +1279,8 @@ async def score_org_wide(
                     ):
                         if mk in rec:
                             org_anomalies_flat[ck][mk] = rec[mk]
-                    # Update composite is_outlier to reflect Markov
-                    org_anomalies_flat[ck]["is_outlier"] = (
-                        org_anomalies_flat[ck]["is_outlier"] or True
-                    )
+                    # Markov flagged → composite is_outlier is True by definition.
+                    org_anomalies_flat[ck]["is_outlier"] = True
     finally:
         await _org_markov_redis.aclose()
 
@@ -1398,13 +1450,13 @@ async def score_org_wide(
             weighted_outlier_score = outlier_weight_sum / total_weight
 
             # Top features: org-wide outliers vs org-wide normals for this family
-            outlier_vecs = [composite_features[k]["vector"] for k in outlier_cks]
+            outlier_vecs = [composite_features[k]["category_vector"] for k in outlier_cks]
             normal_cks = [k for k in family_cks if not org_anomalies_flat[k]["is_outlier"]]
-            normal_vecs = [composite_features[k]["vector"] for k in normal_cks]
+            normal_vecs = [composite_features[k]["category_vector"] for k in normal_cks]
             if not normal_vecs and outlier_vecs:
                 family_ck_set = set(family_cks)
                 normal_vecs = [
-                    composite_features[k]["vector"]
+                    composite_features[k]["category_vector"]
                     for k in composite_macs
                     if k not in family_ck_set
                 ]
@@ -1472,7 +1524,7 @@ async def score_org_wide(
             # string carries the "#sa" suffix — strip it via underlying_mac so
             # the displayed mac is always the real one.
             ck_health_scores = {
-                ck: _mac_health_score(composite_features[ck]["vector"])
+                ck: _mac_health_score(composite_features[ck]["category_vector"])
                 for ck in family_cks
                 if ck in composite_features
             }
