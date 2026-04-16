@@ -267,6 +267,11 @@ def _slim_finding_for_webhook(finding: dict, org_scope: bool) -> dict:
           → current feature list needs rework before it is useful downstream
       - service_alarm_counts
           → consumer reads service_alarms list + service_health dict
+      - health_components (family-level and per-MAC on worst_health_macs)
+          → redundant with service_health; service_health is success-ratio per
+            active MAC and is the actionable per-service signal. health_components
+            used an all-MACs denominator that diluted services where only a subset
+            of the family is active (e.g. printers and DNS).
       - wlan (per-finding)
           → always matches top-level wlan in the envelope
 
@@ -284,7 +289,6 @@ def _slim_finding_for_webhook(finding: dict, org_scope: bool) -> dict:
         "markov_family_reason": finding.get("markov_family_reason"),
         "probable_pattern": finding.get("probable_pattern"),
         "health_score": finding.get("health_score"),
-        "health_components": finding.get("health_components", {}),
         "service_alarms": finding.get("service_alarms", []),
         "service_health": finding.get("service_health", {}),
     }
@@ -303,7 +307,10 @@ def _slim_finding_for_webhook(finding: dict, org_scope: bool) -> dict:
     # at; site-scope entries omit it (the outer `site_id` already identifies
     # the site).
     if "worst_health_macs" in finding:
-        slim["worst_health_macs"] = finding["worst_health_macs"]
+        slim["worst_health_macs"] = [
+            {k: v for k, v in entry.items() if k != "health_components"}
+            for entry in finding["worst_health_macs"]
+        ]
     if "marvis_tshoot" in finding:
         slim["marvis_tshoot"] = finding["marvis_tshoot"]
 

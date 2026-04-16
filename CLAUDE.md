@@ -1387,13 +1387,12 @@ helper if the shape needs to change.
       "markov_family_reason": "repeated",
       "probable_pattern": "auth_failure_terminal",
       "health_score": 0.61,
-      "health_components": {"auth": 0.42, "roam": 0.08, "dhcp": 0.02, "dns": 0.01, "arp": 0.0},
       "service_alarms": ["auth"],
       "service_health": {"auth": 0.55, "roam": 0.92, "dhcp": 0.98, "dns": 0.99, "arp": 1.0},
       "worst_health_macs": [
-        {"mac": "aabbccddee01", "health_score": 0.21, "health_components": {"auth": 0.42}},
-        {"mac": "aabbccddee02", "health_score": 0.34, "health_components": {"roam": 0.28}},
-        {"mac": "aabbccddee03", "health_score": 0.41, "health_components": {"dhcp": 0.19}}
+        {"mac": "aabbccddee01", "health_score": 0.21},
+        {"mac": "aabbccddee02", "health_score": 0.34},
+        {"mac": "aabbccddee03", "health_score": 0.41}
       ],
       "marvis_tshoot": [
         {
