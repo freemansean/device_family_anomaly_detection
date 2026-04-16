@@ -71,6 +71,29 @@ def get_alarm_service_device_pct() -> float:
     return config.get("general", "alarm_service_device_pct")
 
 
+def get_alarm_health_combine() -> str:
+    """Read the combine mode for the two health-side alarm gates.
+
+    "or"  — fire when either the health-score gate OR the service-alarm
+            device-pct gate trips (default; preserves prior behavior).
+    "and" — fire only when BOTH health-side gates trip.
+    Any value other than "and" (case-insensitive) is treated as "or".
+    """
+    raw = config.get("general", "alarm_health_combine")
+    return "and" if str(raw).strip().lower() == "and" else "or"
+
+
+def health_gate_passes(
+    unhealthy_by_score: bool,
+    unhealthy_by_service: bool,
+    combine: str,
+) -> bool:
+    """Combine the two health-side gate results per the admin-selected mode."""
+    if combine == "and":
+        return unhealthy_by_score and unhealthy_by_service
+    return unhealthy_by_score or unhealthy_by_service
+
+
 def get_alarm_dbscan_markov_ratio() -> float:
     """Read the DBSCAN/Markov family-rollup alarm ratio.
 
@@ -349,6 +372,7 @@ async def evaluate_and_dispatch(
     alarm_min_family_size = int(get_alarm_min_family_size())
     service_device_pct = float(get_alarm_service_device_pct())
     dbscan_markov_ratio = float(get_alarm_dbscan_markov_ratio())
+    health_combine = get_alarm_health_combine()
 
     effective_url = config["url"]
     if not config["enabled"] or not effective_url:
@@ -403,7 +427,7 @@ async def evaluate_and_dispatch(
         unhealthy_by_service = (
             len(service_alarms) > 0 and mac_alarm_ratio >= service_device_pct
         )
-        if not (unhealthy_by_score or unhealthy_by_service):
+        if not health_gate_passes(unhealthy_by_score, unhealthy_by_service, health_combine):
             log.debug(
                 "[%s] Skipping webhook for [%s]: rollup gate passed but "
                 "health_score=%.3f >= threshold %.3f and service-alarm device "

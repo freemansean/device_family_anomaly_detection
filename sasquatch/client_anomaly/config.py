@@ -54,6 +54,11 @@ DEFAULTS = {
         # requires at least half of the family's MACs to have tripped a per-MAC
         # service alarm before the service-alarm path fires.
         "alarm_service_device_pct": {"default": 0.50, "env": "ALARM_SERVICE_DEVICE_PCT", "cast": float},
+        # Combine mode for the two health-side alarm gates
+        # (anomaly_health_score_threshold and alarm_service_device_pct).
+        # "or"  = fire when either gate trips (preserves prior behavior).
+        # "and" = fire only when both gates trip.
+        "alarm_health_combine": {"default": "or", "env": "ALARM_HEALTH_COMBINE", "cast": str},
         # Fraction of clients in a device family that must be flagged as
         # anomalous by *either* DBSCAN or Markov before an alarm fires for that
         # family. The union is taken per-MAC: a single client flagged by both
