@@ -132,31 +132,6 @@ async def _redis_get(key: str):
         await client.aclose()
 
 
-@router.get("/org/detection-enabled")
-async def get_org_detection_enabled():
-    """Return whether the scheduled org-wide detection job is enabled."""
-    client = _get_redis()
-    try:
-        val = await client.get("sasquatch:org_detection_enabled")
-    finally:
-        await client.aclose()
-    # Absent key = enabled by default
-    return {"enabled": val != "0"}
-
-
-@router.post("/org/detection-enabled")
-async def set_org_detection_enabled(body: dict):
-    """Enable or disable the scheduled org-wide detection job."""
-    enabled = bool(body.get("enabled", True))
-    client = _get_redis()
-    try:
-        await client.set("sasquatch:org_detection_enabled", "1" if enabled else "0")
-    finally:
-        await client.aclose()
-    log.info(f"Org detection {'enabled' if enabled else 'disabled'} by administrator")
-    return {"enabled": enabled}
-
-
 # ---------------------------------------------------------------------------
 # Org-level event collection (ARCH-3)
 # ---------------------------------------------------------------------------
@@ -801,7 +776,7 @@ async def build_org_summary(redis_client, site_map: dict[str, str], wlan: str) -
 
 
 @router.get("/org/summary")
-async def get_org_summary(wlan: str = Query(..., description="WLAN (SSID) name to scope results to. Required.")):
+async def get_org_summary(wlan: str = Query(..., min_length=1, description="WLAN (SSID) name to scope results to. Required.")):
     """
     Per-site findings and event counts for the org overview.
     Reads from Redis — no real-time Mist API calls for the data itself.
@@ -990,7 +965,7 @@ async def trigger_org_client_refresh():
         total_cached = await refresh_client_cache_org(MIST_ORG_ID)
     except Exception as exc:
         log.exception("Org client refresh failed")
-        raise HTTPException(status_code=502, detail=f"Org client refresh failed: {exc}")
+        raise HTTPException(status_code=502, detail="Org client refresh failed")
 
     return {
         "status": "ok",
@@ -1002,7 +977,12 @@ async def trigger_org_client_refresh():
 
 @router.get("/org/clients/search")
 async def search_org_clients(
-    mac: str = Query(..., description="MAC address prefix — colons/hyphens/whitespace optional"),
+    mac: str = Query(
+        ...,
+        min_length=1,
+        pattern=r"^[a-fA-F0-9:.\-\s]+$",
+        description="MAC address prefix — colons/hyphens/whitespace optional",
+    ),
     limit: int = Query(50, ge=1, le=200, description="Max matches to return"),
 ):
     """
@@ -1221,7 +1201,7 @@ async def build_org_findings(redis_client, site_map: dict[str, str], wlan: str) 
 
 
 @router.get("/org/findings")
-async def get_org_findings_endpoint(wlan: str = Query(..., description="WLAN (SSID) name to scope results to. Required.")):
+async def get_org_findings_endpoint(wlan: str = Query(..., min_length=1, description="WLAN (SSID) name to scope results to. Required.")):
     """
     Return org-wide anomaly findings produced by the cross-site detection job.
 
@@ -1366,7 +1346,7 @@ async def build_org_alerts(redis_client, site_map: dict[str, str], wlan: str) ->
 
 
 @router.get("/org/alerts")
-async def get_org_alerts(wlan: str = Query(..., description="WLAN (SSID) name to scope results to. Required.")):
+async def get_org_alerts(wlan: str = Query(..., min_length=1, description="WLAN (SSID) name to scope results to. Required.")):
     """
     Return org-wide alerts AND per-site alerts in a single response.
 
@@ -1566,7 +1546,7 @@ async def get_org_alerts_full():
 
 @router.get("/org/alert-history")
 async def get_org_alert_history(
-    wlan: str = Query(..., description="WLAN (SSID) name to scope results to. Required."),
+    wlan: str = Query(..., min_length=1, description="WLAN (SSID) name to scope results to. Required."),
     days: int = Query(7, ge=1, le=30),
     tz_offset: int = Query(0, description="Browser timezone offset in minutes (JS getTimezoneOffset())"),
 ):
@@ -1944,7 +1924,7 @@ async def build_org_family_insights(redis_client, site_map: dict[str, str], wlan
 
 
 @router.get("/org/family-insights")
-async def get_org_family_insights(wlan: str = Query(..., description="WLAN (SSID) name to scope results to. Required.")):
+async def get_org_family_insights(wlan: str = Query(..., min_length=1, description="WLAN (SSID) name to scope results to. Required.")):
     """
     Aggregate event category counts and anomaly findings per device family across all org sites.
     Optionally scoped to a specific WLAN via ?wlan=.
@@ -2041,13 +2021,6 @@ def _summary_row_to_drilldown(
     return out
 
 
-def _tally_outliers(rows: list[dict]) -> tuple[int, int, int]:
-    if_count = sum(1 for r in rows if r.get("is_if_outlier"))
-    dbscan_count = sum(1 for r in rows if r.get("is_dbscan_outlier"))
-    markov_count = sum(1 for r in rows if r.get("is_markov_outlier"))
-    return if_count, dbscan_count, markov_count
-
-
 # Whitelist mapping from frontend sort column names to SQL ORDER BY expressions.
 # Keys that don't appear here are rejected (default sort used instead).
 _DRILLDOWN_SORT_COLS: dict[str, str] = {
@@ -2097,7 +2070,7 @@ def _resolve_drilldown_order(sort: str | None, sort_dir: str | None) -> str:
 @router.get("/org/families/{family}/drilldown")
 async def get_org_family_drilldown(
     family: str,
-    wlan: str = Query(..., description="WLAN (SSID) name to scope results to. Required."),
+    wlan: str = Query(..., min_length=1, description="WLAN (SSID) name to scope results to. Required."),
     page: int = Query(1, ge=1, description="Page number (1-based)"),
     page_size: int = Query(500, ge=1, le=2000, description="Rows per page"),
     sort: str | None = Query(None, description="Column to sort by"),
@@ -2413,7 +2386,7 @@ async def list_org_sites():
 
 
 @router.get("/org/cluster-viz")
-async def get_org_cluster_viz(wlan: str = Query(..., description="WLAN (SSID) name to scope results to. Required.")):
+async def get_org_cluster_viz(wlan: str = Query(..., min_length=1, description="WLAN (SSID) name to scope results to. Required.")):
     """
     PCA 2D projection of all MAC feature vectors across every org site.
     Optionally scoped to a specific WLAN via ?wlan=.
@@ -2461,8 +2434,18 @@ async def get_org_cluster_viz(wlan: str = Query(..., description="WLAN (SSID) na
         return {"points": [], "explained_variance": [], "total_points": 0}
 
     keys = list(keyed_features.keys())
-    vec_keys = list(keyed_features[keys[0]]["vector"].keys())
-    X = np.array([[keyed_features[k]["vector"].get(vk, 0.0) for vk in vec_keys] for k in keys])
+    # PCA is a visualization of family-level clustering — category vector is the
+    # right granularity (12 semantic buckets + 2 concentration features). The
+    # 59-dim event_vector is fed to IF/Centroid for detection precision; the
+    # cluster scatter plot is for human inspection where bucket-level distance
+    # is more interpretable.
+    vec_keys = list(keyed_features[keys[0]]["category_vector"].keys())
+    X = np.array(
+        [
+            [keyed_features[k]["category_vector"].get(vk, 0.0) for vk in vec_keys]
+            for k in keys
+        ]
+    )
 
     loop = asyncio.get_event_loop()
     coords, explained_variance = await loop.run_in_executor(_CPU_POOL, _run_pca, X)
@@ -2499,7 +2482,7 @@ async def build_site_findings(site_id: str, wlan: str) -> dict:
 
 
 @router.get("/sites/{site_id}/findings")
-async def get_site_findings(site_id: str, wlan: str = Query(..., description="WLAN (SSID) name to scope results to. Required.")):
+async def get_site_findings(site_id: str, wlan: str = Query(..., min_length=1, description="WLAN (SSID) name to scope results to. Required.")):
     """Current anomaly findings from Redis for a site, optionally scoped to a WLAN.
 
     Cache-first: pre-computed by the detection pipeline tail. On miss, the
@@ -2526,7 +2509,7 @@ async def build_site_health(site_id: str, wlan: str) -> dict:
 
 
 @router.get("/sites/{site_id}/health")
-async def get_site_health(site_id: str, wlan: str = Query(..., description="WLAN (SSID) name to scope results to. Required.")):
+async def get_site_health(site_id: str, wlan: str = Query(..., min_length=1, description="WLAN (SSID) name to scope results to. Required.")):
     """
     Per-family health scores for a site, optionally scoped to a WLAN.
     Returns {family: {health_score, components, total_events, mac_count}}.
@@ -2721,7 +2704,7 @@ async def build_site_events_summary(site_id: str, wlan: str) -> dict | None:
 
 
 @router.get("/sites/{site_id}/events/summary")
-async def get_events_summary(site_id: str, wlan: str = Query(..., description="WLAN (SSID) name to scope results to. Required.")):
+async def get_events_summary(site_id: str, wlan: str = Query(..., min_length=1, description="WLAN (SSID) name to scope results to. Required.")):
     """
     Event category counts per device family — used for heatmap in SiteOverview.
     Optionally scoped to a specific WLAN via ?wlan=.
@@ -2747,7 +2730,7 @@ async def get_events_summary(site_id: str, wlan: str = Query(..., description="W
 
 
 @router.get("/sites/{site_id}/families/{family}/if-outliers")
-async def get_family_if_outliers(site_id: str, family: str, wlan: str = Query(..., description="WLAN (SSID) name to scope results to. Required.")):
+async def get_family_if_outliers(site_id: str, family: str, wlan: str = Query(..., min_length=1, description="WLAN (SSID) name to scope results to. Required.")):
     """
     MACs within a device family that triggered an Isolation Forest deviation.
     Used by the Family Drilldown view. Optionally scoped to a WLAN.
@@ -2893,7 +2876,7 @@ async def get_family_if_outliers(site_id: str, family: str, wlan: str = Query(..
 async def trigger_family_tshoot(
     site_id: str,
     family: str,
-    wlan: str = Query(..., description="WLAN (SSID) name to scope results to. Required."),
+    wlan: str = Query(..., min_length=1, description="WLAN (SSID) name to scope results to. Required."),
 ):
     """
     Manually trigger a Mist client TSHOOT for the worst-health MACs in a device family.
@@ -2929,7 +2912,7 @@ async def trigger_family_tshoot(
 
 
 @router.get("/sites/{site_id}/families/{family}/event-counts")
-async def get_family_event_counts(site_id: str, family: str, wlan: str = Query(..., description="WLAN (SSID) name to scope results to. Required.")):
+async def get_family_event_counts(site_id: str, family: str, wlan: str = Query(..., min_length=1, description="WLAN (SSID) name to scope results to. Required.")):
     """
     Per-MAC event category counts for all clients in a device family.
     Used by the Family Drilldown Event Counts view. Optionally scoped to a WLAN.
@@ -3004,7 +2987,7 @@ async def get_family_event_counts(site_id: str, family: str, wlan: str = Query(.
 
 
 @router.get("/sites/{site_id}/anomalies/{mac}")
-async def get_mac_anomaly(site_id: str, mac: str, wlan: str = Query(..., description="WLAN (SSID) name to scope results to. Required.")):
+async def get_mac_anomaly(site_id: str, mac: str, wlan: str = Query(..., min_length=1, description="WLAN (SSID) name to scope results to. Required.")):
     """
     Full event timeline + anomaly scores for one MAC.
     Used by MAC Drill-down view. Optionally scoped to a WLAN.
@@ -3052,7 +3035,10 @@ async def get_mac_anomaly(site_id: str, mac: str, wlan: str = Query(..., descrip
     if mac_scores is None:
         mac_scores = {}
 
-    mac_vec = mac_features.get("vector", {})
+    # Health math runs on category-level success/failure ratios, so feed the
+    # category vector. The MacDrilldown chart also visualizes the category
+    # vector — 14 readable bars beat 59 sparse ones for a human inspector.
+    mac_vec = mac_features.get("category_vector") or mac_features.get("vector", {})
 
     # Per-MAC health: aggregate score, per-service health, and any service alarms.
     # Computed on demand from the MAC's feature vector — no separate Redis key needed.
@@ -3078,7 +3064,7 @@ async def get_mac_anomaly(site_id: str, mac: str, wlan: str = Query(..., descrip
         "wlan": wlan,
         "client_metadata": client_meta,
         "anomaly_scores": mac_scores,
-        "feature_vector": mac_features.get("vector", {}),
+        "feature_vector": mac_vec,
         "health_score": mac_health_score,
         "health_components": mac_health_components,
         "service_health": mac_service_health_out,
@@ -3112,9 +3098,9 @@ async def trigger_markov_baseline(site_id: str):
             "results": results,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
-    except Exception as exc:
+    except Exception:
         log.exception(f"Markov baseline rebuild failed for site {site_id}")
-        raise HTTPException(status_code=500, detail=str(exc))
+        raise HTTPException(status_code=500, detail="Markov baseline rebuild failed")
 
 
 @router.post("/sites/{site_id}/flush")
@@ -3186,7 +3172,7 @@ async def unlock_global_operation():
 
 
 @router.get("/sites/{site_id}/cluster-viz")
-async def get_cluster_viz(site_id: str, wlan: str = Query(..., description="WLAN (SSID) name to scope results to. Required.")):
+async def get_cluster_viz(site_id: str, wlan: str = Query(..., min_length=1, description="WLAN (SSID) name to scope results to. Required.")):
     """
     PCA 2D projection of all MAC feature vectors for the cluster scatter plot.
     Optionally scoped to a specific WLAN via ?wlan=.
@@ -3203,8 +3189,12 @@ async def get_cluster_viz(site_id: str, wlan: str = Query(..., description="WLAN
     anomalies: dict = json.loads(raw_anomalies) if raw_anomalies else {}
 
     macs = list(features.keys())
-    vec_keys = list(features[macs[0]]["vector"].keys())
-    X = np.array([[features[m]["vector"].get(k, 0.0) for k in vec_keys] for m in macs])
+    # Site-level cluster viz mirrors the org viz: project the category_vector for
+    # human-readable distance, while detection still uses the granular event_vector.
+    vec_keys = list(features[macs[0]]["category_vector"].keys())
+    X = np.array(
+        [[features[m]["category_vector"].get(k, 0.0) for k in vec_keys] for m in macs]
+    )
 
     loop = asyncio.get_event_loop()
     coords, explained_variance = await loop.run_in_executor(_CPU_POOL, _run_pca, X)
@@ -3233,7 +3223,7 @@ async def get_cluster_viz(site_id: str, wlan: str = Query(..., description="WLAN
 
 
 @router.get("/sites/{site_id}/status")
-async def get_site_status(site_id: str, wlan: str = Query(..., description="WLAN (SSID) name to scope results to. Required.")):
+async def get_site_status(site_id: str, wlan: str = Query(..., min_length=1, description="WLAN (SSID) name to scope results to. Required.")):
     """Last run metadata: event count, finding count, key TTLs."""
     from .. import db as _db
 
