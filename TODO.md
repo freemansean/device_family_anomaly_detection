@@ -2,10 +2,10 @@
 
 ## Open Work
 
-- [ ]  Break down client disassociation / AP disassociation
-- [ ]  Validate if we need “Security” Events
+- [X]  Break down client disassociation / AP disassociation
+- [X]  Validate if we need “Security” Events
 - [x]  Make Device Family Drilldown cached — `client_summary` SQLite table (2026-04-15)
-- [ ]  Create site/org level ML detection for the search option
+- [X]  Create site/org level ML detection for the search option
 
 ### Findings / Alerts UI rework (2026-04-11)
 
@@ -27,6 +27,64 @@ Scope: [OrgAlerts.jsx](sasquatch/frontend/src/components/OrgAlerts.jsx), [OrgFin
    - Add a page-level "SITE ALERTS" header block at the top of `FindingsFeed` that lists the site's dual-gate alerts as dedicated cards (mirroring the ORG-WIDE ALERTS section in OrgAlerts), followed by the unified findings list below. Reuse the same alert-card shape so visuals are consistent.
    - Confirm the site findings API payload carries everything the alert card needs (`is_family_outlier`, `health_score`, `worst_health_macs`, `health_components`). Today `FindingsFeed` cross-references `health` from a separate endpoint ([FindingsFeed.jsx:386-389](sasquatch/frontend/src/components/FindingsFeed.jsx#L386-L389)) — that's fine, but `worst_health_macs` is not written to per-site finding records by `score()` in `anomaly_detector.py` (only `score_org_wide` writes it, per CLAUDE.md). If site alert cards need to show worst-health MACs like org alert cards do, either (a) teach per-site `score()` to write the same field, or (b) have the site alert card fall back to querying `/api/v1/sites/{site_id}/health` for the worst MACs. Pick one before implementing the card.
    - Bonus: once site-level alerts are promoted, consider hiding the inline `ALERT` pill + red recoloring on cards in the main findings list for families already lifted into the SITE ALERTS section, to avoid double-surfacing.
+
+### Pre-submission hardening (2026-04-16)
+
+Work bucketed by risk. Within each bucket, ordered by fix cost (cheapest first) so a partial pass still lands the high-ROI items.
+
+#### Bucket A — Security / Info leakage ✅ (2026-04-16)
+
+- [x] **CORS wildcard** — [main.py:50](sasquatch/main.py#L50) was `allow_origins=["*"]`. Now pinned to `http://localhost:3000` + `http://localhost:5173` (and their `127.0.0.1` twins).
+- [x] **Exception string leaked in HTTP response** — swept all `detail=f"...{exc}"` in [api/routes.py](sasquatch/client_anomaly/api/routes.py). Two real leaks found and fixed: line 993 (`Org client refresh failed`) and line 3130 (`Markov baseline rebuild failed`). Both already had `log.exception(...)` capturing the traceback server-side. Other `detail=f"..."` instances interpolate user-supplied values (field names, families, MACs) not exceptions — safe.
+- [x] **Token-bearing log lines** — audited. `MIST_API_TOKEN` is only ever interpolated into `Authorization: Token ...` headers, never into log or exception messages. The `"MIST_API_TOKEN not configured"` messages leak the variable *name*, not the value. No redaction needed.
+
+#### Bucket B — Crash risks (will kill a live demo) ✅ (2026-04-16)
+
+- [x] **Pagination page-count ceiling** — [event_collector.py:396-413](sasquatch/client_anomaly/event_collector.py#L396-L413) now caps at `_MAX_PAGES = 20000` (20M events) and also guards `resp.json()` with an explicit `JSONDecodeError` branch that includes a 200-char body snippet. Same treatment applied to [client_cache.py:254-273](sasquatch/client_anomaly/client_cache.py#L254-L273) (cap at 10k pages = 10M clients).
+- [x] **Per-row JSON decode** — [db.py:339-353](sasquatch/client_anomaly/db.py#L339-L353). `get_events` now decodes row-by-row inside a `try/except (JSONDecodeError, TypeError)`; bad rows are counted and a single summary WARNING is emitted per call.
+- [x] **TSHOOT `asyncio.gather`** — [webhook_dispatcher.py:515-530](sasquatch/client_anomaly/webhook_dispatcher.py#L515-L530). Now passes `return_exceptions=True` and the zip loop checks `isinstance(result, BaseException)` → logs a WARNING and falls through with empty `tshoot_results`. One failed MAC can no longer crash the whole dispatch.
+- [x] **`alert_tracker.record_cycle()` guarded** — [webhook_dispatcher.py:483-495](sasquatch/client_anomaly/webhook_dispatcher.py#L483-L495). Wrapped in `try/except Exception` with `log.exception`. Alert-history is now best-effort; the outbound webhook is load-bearing.
+- [x] **`client_cache.py` `resp.json()` guarded** — handled by the same `JSONDecodeError` wrapper added for the pagination-cap fix ([client_cache.py:263-269](sasquatch/client_anomaly/client_cache.py#L263-L269)).
+
+#### Bucket C — Correctness ✅ (2026-04-16)
+
+- [x] **Dead `or True`** — [anomaly_detector.py:1267](sasquatch/client_anomaly/anomaly_detector.py#L1267) replaced with `= True`. Comment clarifies intent.
+- [x] **Bare `except` narrowed** — [anomaly_detector.py:1244](sasquatch/client_anomaly/anomaly_detector.py#L1244) now `except (json.JSONDecodeError, TypeError) as exc:` with a `log.warning` carrying site_id + wlan.
+- [x] **Event-type-index fallback** — no action needed. [event_collector.py:336-337](sasquatch/client_anomaly/event_collector.py#L336-L337) already logs via `log.warning(f"Failed to fetch live event type index: {exc} — using hardcoded list")`. The prior review was stale.
+
+#### Bucket D — Robustness ✅ (2026-04-16)
+
+- [x] **Empty `wlan` query param** — all 16 `wlan: str = Query(..., description="...")` occurrences in [api/routes.py](sasquatch/client_anomaly/api/routes.py) now carry `min_length=1`. Applied via `replace_all` on the exact matching string.
+- [x] **MAC query param format** — [api/routes.py:1005-1010](sasquatch/client_anomaly/api/routes.py#L1005-L1010) now has `min_length=1, pattern=r"^[a-fA-F0-9:.\-\s]+$"` on the only MAC `Query(...)` call (`/org/clients/search`). Other MACs are path params (validated downstream by normalize helpers) or come in request bodies.
+- [x] **Global-lock TTL** — [scheduler.py:46](sasquatch/client_anomaly/scheduler.py#L46) raised from 2h to 6h with an inline note clarifying that `clear_stale_global_lock()` at startup is the real crash-recovery mechanism; TTL is a backstop.
+- [x] **Huge payload log** — [webhook_dispatcher.py:560-572](sasquatch/client_anomaly/webhook_dispatcher.py#L560-L572). INFO log now shows `len(qualifying)` + first 3 device families (`(+N more)` suffix when truncated). Full payload moved behind `log.isEnabledFor(logging.DEBUG)`.
+
+#### Suggested execution order
+
+1. **Bucket A + dead `or True` in Bucket C** — ~20 min, all one-line changes, highest "a reviewer will see this" ROI.
+2. **Bucket B** — ~45 min, closes the demo-crash surface. The pagination guard and the TSHOOT `return_exceptions=True` are the two fixes most likely to actually trip during judging.
+3. **Remaining Bucket C + Bucket D** — polish. If time runs out, skip these; none of them are externally visible on a happy-path demo.
+
+### Code-cleanup pass (2026-04-16)
+
+Dead-code audit after the hardening pass. All fixes verified: modules compile, the FastAPI app imports cleanly at runtime, and repo-wide grep returns no residual references to the deleted symbols.
+
+- [x] **Deleted unused `_tally_outliers` helper** — [api/routes.py](sasquatch/client_anomaly/api/routes.py). Defined but called nowhere in the repo. −6 lines.
+- [x] **Deleted orphan `/org/detection-enabled` endpoints (GET + POST)** — [api/routes.py](sasquatch/client_anomaly/api/routes.py). No frontend caller, no internal caller, Redis key `sasquatch:org_detection_enabled` had zero readers/writers elsewhere. Superseded by the `auto-detect` mechanism (`/org/auto-detect`). −25 lines.
+- [x] **Deleted abandoned `pass`-loop in `delete_client_summaries_not_in`** — [db.py:912-923](sasquatch/client_anomaly/db.py#L912-L923) built placeholders then did nothing; real logic already followed on the next lines. Half-finished refactor. −11 lines.
+- [x] **Extracted `_family_mean_health` helper** — [anomaly_detector.py:497](sasquatch/client_anomaly/anomaly_detector.py#L497). Replaced two near-verbatim 13-line blocks (site-scope at ~703 and org-scope at ~1154) that computed per-family mean health before feeding `_run_family_centroid_distance`. −10 lines net, single source of truth.
+
+#### Known-to-be-real but deferred
+
+These were identified during the audit but the payoff is too small for a hackathon submission. Carry them into the post-hackathon backlog.
+
+- `db.search_clients_by_mac_prefix` issues 2 extra SQLite queries per matched MAC (N+1 pattern; ~100 queries for a 50-result prefix search). Worth fixing if the MAC-search UI feels laggy. Rewrite as a single JOIN with `MAX(timestamp)` + `COUNT(*)`.
+- `event_collector._persist_unknown_types` opens a fresh Redis client on every flush. On a 12-hour collect that's ~100 connection setups. Accept an optional `redis_client` parameter the way `health_scorer.score_health()` does.
+- `alert_tracker.record_cycle` uses a Redis `pipeline` of individual `.get()` calls where `mget` would collapse to one round-trip.
+- `anomaly_detector.score_org_wide` finding rollup makes 3–4 separate passes over `family_cks`. Fuse into one accumulator loop. Measurable in the tens-of-milliseconds range at org scale; invisible to a demo.
+- **Frontend card duplication** — `AnomalyFindingCard`, `HealthOnlyCard`, `PATTERN_LABELS`, `healthScoreColor` are re-defined across `OrgFindingsFeed.jsx`, `FindingsFeed.jsx`, `OrgAlerts.jsx`. Captured in items 2–3 of the "Findings / Alerts UI rework (2026-04-11)" section above — leave it there.
+- **Markov family rollup may be duplicated** between site-scoped and org-scoped paths in `markov_analyzer.py`. Flagged by the audit but not line-verified; needs a read-through before extraction because the reason-selection logic ("anomaly" vs "repeated") has historically been delicate.
+- **Inlining `_empty_markov_result`** at its two callers in `markov_analyzer.py`. Low-value churn; skip.
 
 ### Pre-existing
 

@@ -2044,3 +2044,33 @@ Build in this order to enable incremental testing:
 - No real-time Mist API calls in the FastAPI request path — reads from Redis only
 - No failure weighting in the anomaly ML feature vector — failure signals belong in the health score, not the anomaly vector
 - Do not gate webhooks on single-device IF or DBSCAN anomalies — only `is_family_outlier` (centroid IF) qualifies for webhook dispatch
+
+---
+
+## Hardening Log (2026-04-16)
+
+Tracked so future edits don't accidentally regress these. Full context in [TODO.md](TODO.md) under "Pre-submission hardening" and "Code-cleanup pass".
+
+**Security / info leakage**
+- CORS pinned to `localhost:3000` / `localhost:5173` (+ `127.0.0.1` twins) in [main.py](sasquatch/main.py). Do not regress to `allow_origins=["*"]`.
+- `HTTPException.detail` must never interpolate an exception object. Two routes (`/org/refresh` at [routes.py:993](sasquatch/client_anomaly/api/routes.py#L993), Markov rebuild at [routes.py:3130](sasquatch/client_anomaly/api/routes.py#L3130)) were leaking `str(exc)` to clients — pair every handler's `log.exception(...)` with a constant `detail=`.
+- `MIST_API_TOKEN` lives only inside `Authorization` headers. Never interpolate it into log lines or error messages.
+
+**Crash-resistance invariants**
+- Both Mist paginators ([event_collector.iter_events_org](sasquatch/client_anomaly/event_collector.py), [client_cache.fetch_all_clients_org](sasquatch/client_anomaly/client_cache.py)) enforce a hard `_MAX_PAGES` ceiling (20k / 10k) and wrap `resp.json()` in an explicit `JSONDecodeError` branch. Protects against circular `next` cursors and HTML error pages.
+- `db.get_events` decodes `raw_json` row-by-row with a `(JSONDecodeError, TypeError)` guard. A single corrupt row logs and is skipped rather than crashing every downstream consumer.
+- Webhook dispatch is crash-isolated from its auxiliary steps:
+  - `alert_tracker.record_cycle()` is wrapped in `try/except Exception` ([webhook_dispatcher.py:483-495](sasquatch/client_anomaly/webhook_dispatcher.py#L483-L495)). Alert history is best-effort; the outbound POST is load-bearing.
+  - TSHOOT enrichment uses `asyncio.gather(..., return_exceptions=True)` ([webhook_dispatcher.py:515-530](sasquatch/client_anomaly/webhook_dispatcher.py#L515-L530)) and converts per-MAC failures to empty `tshoot_results`. One bad MAC cannot crash the dispatch.
+- `_GLOBAL_LOCK_TTL_SECONDS` is 6h ([scheduler.py:46](sasquatch/client_anomaly/scheduler.py#L46)) — long enough to cover a full 12hr multi-million-event collect. `clear_stale_global_lock()` at startup handles the crash-before-release case; the TTL is the backstop.
+
+**Input validation**
+- Every `wlan: str = Query(...)` param in [routes.py](sasquatch/client_anomaly/api/routes.py) carries `min_length=1`. An empty string would otherwise build malformed Redis keys like `sasquatch:findings:{site}:` and silently miss real data.
+- The `/org/clients/search` MAC query param has `pattern=r"^[a-fA-F0-9:.\-\s]+$"`.
+
+**Payload-size logging**
+- Webhook dispatch logs a summary line at INFO (count + first 3 family names) and puts the full JSON behind `log.isEnabledFor(logging.DEBUG)` ([webhook_dispatcher.py:560-572](sasquatch/client_anomaly/webhook_dispatcher.py#L560-L572)). At org scale a payload is multi-MB — do not regress to `log.info(json.dumps(payload, indent=2))`.
+
+**Correctness invariants**
+- Centroid-detection prelude lives in `_family_mean_health()` helper ([anomaly_detector.py:497](sasquatch/client_anomaly/anomaly_detector.py#L497)). Both `score()` and `score_org_wide()` call it — edit the helper rather than re-inlining the prelude.
+- Markov merge at [anomaly_detector.py:1267](sasquatch/client_anomaly/anomaly_detector.py#L1267) sets `is_outlier = True` directly (the old `or True` was dead code). JSON-decode failures on per-site anomaly records narrow to `(json.JSONDecodeError, TypeError)` and log site/wlan context.
