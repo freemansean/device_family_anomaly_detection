@@ -810,6 +810,7 @@ export default function App() {
       alarm_min_family_size: 10,
       anomaly_health_score_threshold: 0.30,
       alarm_service_device_pct: 0.50,
+      alarm_health_combine: "or",
       alarm_dbscan_markov_ratio: 0.70,
     });
     setGeneralConfigSaveState("idle");
@@ -1450,15 +1451,15 @@ export default function App() {
 
               <div style={{ marginBottom: "18px" }}>
                 <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: "5px" }}>
-                  <div style={{ color: "#888", fontSize: "11px" }}>MIN FAMILY SIZE FOR ALARM GENERATION</div>
+                  <div style={{ color: "#888", fontSize: "11px" }}>MIN FAMILY SIZE FOR ALERT GENERATION</div>
                   <div style={{ color: "#7ec8e3", fontSize: "13px", fontWeight: "bold" }}>{generalConfigDraft.alarm_min_family_size ?? 10} MAC{(generalConfigDraft.alarm_min_family_size ?? 10) === 1 ? "" : "s"}</div>
                 </div>
                 <input type="range" min={1} max={50} value={generalConfigDraft.alarm_min_family_size ?? 10} onChange={(e) => setGeneralConfigDraft(d => ({ ...d, alarm_min_family_size: Number(e.target.value) }))} style={{ width: "100%", accentColor: "#7ec8e3", cursor: "pointer" }} />
-                <div style={{ color: "#555", fontSize: "11px", marginTop: "4px" }}>Suppress alarms for device families whose total MAC count is below this threshold. Findings still appear in the UI, but the OrgAlerts feed and webhook dispatch skip them. Set to 1 to disable (every family eligible).</div>
+                <div style={{ color: "#555", fontSize: "11px", marginTop: "4px" }}>Suppress alerts for device families whose total MAC count is below this threshold. Findings still appear in the UI, but the OrgAlerts feed and webhook dispatch skip them. Set to 1 to disable (every family eligible).</div>
               </div>
 
               <div style={{ marginBottom: "24px", paddingBottom: "20px", borderBottom: "1px solid #222" }}>
-                <div style={{ color: "#7ec8e3", fontSize: "11px", fontWeight: "bold", letterSpacing: "0.5px", marginBottom: "12px", textTransform: "uppercase" }}>Health Thresholds for Alarm Generation</div>
+                <div style={{ color: "#7ec8e3", fontSize: "11px", fontWeight: "bold", letterSpacing: "0.5px", marginBottom: "12px", textTransform: "uppercase" }}>Health Thresholds for Alert Generation</div>
 
                 <div style={{ marginBottom: "18px" }}>
                   <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: "5px" }}>
@@ -1466,16 +1467,48 @@ export default function App() {
                     <div style={{ color: "#7ec8e3", fontSize: "13px", fontWeight: "bold" }}>{((generalConfigDraft.anomaly_health_score_threshold ?? 0.30) * 100).toFixed(0)}%</div>
                   </div>
                   <input type="range" min={0} max={100} value={Math.round((generalConfigDraft.anomaly_health_score_threshold ?? 0.30) * 100)} onChange={(e) => setGeneralConfigDraft(d => ({ ...d, anomaly_health_score_threshold: Number(e.target.value) / 100 }))} style={{ width: "100%", accentColor: "#7ec8e3", cursor: "pointer" }} />
-                  <div style={{ color: "#555", fontSize: "11px", marginTop: "4px" }}>Health score below which a family is considered degraded. Both a family-level anomaly AND health must fail for the dual-gate alarm to fire — this gates both the webhook dispatcher and the OrgAlerts UI feed at org and site level.</div>
+                  <div style={{ color: "#555", fontSize: "11px", marginTop: "4px" }}>Health score below which a family is considered degraded. Both a family-level anomaly AND health must fail for the dual-gate alert to fire — this gates both the webhook dispatcher and the OrgAlerts UI feed at org and site level.</div>
+                </div>
+
+                <div style={{ marginBottom: "18px", display: "flex", alignItems: "center", justifyContent: "center", gap: "8px" }}>
+                  <div style={{ color: "#555", fontSize: "11px", letterSpacing: "0.05em" }}>COMBINE WITH</div>
+                  {["and", "or"].map(mode => {
+                    const active = (generalConfigDraft.alarm_health_combine ?? "or") === mode;
+                    return (
+                      <button
+                        key={mode}
+                        type="button"
+                        onClick={() => setGeneralConfigDraft(d => ({ ...d, alarm_health_combine: mode }))}
+                        style={{
+                          background: active ? "#0d2a38" : "transparent",
+                          color: active ? "#7ec8e3" : "#666",
+                          border: `1px solid ${active ? "#2d5a8a" : "#2a2a2a"}`,
+                          borderRadius: "4px",
+                          padding: "4px 14px",
+                          cursor: "pointer",
+                          fontSize: "11px",
+                          fontFamily: "monospace",
+                          fontWeight: "bold",
+                          letterSpacing: "0.08em",
+                        }}
+                      >
+                        {mode.toUpperCase()}
+                      </button>
+                    );
+                  })}
+                </div>
+                <div style={{ color: "#555", fontSize: "11px", marginTop: "-10px", marginBottom: "12px", textAlign: "center" }}>
+                  <strong>OR</strong>: fire when either the health-score gate above or the service-alert gate below trips.
+                  <strong> AND</strong>: fire only when both trip.
                 </div>
 
                 <div style={{ marginBottom: "18px" }}>
                   <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: "5px" }}>
-                    <div style={{ color: "#888", fontSize: "11px" }}>SERVICE ALARM — DEVICES IN FAMILY</div>
+                    <div style={{ color: "#888", fontSize: "11px" }}>SERVICE ALERT — DEVICES IN FAMILY</div>
                     <div style={{ color: "#7ec8e3", fontSize: "13px", fontWeight: "bold" }}>{((generalConfigDraft.alarm_service_device_pct ?? 0.50) * 100).toFixed(0)}%</div>
                   </div>
                   <input type="range" min={0} max={100} value={Math.round((generalConfigDraft.alarm_service_device_pct ?? 0.50) * 100)} onChange={(e) => setGeneralConfigDraft(d => ({ ...d, alarm_service_device_pct: Number(e.target.value) / 100 }))} style={{ width: "100%", accentColor: "#7ec8e3", cursor: "pointer" }} />
-                  <div style={{ color: "#555", fontSize: "11px", marginTop: "4px" }}>Minimum percentage of devices within a family that must individually have seen a service alarm (auth/roam/dhcp/dns/arp below the per-MAC service health floor) before the service-alarm path fires. Gates both the webhook dispatcher and the org/site alert feeds. Set to 0% to alarm on any tripped device.</div>
+                  <div style={{ color: "#555", fontSize: "11px", marginTop: "4px" }}>Minimum percentage of devices within a family that must individually have seen a service alert (auth/roam/dhcp/dns/arp below the per-MAC service health floor) before the service-alert path fires. Gates both the webhook dispatcher and the org/site alert feeds. Set to 0% to alert on any tripped device.</div>
                 </div>
 
                 <div>
@@ -1484,7 +1517,7 @@ export default function App() {
                     <div style={{ color: "#7ec8e3", fontSize: "13px", fontWeight: "bold" }}>{((generalConfigDraft.alarm_dbscan_markov_ratio ?? 0.70) * 100).toFixed(0)}%</div>
                   </div>
                   <input type="range" min={0} max={100} value={Math.round((generalConfigDraft.alarm_dbscan_markov_ratio ?? 0.70) * 100)} onChange={(e) => setGeneralConfigDraft(d => ({ ...d, alarm_dbscan_markov_ratio: Number(e.target.value) / 100 }))} style={{ width: "100%", accentColor: "#7ec8e3", cursor: "pointer" }} />
-                  <div style={{ color: "#555", fontSize: "11px", marginTop: "4px" }}>Minimum percentage of clients in a device family that must be flagged as anomalous by <strong>either</strong> DBSCAN or Markov before an alarm fires for that family. The two detector flags are unioned per client (a single device flagged by both still counts once). Gates both the webhook dispatcher and the org/site alert feeds. Inter-family centroid detection (is_family_outlier) is independent of this gate and remains independently sufficient to fire an alarm.</div>
+                  <div style={{ color: "#555", fontSize: "11px", marginTop: "4px" }}>Minimum percentage of clients in a device family that must be flagged as anomalous by <strong>either</strong> DBSCAN or Markov before an alert fires for that family. The two detector flags are unioned per client (a single device flagged by both still counts once). Gates both the webhook dispatcher and the org/site alert feeds. Inter-family centroid detection (is_family_outlier) is independent of this gate and remains independently sufficient to fire an alert.</div>
                 </div>
               </div>
 
@@ -1664,8 +1697,8 @@ export default function App() {
               <div style={{ marginBottom: "18px" }}>
                 <div style={{ color: "#888", fontSize: "11px", marginBottom: "8px" }}>WEBHOOK SCOPE</div>
                 {[
-                  { value: "org_and_site", label: "Org alarms and site alarms", desc: "Dispatch for both org-wide and per-site dual-gate alerts" },
-                  { value: "org_only",     label: "Org alarms only",            desc: "Suppress site-level dispatches; only fire on org-wide findings" },
+                  { value: "org_and_site", label: "Org alerts and site alerts", desc: "Dispatch for both org-wide and per-site dual-gate alerts" },
+                  { value: "org_only",     label: "Org alerts only",            desc: "Suppress site-level dispatches; only fire on org-wide findings" },
                 ].map(opt => (
                   <label key={opt.value} style={{ display: "flex", alignItems: "flex-start", gap: "10px", marginBottom: "10px", cursor: webhookDraft.enabled ? "pointer" : "default" }}>
                     <input
@@ -1700,7 +1733,7 @@ export default function App() {
                   style={{ width: "100%", accentColor: "#7ec8e3", cursor: webhookDraft.enabled ? "pointer" : "default" }}
                 />
                 <div style={{ color: "#555", fontSize: "11px", marginTop: "4px" }}>
-                  Families with fewer affected devices than this threshold appear in the UI as alarms but do not trigger a webhook.
+                  Families with fewer affected devices than this threshold appear in the UI as alerts but do not trigger a webhook.
                 </div>
               </div>
 
