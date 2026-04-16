@@ -15,7 +15,8 @@ const CATEGORY_LABELS = {
   AUTH_FAILURE:   "Auth ✗",
   ROAM_SUCCESS:   "Roam ✓",
   ROAM_FAILURE:   "Roam ✗",
-  DISASSOC:       "Disassoc",
+  DISASSOC_AP:     "Disassoc - AP",
+  DISASSOC_CLIENT: "Disassoc - Client",
   ARP_SUCCESS:    "ARP ✓",
   ARP_FAILURE:    "ARP ✗",
   CAPTIVE_PORTAL: "Captive",
@@ -50,7 +51,8 @@ const DEFAULT_VISIBLE = {
   cat_DNS_SUCCESS: false, cat_DNS_FAILURE: false,
   cat_AUTH_SUCCESS: true, cat_AUTH_FAILURE: true,
   cat_ROAM_SUCCESS: true, cat_ROAM_FAILURE: true,
-  cat_DISASSOC: false,
+  cat_DISASSOC_AP: false,
+  cat_DISASSOC_CLIENT: false,
   cat_ARP_SUCCESS: false, cat_ARP_FAILURE: false,
   cat_CAPTIVE_PORTAL: false, cat_SECURITY: false,
   cat_COLLABORATION: false, cat_OTHER: false,
@@ -152,7 +154,7 @@ export default function FamilyDrilldown({ siteId, family, apiBase, onMacSelect, 
   const [sortCol, setSortCol] = useState("if_score");
   const [sortDir, setSortDir] = useState("desc");
   const [visibleCols, setVisibleCols] = useState(() =>
-    loadVisibleFromStorage("familyDrilldown.columns.v1", DEFAULT_VISIBLE)
+    loadVisibleFromStorage("familyDrilldown.columns.v2", DEFAULT_VISIBLE)
   );
 
   useEffect(() => {
@@ -293,7 +295,7 @@ export default function FamilyDrilldown({ siteId, family, apiBase, onMacSelect, 
           columns={COLUMN_DEFS}
           visible={visibleCols}
           onChange={setVisibleCols}
-          storageKey="familyDrilldown.columns.v1"
+          storageKey="familyDrilldown.columns.v2"
         />
       </div>
 

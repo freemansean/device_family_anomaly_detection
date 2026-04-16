@@ -8,7 +8,7 @@ import ColumnSelector, { loadVisibleFromStorage } from "./ColumnSelector";
 const CATEGORIES = [
   "DHCP_SUCCESS", "DHCP_FAILURE", "DNS_SUCCESS", "DNS_FAILURE",
   "AUTH_SUCCESS", "AUTH_FAILURE", "ROAM_SUCCESS", "ROAM_FAILURE",
-  "DISASSOC", "ARP_SUCCESS", "ARP_FAILURE", "CAPTIVE_PORTAL", "SECURITY", "COLLABORATION", "OTHER",
+  "DISASSOC_AP", "DISASSOC_CLIENT", "ARP_SUCCESS", "ARP_FAILURE", "CAPTIVE_PORTAL", "SECURITY", "COLLABORATION", "OTHER",
 ];
 
 const COLUMN_DEFS = [
@@ -32,7 +32,8 @@ const DEFAULT_VISIBLE = {
   cat_DNS_SUCCESS: false, cat_DNS_FAILURE: false,
   cat_AUTH_SUCCESS: true, cat_AUTH_FAILURE: true,
   cat_ROAM_SUCCESS: true, cat_ROAM_FAILURE: true,
-  cat_DISASSOC: false,
+  cat_DISASSOC_AP: false,
+  cat_DISASSOC_CLIENT: false,
   cat_ARP_SUCCESS: false, cat_ARP_FAILURE: false,
   cat_CAPTIVE_PORTAL: false, cat_SECURITY: false,
   cat_COLLABORATION: false, cat_OTHER: false,
@@ -140,7 +141,7 @@ export default function OrgFamilyInsights({ apiBase, refreshToken, onMacSiteSele
   const [pcaFamilies, setPcaFamilies] = useState(null); // null until seeded from data
   const [pcaSeeded, setPcaSeeded]     = useState(false);
   const [visibleCols, setVisibleCols] = useState(() =>
-    loadVisibleFromStorage("orgFamilyInsights.columns.v1", DEFAULT_VISIBLE)
+    loadVisibleFromStorage("orgFamilyInsights.columns.v2", DEFAULT_VISIBLE)
   );
 
   const load = useCallback(() => {
@@ -320,7 +321,7 @@ export default function OrgFamilyInsights({ apiBase, refreshToken, onMacSiteSele
           columns={COLUMN_DEFS}
           visible={visibleCols}
           onChange={setVisibleCols}
-          storageKey="orgFamilyInsights.columns.v1"
+          storageKey="orgFamilyInsights.columns.v2"
         />
       </div>
 

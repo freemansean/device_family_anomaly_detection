@@ -112,7 +112,7 @@ _EVENT_TYPE_TO_CATEGORY: dict[str, str] = {
 # Category-level failure classes for stuck-loop detection.
 _STUCK_LOOP_FAILURE_CATEGORIES: frozenset[str] = frozenset({
     "DHCP_FAILURE", "DNS_FAILURE", "AUTH_FAILURE", "ROAM_FAILURE",
-    "ARP_FAILURE", "DISASSOC",
+    "ARP_FAILURE", "DISASSOC_AP", "DISASSOC_CLIENT",
 })
 
 
