@@ -17,18 +17,21 @@ Detects anomalous client behavior across every site in a Juniper Mist org by:
    full collects fetch the last 12 hours, hourly polls top up the trailing 1 hour.
    Events are streamed to SQLite in batches and enriched with device metadata at
    write time.
-3. Engineering per-MAC behavioral feature vectors (61 dimensions: 59 normalized
-   event-type frequencies + 2 timing features)
+3. Engineering per-MAC behavioral feature vectors. Each MAC carries TWO vectors:
+   an `event_vector` (~59-dim normalized per-event-type frequency distribution,
+   fed to IF and Centroid distance) and a `category_vector` (~15-dim semantic
+   buckets + 2 concentration features, fed to DBSCAN, the health scorer, and
+   the human-readable explainer). See `feature_engineer.py` for the full design.
 4. Running a four-stage ML detection pipeline (see `anomaly_detector.py`):
    - **Stage 1 — DBSCAN** (population-wide): flags MACs that don't cluster with any
      peer group. `min_samples` and `eps` are auto-tuned per run from the population
      size — `min_samples = max(3, n_clients * pct)` and `eps` is the k-distance
      elbow. Only one operator knob (`anomaly_dbscan_min_samples_pct`).
-   - **Stage 1b — Family Centroid Distance**: flags entire device families whose
+   - **Stage 2 — Family Centroid Distance**: flags entire device families whose
      L2-normalized centroid sits far (cosine distance) from a healthy-family
      reference centroid built from families with mean health ≥
      `ANOMALY_CENTROID_HEALTHY_REF_THRESHOLD`.
-   - **Stage 2 — Isolation Forest** (per device family): flags individual MACs
+   - **Stage 3 — Isolation Forest** (per device family): flags individual MACs
      anomalous within their family. Families below `MIN_PEERS` borrow MACs from
      other org sites for the same family.
    - **Stage 4 — Markov Chain** (see `markov_analyzer.py`): scores event-transition
@@ -865,51 +868,75 @@ values across its entire 24hr event window.
 
 ---
 
-#### ML Input: Raw Event Frequency Vector
+#### ML Input: Two Vectors, Routed by Stage
 
-**Design principle:** The ML models (Isolation Forest + DBSCAN) receive only raw,
-assumption-free features. No pre-computed ratios, no chain completion logic, no
-domain knowledge about what sequences "should" look like. The model discovers what
-normal looks like from the population itself.
+**Design principle:** The ML models receive raw, assumption-free features —
+no pre-computed ratios, no chain-completion logic, no domain knowledge about
+what sequences "should" look like. The model discovers what normal looks
+like from the population itself.
 
-**Primary input — normalized event type frequency vector (59 dimensions):**
+But "raw" is granularity-dependent: per-event-type frequencies and per-category
+frequencies surface different signal. So `feature_engineer.build_features`
+emits BOTH per MAC, and each detection stage consumes the one that matches
+its job.
 
-One dimension per known event type. Value = count of that event type for this MAC /
-total events for this MAC. This is a probability distribution over event types.
+**`event_vector` — normalized event-type frequency distribution (~59 dim):**
+
+One dimension per known Mist client event type. Value = `count(event_type) /
+total_events`. Always sums to 1.0; zero-filled for types this MAC never
+produced. Dimension ordering comes from Redis `sasquatch:event_type_index`
+(refreshed from `GET /api/v1/const/client_events`, 7-day TTL, falls back to
+`MIST_CLIENT_EVENT_TYPES` in `event_collector.py`).
 
 ```python
 # For each MAC, build a vector like:
 {
     "CLIENT_IP_ASSIGNED": 0.04,        # 4% of this client's events were DHCP success
     "CLIENT_AUTH_REASSOCIATION": 0.31, # 31% were successful roam reassociations
-    "CLIENT_GW_ARP_OK": 0.18,          # etc.
+    "CLIENT_GW_ARP_OK": 0.18,
     "MARVIS_EVENT_STA_LEAVING": 0.21,
     "CLIENT_DNS_OK": 0.18,
     "CLIENT_AUTHENTICATED": 0.08,
     "MARVIS_EVENT_CLIENT_AUTH_FAILURE": 0.0,
-    # ... all 59 dimensions, zero-filled for absent types
+    # ... ~59 dimensions, zero-filled for absent types
 }
 ```
 
-The vector always sums to 1.0. Zero-fill for event types not seen for this MAC.
-Use the event type index from Redis `sasquatch:event_type_index` to ensure consistent
-vector ordering across all MACs and all runs.
+Consumers: **Isolation Forest** (per-family, intra-family outliers) and
+**Family Centroid cosine distance** (inter-family outliers). Both passes
+need per-event-type granularity — collapsing all roam failures into one
+ROAM_FAILURE bucket would mask the difference between an iPhone failing
+fast-roam (`MARVIS_EVENT_CLIENT_FBT_FAILURE`) and an iPhone failing OKC
+(`MARVIS_EVENT_CLIENT_AUTH_FAILURE_OKC`), exactly the per-revision
+fingerprint this detector exists to find.
 
-**Secondary inputs — two timing features (assumption-free):**
+**`category_vector` — semantic-bucket frequency + concentration (~15 dim):**
 
-| Feature | Type | Description |
+| Block | Dimensions | Description |
 |---|---|---|
-| `median_inter_event_seconds` | float | Median time gap between consecutive events. Very low = machine-like burst activity. |
-| `inter_event_cv` | float | Coefficient of variation (std/mean) of inter-event gaps. Low CV = suspiciously regular cadence. High CV = natural human/device variation. |
+| Per-category frequencies | ~13 | `count(events in category) / total events`, one per `EVENT_CATEGORIES` bucket except COLLABORATION (excluded — application-layer noise that contaminates cross-device signal). |
+| `top_category_fraction` | 1 | Largest single category share. Amplifies the signal for clients stuck in a single-category loop. |
+| `top_failure_category_fraction` | 1 | Largest share among failure categories only. Same amplification, failure-only flavor. |
 
-These two features capture temporal behavior without encoding any assumption about
-which event types should or shouldn't appear together.
+Consumers: **DBSCAN** (after StandardScaler + PCA reduction — semantic
+bucket distance is the right level for population-wide clustering), the
+**Health Scorer** (success/failure ratios are inherently category-level),
+the post-hoc **top-contributing-features explainer** (chip labels in the
+UI need readable names like "ROAM_FAILURE" not raw event-type strings),
+and the **MacDrilldown bar chart** (~15 readable bars beat 59 sparse
+ones for a human inspector).
 
-**Total ML input dimensionality: 61 features** (59 event type frequencies + 2 timing features).
+**Normalization:** Apply StandardScaler across the full MAC population
+before passing to Isolation Forest or DBSCAN. Fit on the full population
+per run. Do not persist the scaler — refit each cycle. Centroid distance
+deliberately skips StandardScaler (it would zero-mean the small set of
+family rows and pull the median reference toward zero, producing
+spurious near-unit distances) and instead L2-normalizes each row.
 
-**Normalization:** Apply StandardScaler across the full MAC population before passing
-to Isolation Forest or DBSCAN. Fit on the full population per run. Do not persist the
-scaler — refit each cycle.
+**Storage:** Both vectors land in Redis at `sasquatch:features:{site}:{wlan}`
+on the same MAC record under keys `event_vector` and `category_vector`.
+A legacy `vector` alias points at `category_vector` for backwards
+compatibility with any reader that hasn't migrated yet.
 
 ---
 
@@ -997,8 +1024,11 @@ simpler, more stable, and produces interpretable scores. IF remains in use for *
 MAC outlier detection (Stage 2).
 
 **Healthy-only reference centroid:** Before centroid detection runs, `score()` /
-`score_org_wide()` computes per-family mean health scores from the feature vectors. Families
-with mean health >= `ANOMALY_CENTROID_HEALTHY_REF_THRESHOLD` (default 0.75) form the
+`score_org_wide()` compute per-family mean health via the shared
+`_family_mean_health(groups, feature_map, log_prefix, wlan)` helper (one source of
+truth for both site and org paths — edit the helper rather than duplicating the
+prelude inline). Families with mean health >=
+`ANOMALY_CENTROID_HEALTHY_REF_THRESHOLD` (default 0.75) form the
 "healthy reference pool": the reference centroid (element-wise median) is built from
 healthy families only. All families — including unhealthy ones — are measured against
 this healthy reference. This prevents a group of failing families from hiding behind

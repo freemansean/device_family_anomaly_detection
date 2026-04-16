@@ -203,7 +203,10 @@ def compute_family_health(features: dict[str, dict]) -> dict[str, dict]:
     family_mac_alarm_count: dict[str, int] = defaultdict(int)
 
     for record in features.values():
-        vec = record.get("vector", {})
+        # Health is a category-level computation (success/failure per service
+        # bucket) — read category_vector, falling back to legacy "vector" alias
+        # for any record written before the two-vector split.
+        vec = record.get("category_vector") or record.get("vector", {})
         family = record.get("device_family", "Unknown")
         if family in _HIDDEN_FAMILIES:
             continue

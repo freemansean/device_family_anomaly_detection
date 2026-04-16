@@ -2,15 +2,24 @@
 feature_engineer.py — Per-MAC feature vector construction.
 
 DESIGN PRINCIPLE: Volume is not anomaly.
-The ML models receive ratio/timing features ONLY — not raw counts.
+The ML models receive ratio features ONLY — not raw counts.
 All features are normalized so that active clients are not penalized for being active.
 
-Feature vector — event category frequency vector + concentration features:
-  - 13 dimensions: one per event category (all EVENT_CATEGORIES except COLLABORATION).
-    Value = fraction of this MAC's events that fall in that category.
-    Zero-filled for categories with no events.
-    The category dimensions always sum to 1.0.
-  - 2 concentration features: top_category_fraction, top_failure_category_fraction
+Each MAC carries TWO feature vectors, routed to different stages:
+
+  event_vector     — ~59-dim normalized per-event-type frequency distribution.
+                     Fed to Isolation Forest (per-family intra-family outliers)
+                     and the family Centroid cosine-distance detector
+                     (inter-family outliers). Granular enough to distinguish,
+                     e.g., two iPhones failing at different roam types
+                     (FBT vs OKC vs 11r) rather than collapsing them both
+                     into one ROAM_FAILURE bucket.
+
+  category_vector  — 14-dim category frequency + 2 concentration features.
+                     Fed to DBSCAN (population-wide, after PCA), the health
+                     scorer, and the top-contributing-features explainer
+                     shown in the UI. Semantic bucket granularity is the
+                     right level for clustering and human-readable output.
 
 Post-hoc explainer features are computed separately, only for flagged MACs.
 
@@ -30,7 +39,7 @@ import redis.asyncio as aioredis
 
 from .event_collector import (
     EVENT_CATEGORIES,
-    MIST_CLIENT_EVENT_TYPES,
+    ensure_event_type_index,
     get_events,
     sanitize_wlan_key,
 )
@@ -106,9 +115,19 @@ _FAILURE_CATEGORIES: frozenset[str] = frozenset({
     "DHCP_FAILURE", "DNS_FAILURE", "AUTH_FAILURE", "ROAM_FAILURE", "ARP_FAILURE"
 })
 
-# Canonical feature key ordering — guarantees vector consistency across MACs and runs.
-# Category dimensions first (in _ML_CATEGORIES order), then concentration.
-FEATURE_KEYS: list[str] = _ML_CATEGORIES + ["top_category_fraction", "top_failure_category_fraction"]
+# Canonical category-vector key ordering — guarantees vector consistency across
+# MACs and runs. Category dimensions first (in _ML_CATEGORIES order), then the
+# two concentration features. Used by DBSCAN, health scorer, and the top-
+# contributing-features explainer.
+CATEGORY_FEATURE_KEYS: list[str] = _ML_CATEGORIES + [
+    "top_category_fraction",
+    "top_failure_category_fraction",
+]
+
+# Backwards-compatible alias so any stragglers (and external readers that grep
+# the module) still resolve to the category vector's key order. New code should
+# reference CATEGORY_FEATURE_KEYS or EVENT_FEATURE_KEYS explicitly.
+FEATURE_KEYS = CATEGORY_FEATURE_KEYS
 
 
 def _features_redis_key(site_id: str, wlan: str) -> str:
@@ -119,24 +138,26 @@ def _family_event_counts_redis_key(site_id: str, wlan: str) -> str:
     return f"sasquatch:family_event_counts:{site_id}:{sanitize_wlan_key(wlan)}"
 
 
-def build_mac_feature_vector(mac_events: list[dict]) -> dict[str, float]:
+def build_mac_category_vector(mac_events: list[dict]) -> dict[str, float]:
     """
-    Build the ML input feature vector for a single MAC.
+    Build the semantic category-level feature vector for a single MAC.
 
     Dimensions:
       [0–N-1]  One frequency per event category (excluding COLLABORATION):
                count of events in that category / total non-collaboration events.
                Zero-filled for categories with no events. Dimensions sum to 1.0.
       [N, N+1] top_category_fraction, top_failure_category_fraction
+
+    Consumers: DBSCAN (post-PCA), health scorer, top-contributing-features explainer.
     """
     if not mac_events:
-        return {k: 0.0 for k in FEATURE_KEYS}
+        return {k: 0.0 for k in CATEGORY_FEATURE_KEYS}
 
     # Strip collaboration events — they are not network signals and are absent for most
     # device types, so including them would create spurious cross-device anomaly signal.
     ml_events = [e for e in mac_events if e.get("type") not in _COLLABORATION_EVENT_TYPES]
     if not ml_events:
-        return {k: 0.0 for k in FEATURE_KEYS}
+        return {k: 0.0 for k in CATEGORY_FEATURE_KEYS}
 
     total = len(ml_events)
     type_counts: Counter = Counter(e.get("type", "") for e in ml_events)
@@ -155,6 +176,47 @@ def build_mac_feature_vector(mac_events: list[dict]) -> dict[str, float]:
     )
 
     return vec
+
+
+def build_mac_event_vector(
+    mac_events: list[dict], event_type_index: list[str]
+) -> dict[str, float]:
+    """
+    Build the per-event-type frequency vector for a single MAC.
+
+    Each dimension is count(event_type) / total_events across all known Mist
+    client event types. Zero-filled for types this MAC never produced. Dimensions
+    sum to 1.0 over the subset of events whose type is in event_type_index;
+    unknown types are excluded from both the numerator and the denominator so
+    the vector stays a proper probability distribution even when Mist introduces
+    a new type we don't yet track.
+
+    Collaboration events are kept here — at the per-event-type level they are
+    just additional dimensions that devices using them can differ on, not
+    category-level noise. IF and centroid consumers see the full event surface.
+
+    Consumers: Isolation Forest (intra-family), Centroid cosine-distance (inter-family).
+    """
+    keys = list(event_type_index)
+    if not mac_events or not keys:
+        return {k: 0.0 for k in keys}
+
+    known = set(keys)
+    type_counts: Counter = Counter(
+        e.get("type", "") for e in mac_events if e.get("type") in known
+    )
+    total = sum(type_counts.values())
+    if total == 0:
+        return {k: 0.0 for k in keys}
+
+    return {k: type_counts.get(k, 0) / total for k in keys}
+
+
+# Legacy name — some callers still reference it. Resolves to the category
+# vector (the historical behavior). New detection-path code should call
+# build_mac_category_vector or build_mac_event_vector directly.
+def build_mac_feature_vector(mac_events: list[dict]) -> dict[str, float]:
+    return build_mac_category_vector(mac_events)
 
 
 def build_posthoc_features(mac_events: list[dict]) -> dict:
@@ -290,6 +352,12 @@ async def build_features(site_id: str, wlan: str) -> int:
                 "Run event_collector.collect() first."
             )
 
+        # Load the canonical event-type ordering once per build so every MAC's
+        # event_vector lines up dimension-for-dimension. Cached in Redis with a
+        # 7-day TTL by ensure_event_type_index — first build after a Redis flush
+        # pays one HTTP call, every subsequent build is a single GET.
+        event_type_index = await ensure_event_type_index(redis_client)
+
         # Group events by MAC up-front — every downstream pass uses this map.
         mac_events: dict[str, list[dict]] = defaultdict(list)
         for event in events:
@@ -369,7 +437,9 @@ async def build_features(site_id: str, wlan: str) -> int:
             ex=FEATURES_TTL,
         )
 
-        # Build feature vector for each MAC
+        # Build feature vectors for each MAC. Each record carries TWO vectors:
+        #   category_vector — semantic buckets, fed to DBSCAN/health/explainer
+        #   event_vector    — per-event-type frequencies, fed to IF/Centroid
         features: dict[str, dict] = {}
         skipped = 0
         sa_emitted = 0
@@ -378,7 +448,8 @@ async def build_features(site_id: str, wlan: str) -> int:
             if len(evts) < min_mac_events:
                 skipped += 1
                 continue
-            vec = build_mac_feature_vector(evts)
+            cat_vec = build_mac_category_vector(evts)
+            event_vec = build_mac_event_vector(evts, event_type_index)
             # Majority-vote device_family across all events for this MAC.
             # Any non-Unknown label beats Unknown — handles MACs whose events span
             # a cache refresh boundary (early events labeled Unknown, later ones correct).
@@ -395,9 +466,15 @@ async def build_features(site_id: str, wlan: str) -> int:
             last_username = mac_to_username.get(mac, "")
             sa_family_name = mac_to_sa_family.get(mac, "")
 
-            volume_concentration_weight = math.log1p(len(evts)) * vec["top_category_fraction"]
+            volume_concentration_weight = math.log1p(len(evts)) * cat_vec["top_category_fraction"]
             features[mac] = {
-                "vector": vec,
+                # `vector` retained as alias for category_vector so any reader
+                # that grew up on the single-vector schema keeps working until
+                # it migrates. New code reads category_vector / event_vector
+                # explicitly.
+                "vector": cat_vec,
+                "category_vector": cat_vec,
+                "event_vector": event_vec,
                 "device_family": device_family,
                 "event_count": len(evts),
                 "random_mac": evts[0].get("random_mac", False) if evts else False,
@@ -407,7 +484,7 @@ async def build_features(site_id: str, wlan: str) -> int:
             }
 
             # ── Dual-family emission ──
-            # Same vector under a composite key with device_family overridden to
+            # Same vectors under a composite key with device_family overridden to
             # the virtual service-account label. The two records share weight,
             # event count, and random_mac flag — they are the SAME device viewed
             # under two grouping schemes. anomaly_detector groups by device_family,
@@ -415,7 +492,9 @@ async def build_features(site_id: str, wlan: str) -> int:
             # scored independently of its physical-device-family peers.
             if sa_family_name:
                 features[sa_record_key(mac)] = {
-                    "vector": dict(vec),
+                    "vector": dict(cat_vec),
+                    "category_vector": dict(cat_vec),
+                    "event_vector": dict(event_vec),
                     "device_family": sa_family_name,
                     "event_count": len(evts),
                     "random_mac": evts[0].get("random_mac", False) if evts else False,
@@ -432,6 +511,8 @@ async def build_features(site_id: str, wlan: str) -> int:
         log.info(
             f"Built features for {len(features)} records "
             f"({sa_emitted} service-account dual records) → {key} "
+            f"(category_vector={len(CATEGORY_FEATURE_KEYS)}d, "
+            f"event_vector={len(event_type_index)}d) "
             f"({skipped} skipped with < {min_mac_events} events) [wlan={wlan}]"
         )
         return len(features)

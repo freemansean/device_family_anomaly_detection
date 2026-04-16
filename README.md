@@ -142,8 +142,7 @@ The variables below are those that must be set in `.env` before starting.
 |---|---|
 | `MIST_API_TOKEN` | Mist API token with read access to client events |
 | `MIST_CLOUD_HOST` | Regional API host — `api.mist.com`, `api.gc1.mist.com`, `api.gc4.mist.com`, `api.eu.mist.com`, etc. Do **not** include `/api/v1`. |
-| `MIST_SITE_ID` | UUID of the primary site to monitor |
-| `MIST_ORG_ID` | UUID of the org — enables org-wide cross-site detection |
+| `MIST_ORG_ID` | UUID of the org — required. Per-site collection (`MIST_SITE_ID`) has been retired; every site in the org is discovered and scored automatically. |
 
 ### Frontend
 
@@ -160,7 +159,7 @@ These variables have no GUI equivalent. Most deployments will not need to change
 | `ANOMALY_CENTROID_IF_CONTAMINATION` | `0.15` | Fraction of device families expected to be behavioral outliers (inter-family centroid IF). Intentionally higher than intra-family IF contamination — at a site with a real problem, 1 in 6–8 families being anomalous is plausible. |
 | `ANOMALY_IF_N_ESTIMATORS` | `100` | Number of trees in every IsolationForest. More trees = more stable scores at diminishing returns. Increase to 200–500 if scores are noisy across consecutive cycles. |
 | `ANOMALY_RANDOM_STATE` | `42` | Global random seed for all ML components (IsolationForest, PCA). Fixed integer gives reproducible scores across cycles. Set to `-1` to use a random seed each run. |
-| `ANOMALY_DBSCAN_PCA_VARIANCE` | `0.95` | Fraction of variance PCA must retain when reducing dimensions before DBSCAN. The 61-dim feature vectors are sparse; PCA typically collapses to 8–15 components at 0.95. Does not affect IsolationForest. |
+| `ANOMALY_DBSCAN_PCA_VARIANCE` | `0.95` | Fraction of variance PCA must retain when reducing dimensions before DBSCAN. DBSCAN consumes the ~15-dim category vector; PCA typically collapses it to a handful of components at 0.95. Does not affect IsolationForest or the family centroid distance pass — both consume the ~59-dim event vector directly. |
 | `ANOMALY_DBSCAN_FAMILY_NOISE_THRESHOLD` | `0.5` | Fraction of a family's MACs that must be DBSCAN noise before the family is considered a DBSCAN-level outlier. Stored on anomaly records and shown in the UI; does **not** control `is_family_outlier` (that is set by centroid IF). |
 | `ANOMALY_FINDING_MIN_SIZE` | `2` | Minimum local MACs before a site-level finding is generated for families that did **not** use org-level IF pooling. Families that did use org pooling use the GUI-configured Min Peers value as their minimum instead. |
 | `MARKOV_MIN_EPISODE_LENGTH` | `3` | Episodes shorter than this number of events are treated as short-episode states and not scored against the transition matrix. Short episodes represent connection attempts that never completed a full connectivity chain. |
@@ -171,11 +170,13 @@ These variables have no GUI equivalent. Most deployments will not need to change
 
 ## Feature Design
 
-Feature vectors are probability distributions over Mist event types — each value is `count(event_type) / total_events` for that MAC. Volume is never a signal.
+Each MAC carries TWO feature vectors. Both are probability distributions over Mist events; volume is never a signal. Different stages need different granularity, so each vector is routed to the consumers it fits.
 
-**61-dimensional ML input:**
-- 59 dimensions: normalized frequency per Mist client event type (DHCP, DNS, auth, roam, ARP, disassoc, etc.)
-- 2 dimensions: `median_inter_event_seconds`, `inter_event_cv` (timing behavior)
+**`event_vector` — ~59-dim per-event-type frequency distribution**
+One dimension per known Mist client event type (DHCP, DNS, auth, roam, ARP, disassoc, etc.). Value = `count(event_type) / total_events` for that MAC. Fed to **Isolation Forest** (per-family intra-family outliers) and the **Family Centroid cosine-distance** detector (inter-family outliers). Granular enough to distinguish, e.g., two iPhones failing at different roam types (`MARVIS_EVENT_CLIENT_FBT_FAILURE` vs `MARVIS_EVENT_CLIENT_AUTH_FAILURE_OKC`) — exactly the per-revision fingerprint the detector exists to find.
+
+**`category_vector` — ~15-dim semantic-bucket frequency + concentration**
+~13 dimensions: one per `EVENT_CATEGORIES` bucket (DHCP_SUCCESS, ROAM_FAILURE, etc., excluding COLLABORATION). Plus `top_category_fraction` and `top_failure_category_fraction` to amplify single-category-loop signal. Fed to **DBSCAN** (population-wide clustering, after PCA — semantic distance is the right level for whole-population grouping), the **health scorer** (success/failure ratios are inherently category-level), the **top-contributing-features explainer** (chip labels need readable category names), and the **MacDrilldown chart** (~15 readable bars beat 59 sparse ones).
 
 **Post-hoc explainer features** (computed only after a MAC is flagged, never fed to ML):
 PMKID failure ratio, DHCP XID counts, roam failure types — used to generate human-readable `probable_pattern` labels like `pmkid_stale`, `dhcp_discard_loop`, `auth_failure_terminal`.
@@ -188,9 +189,8 @@ Webhooks fire only when **both** conditions are met for a device family:
 
 1. Any family-level anomaly label is set — at least one of:
    - `is_family_outlier` — centroid IF/distance flagged the whole family as behaviorally different from all other device types
-   - `is_family_dbscan_outlier` — fraction of DBSCAN-noise MACs in the family exceeds the noise threshold
-   - `is_family_markov_outlier` — Markov Chain analysis found anomalous event-chain patterns in ≥ `MARKOV_FAMILY_OUTLIER_RATIO` of the family's clients
-2. `health_score < 0.75` — family is also measurably failing
+   - `is_family_dbscan_outlier` and `is_family_markov_outlier` — fraction of MACs in the device family are above the administratively configured threshold
+2. `health_score < XYZ` — family is also measurably failing, the XYZ level is controlled in the config by the administrator
 
 Finding severity (`minimal` / `moderate` / `significant`) is informational only — it is displayed in the UI but does not gate webhook dispatch. Single-device IF outliers without a family-level flag appear in the UI but never trigger webhooks.
 
@@ -244,34 +244,56 @@ TSHOOT failures for individual MACs return an empty `tshoot_results` list withou
 All reads come from Redis — no real-time Mist API calls in the request path.
 
 ```
-GET  /api/v1/sites
 GET  /api/v1/sites/{site_id}/findings
 GET  /api/v1/sites/{site_id}/health
 GET  /api/v1/sites/{site_id}/events/summary
 GET  /api/v1/sites/{site_id}/anomalies/{mac}
-POST /api/v1/sites/{site_id}/refresh
+GET  /api/v1/org/sites
 GET  /api/v1/org/summary
 GET  /api/v1/org/alerts
+GET  /api/v1/org/alert-history
 GET  /api/v1/org/findings
 GET  /api/v1/org/family-insights
-POST /api/v1/org/detect
+GET  /api/v1/org/clients/search
+POST /api/v1/org/refresh           # daily client-cache refresh trigger
+POST /api/v1/org/collect-full      # trailing-12hr event collect
+POST /api/v1/org/detect            # re-run the detection pipeline
+POST /api/v1/org/flush             # drop cached aggregates
 ```
+
+Full route inventory in the auto-generated Swagger UI at `http://localhost:8000/docs`.
 
 ---
 
-## Redis Key Schema
+## Storage Layout
+
+Events and the org-wide client cache live in **SQLite** (system of record, survives Redis flushes). Derived state lives in **Redis** with TTLs so loss just triggers a recompute.
+
+### SQLite (`sasquatch/client_anomaly/data/sasquatch.db`)
+
+| Table | Retention | Contents |
+|---|---|---|
+| `events` | 7 days | Every client event, enriched with device metadata at write time. Purged daily at 03:00. |
+| `clients` | until next refresh | Org-scoped `MAC → {family, model, os, manufacturer, last_site_id, last_username, …}`. Overwritten in place by the daily client-cache refresh. |
+| `client_summary` | rebuilt per cycle | Materialized per-(mac, site_id, wlan) rollup backing the drilldown endpoints. |
+| `client_refresh_log` | permanent | One row per org recording the last cache-refresh timestamp. |
+
+### Redis
 
 | Key | TTL | Contents |
 |---|---|---|
-| `sasquatch:clients:{site_id}` | 7 days | MAC → device metadata (family, model, OS, manufacturer) |
-| `sasquatch:events:{site_id}` | 7 days | Sorted set of enriched events scored by Unix timestamp |
-| `sasquatch:wlans:{site_id}` | 7 days | Unique SSIDs seen at site |
-| `sasquatch:features:{site_id}:{wlan}` | 24 hr | Per-MAC feature vectors |
-| `sasquatch:anomalies:{site_id}:{wlan}` | 24 hr | Per-MAC anomaly scores + outlier flags |
-| `sasquatch:health:{site_id}:{wlan}` | 24 hr | Per-family health scores + category breakdown |
-| `sasquatch:findings:{site_id}:{wlan}` | 24 hr | Rolled-up per-family findings |
-| `sasquatch:org_findings:{wlan}` | 24 hr | Cross-site findings (one entry per family across all sites) |
-| `sasquatch:markov_baseline:{site_id}:{wlan}` | 48 hr | Markov transition matrices + episode-type state machine built from 24hr events |
+| `sasquatch:event_type_index` | 7 days | Ordered list of known Mist client event types (from `GET /api/v1/const/client_events`). |
+| `sasquatch:features:{site_id}:{wlan}` | 24 hr | Per-MAC feature vectors (`event_vector` + `category_vector`). |
+| `sasquatch:anomalies:{site_id}:{wlan}` | 24 hr | Per-MAC anomaly scores + outlier flags. |
+| `sasquatch:health:{site_id}:{wlan}` | 24 hr | Per-family health scores + per-category breakdown. |
+| `sasquatch:findings:{site_id}:{wlan}` | 24 hr | Rolled-up per-family findings. |
+| `sasquatch:org_anomalies:{site_id}:{wlan}` | 24 hr | Per-MAC org-wide scores from `score_org_wide`. |
+| `sasquatch:org_findings:{wlan}` | 24 hr | Cross-site findings (one entry per family across all sites). |
+| `sasquatch:markov_baseline:{site_id}:{wlan}` | 48 hr | Markov transition matrix + event-type index. |
+| `sasquatch:summary:*` | 2 hr | Pre-computed dashboard aggregates (org/site overview, alerts, findings). Rebuilt at the tail of every detection cycle. |
+| `sasquatch:alert_active:{site_id}:{wlan}` | explicit | Currently-open alert sessions by family. |
+| `sasquatch:alert_session:{key}` | 8 days | Individual alert session records (for history API). |
+| `sasquatch:lock:global_operation` | 6 hr | Global mutex — only one collect/detect runs at a time. |
 
 Detection runs independently for each unique SSID — there is no combined cross-WLAN scope. All API endpoints require an explicit `?wlan=` parameter.
 
@@ -283,28 +305,40 @@ Detection runs independently for each unique SSID — there is no combined cross
 unsupervised_anomaly/
 ├── sasquatch/
 │   ├── client_anomaly/
-│   │   ├── client_cache.py          # Daily MAC → device metadata refresh
-│   │   ├── event_collector.py       # 24hr event pull, enrichment, deduplication
-│   │   ├── feature_engineer.py      # Per-MAC behavioral feature vectors
-│   │   ├── anomaly_detector.py      # Four-stage ML pipeline + finding rollup
-│   │   ├── markov_analyzer.py       # Markov Chain episode analysis (Stage 4)
-│   │   ├── health_scorer.py         # Per-family failure rate scoring (independent)
-│   │   ├── webhook_dispatcher.py    # Dual-gate alert dispatch
-│   │   ├── scheduler.py             # APScheduler job definitions
-│   │   ├── oui_lookup.py            # Local IEEE OUI database (no network calls)
+│   │   ├── config.py                 # DEFAULTS + config_overrides.json resolver
+│   │   ├── db.py                     # Async SQLite layer + migrations
+│   │   ├── client_cache.py           # Daily org-wide MAC → device metadata refresh
+│   │   ├── event_collector.py        # Streaming org event pull + enrichment → SQLite
+│   │   ├── feature_engineer.py       # Per-MAC behavioral feature vectors
+│   │   ├── anomaly_detector.py       # Four-stage ML pipeline + finding rollup
+│   │   ├── markov_analyzer.py        # Markov Chain episode + stuck-loop analysis
+│   │   ├── health_scorer.py          # Per-family failure rate scoring (independent)
+│   │   ├── webhook_dispatcher.py     # Dual-gate alert dispatch + TSHOOT enrichment
+│   │   ├── alert_tracker.py          # Persistent alert-session history
+│   │   ├── client_summary_builder.py # Materialized per-(mac, site, wlan) rollup
+│   │   ├── summary_cache.py          # Pre-computed dashboard aggregates
+│   │   ├── scheduler.py              # APScheduler jobs + global mutex
+│   │   ├── oui_lookup.py             # Local IEEE OUI database (no network calls)
 │   │   └── api/
-│   │       └── routes.py            # FastAPI route definitions
+│   │       └── routes.py             # FastAPI route definitions
 │   ├── frontend/
 │   │   └── src/
 │   │       ├── App.jsx
+│   │       ├── api.js
 │   │       └── components/
 │   │           ├── SiteOverview.jsx
 │   │           ├── FindingsFeed.jsx
 │   │           ├── OrgOverview.jsx
 │   │           ├── OrgAlerts.jsx
+│   │           ├── OrgFindingsFeed.jsx
 │   │           ├── OrgFamilyInsights.jsx
 │   │           ├── MacDrilldown.jsx
-│   │           └── FamilyDrilldown.jsx
+│   │           ├── FamilyDrilldown.jsx
+│   │           ├── OrgFamilyDrilldown.jsx
+│   │           ├── ClusterViz.jsx
+│   │           ├── OrgClusterViz.jsx
+│   │           ├── ColumnSelector.jsx
+│   │           └── familyColors.js
 │   └── main.py
 ├── setup.sh
 ├── start.sh
