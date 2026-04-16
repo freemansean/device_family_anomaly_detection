@@ -2268,11 +2268,18 @@ async def search_families_drilldown(
     page_size: int = Query(500, ge=1, le=2000, description="Rows per page"),
     sort: str | None = Query(None, description="Column to sort by"),
     sort_dir: str | None = Query(None, description="Sort direction: asc or desc"),
+    scope: str = Query("site", pattern="^(site|org)$", description="Anomaly-flag scope for IF/DBSCAN/Centroid. Markov is site-WLAN only regardless."),
 ):
     """
     Multi-family drilldown: returns a paginated slice of the all-WLANs
     drilldown for every device family whose name contains ``q``. Backed by
     the ``client_summary`` table with a case-insensitive LIKE query.
+
+    When ``scope="org"``, the IF/DBSCAN/centroid flags on each returned row
+    are overlaid from ``sasquatch:org_anomalies:{site}:{wlan}`` (written by
+    ``anomaly_detector.score_org_wide``). Markov is not re-scoped — its
+    baseline is always site-WLAN. Header counts for IF and DBSCAN under
+    org scope are computed from the current page only (see ``counts_scope``).
     """
     if not MIST_ORG_ID or not MIST_API_TOKEN:
         raise HTTPException(status_code=500, detail="MIST_ORG_ID or MIST_API_TOKEN not configured.")
@@ -2308,6 +2315,58 @@ async def search_families_drilldown(
         r = _summary_row_to_drilldown(sr, site_map, include_wlan=True, include_device_family=True)
         rows.append(r)
 
+    if_outlier_count = counts["if_outlier"]
+    dbscan_outlier_count = counts["dbscan_outlier"]
+    counts_scope = "total"
+
+    if scope == "org" and rows:
+        scope_pairs = sorted({(r["site_id"], r.get("wlan", "")) for r in rows if r.get("site_id")})
+        org_redis = _get_redis()
+        try:
+            pipe = org_redis.pipeline()
+            for sid, wl in scope_pairs:
+                pipe.get(_org_anomalies_redis_key(sid, wl))
+            raw_results = await pipe.execute()
+        finally:
+            await org_redis.aclose()
+
+        org_anom_by_scope: dict[tuple[str, str], dict] = {}
+        for (sid, wl), raw in zip(scope_pairs, raw_results):
+            if not raw:
+                continue
+            try:
+                org_anom_by_scope[(sid, wl)] = json.loads(raw)
+            except Exception:
+                continue
+
+        for r in rows:
+            scope_key = (r.get("site_id", ""), r.get("wlan", ""))
+            anom_map = org_anom_by_scope.get(scope_key)
+            if not anom_map:
+                # No org-wide scoring for this (site, wlan) — wipe the IF/DBSCAN
+                # flags so the row doesn't misleadingly show site-scoped flags
+                # while the user is in org mode.
+                r["is_if_outlier"] = False
+                r["is_dbscan_outlier"] = False
+                r["if_score"] = None
+                r["is_family_outlier"] = False
+                continue
+            rec = anom_map.get(r["mac"])
+            if not rec:
+                r["is_if_outlier"] = False
+                r["is_dbscan_outlier"] = False
+                r["if_score"] = None
+                r["is_family_outlier"] = False
+                continue
+            r["is_if_outlier"] = bool(rec.get("is_if_outlier", False))
+            r["is_dbscan_outlier"] = bool(rec.get("is_dbscan_outlier", False))
+            r["if_score"] = rec.get("if_score")
+            r["is_family_outlier"] = bool(rec.get("is_family_outlier", False))
+
+        if_outlier_count = sum(1 for r in rows if r.get("is_if_outlier"))
+        dbscan_outlier_count = sum(1 for r in rows if r.get("is_dbscan_outlier"))
+        counts_scope = "page"
+
     total_pages = (counts["total"] + page_size - 1) // page_size
 
     return {
@@ -2317,9 +2376,11 @@ async def search_families_drilldown(
         "service_account_member_families": [],
         "matched_families": counts["families"],
         "total_count": counts["total"],
-        "if_outlier_count": counts["if_outlier"],
-        "dbscan_outlier_count": counts["dbscan_outlier"],
+        "if_outlier_count": if_outlier_count,
+        "dbscan_outlier_count": dbscan_outlier_count,
         "markov_outlier_count": counts["markov_outlier"],
+        "scope": scope,
+        "counts_scope": counts_scope,
         "page": page,
         "page_size": page_size,
         "total_pages": total_pages,

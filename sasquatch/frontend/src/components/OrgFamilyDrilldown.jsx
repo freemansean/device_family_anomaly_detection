@@ -70,11 +70,12 @@ const DEFAULT_VISIBLE = {
   health: true, service_alarm: true, if_score: true, if_flag: true,
   dbscan: true, markov: true,
   cat_DHCP_SUCCESS: true, cat_DHCP_FAILURE: true,
-  cat_DNS_SUCCESS: false, cat_DNS_FAILURE: false,
+  cat_DNS_SUCCESS: true, cat_DNS_FAILURE: true,
   cat_AUTH_SUCCESS: true, cat_AUTH_FAILURE: true,
   cat_ROAM_SUCCESS: true, cat_ROAM_FAILURE: true,
-  cat_DISASSOC: false,
-  cat_ARP_SUCCESS: false, cat_ARP_FAILURE: false,
+  cat_DISASSOC_AP: true,
+  cat_DISASSOC_CLIENT: true,
+  cat_ARP_SUCCESS: true, cat_ARP_FAILURE: true,
   cat_CAPTIVE_PORTAL: false, cat_SECURITY: false,
   cat_COLLABORATION: false, cat_OTHER: false,
   total_events: true,
@@ -253,8 +254,9 @@ export default function OrgFamilyDrilldown({ family, apiBase, onMacSiteSelect, o
   const [sortDir, setSortDir] = useState("asc");
   const [filterText, setFilterText] = useState("");
   const [filterTags, setFilterTags] = useState([]);
+  const [scope, setScope] = useState("site");
   const [visibleCols, setVisibleCols] = useState(() =>
-    loadVisibleFromStorage("orgFamilyDrilldown.columns.v1", DEFAULT_VISIBLE)
+    loadVisibleFromStorage("orgFamilyDrilldown.columns.v3", DEFAULT_VISIBLE)
   );
 
   useEffect(() => {
@@ -263,7 +265,7 @@ export default function OrgFamilyDrilldown({ family, apiBase, onMacSiteSelect, o
     const sortParams = `&sort=${encodeURIComponent(sortCol)}&sort_dir=${encodeURIComponent(sortDir)}`;
     let url;
     if (searchQuery) {
-      url = `${apiBase}/api/v1/org/families/search-drilldown?q=${encodeURIComponent(searchQuery)}&page=${page}&page_size=${PAGE_SIZE}${sortParams}`;
+      url = `${apiBase}/api/v1/org/families/search-drilldown?q=${encodeURIComponent(searchQuery)}&page=${page}&page_size=${PAGE_SIZE}${sortParams}&scope=${scope}`;
     } else if (allWlans) {
       url = `${apiBase}/api/v1/org/families/${encodeURIComponent(family)}/drilldown-all-wlans?page=${page}&page_size=${PAGE_SIZE}${sortParams}`;
     } else {
@@ -276,10 +278,10 @@ export default function OrgFamilyDrilldown({ family, apiBase, onMacSiteSelect, o
       })
       .then(d => { setData(d); setLoading(false); })
       .catch(e => { setError(String(e)); setLoading(false); });
-  }, [family, apiBase, wlan, allWlans, searchQuery, page, sortCol, sortDir]);
+  }, [family, apiBase, wlan, allWlans, searchQuery, page, sortCol, sortDir, scope]);
 
-  // Reset to page 1 when the query/family changes
-  useEffect(() => { setPage(1); }, [family, wlan, allWlans, searchQuery]);
+  // Reset to page 1 when the query/family/scope changes
+  useEffect(() => { setPage(1); }, [family, wlan, allWlans, searchQuery, scope]);
 
   const handleExportCsv = async () => {
     if (!data || exporting) return;
@@ -288,7 +290,7 @@ export default function OrgFamilyDrilldown({ family, apiBase, onMacSiteSelect, o
       // Build the base URL (without pagination) then fetch all pages
       let baseUrl;
       if (searchQuery) {
-        baseUrl = `${apiBase}/api/v1/org/families/search-drilldown?q=${encodeURIComponent(searchQuery)}`;
+        baseUrl = `${apiBase}/api/v1/org/families/search-drilldown?q=${encodeURIComponent(searchQuery)}&scope=${scope}`;
       } else if (allWlans) {
         baseUrl = `${apiBase}/api/v1/org/families/${encodeURIComponent(family)}/drilldown-all-wlans?`;
       } else {
@@ -411,6 +413,36 @@ export default function OrgFamilyDrilldown({ family, apiBase, onMacSiteSelect, o
         <div style={{ flex: 1 }} />
         <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: "6px" }}>
           <div style={{ display: "flex", gap: "6px", alignItems: "center" }}>
+            {searchQuery && (
+              <div
+                title="Toggle between site-local and org-wide scoring for IF, DBSCAN, and Centroid flags. Markov is always site-WLAN scoped regardless."
+                style={{
+                  display: "inline-flex", alignItems: "center",
+                  background: "#1a1a1a", border: "1px solid #333",
+                  borderRadius: "4px", padding: "2px", gap: "2px",
+                }}
+              >
+                <span style={{ color: "#666", fontSize: "11px", padding: "0 6px" }}>
+                  IF/DBSCAN/Centroid:
+                </span>
+                {["site", "org"].map((s) => (
+                  <button
+                    key={s}
+                    onClick={() => setScope(s)}
+                    style={{
+                      background: scope === s ? "#0d2535" : "transparent",
+                      color: scope === s ? "#7ec8e3" : "#888",
+                      border: scope === s ? "1px solid #2a6a8a" : "1px solid transparent",
+                      padding: "2px 8px", borderRadius: "3px",
+                      cursor: "pointer", fontSize: "11px",
+                      textTransform: "capitalize",
+                    }}
+                  >
+                    {s}
+                  </button>
+                ))}
+              </div>
+            )}
             {sortedRows.length > 0 && (
               <button
                 onClick={handleExportCsv}
@@ -430,7 +462,7 @@ export default function OrgFamilyDrilldown({ family, apiBase, onMacSiteSelect, o
               columns={COLUMN_DEFS}
               visible={visibleCols}
               onChange={setVisibleCols}
-              storageKey="orgFamilyDrilldown.columns.v1"
+              storageKey="orgFamilyDrilldown.columns.v3"
             />
           </div>
           {data?.total_pages > 1 && (
@@ -565,8 +597,10 @@ export default function OrgFamilyDrilldown({ family, apiBase, onMacSiteSelect, o
             ))}
             <div style={{ fontSize: "12px", color: "#666" }}>
               {data.total_count} clients across all sites.{" "}
-              <span style={{ color: "#e05555" }}>{data.if_outlier_count} flagged</span> by Isolation Forest.{" "}
-              <span style={{ color: "#e05555" }}>{data.dbscan_outlier_count} flagged</span> by DBSCAN.{" "}
+              <span style={{ color: "#e05555" }}>{data.if_outlier_count} flagged</span> by Isolation Forest
+              {data.counts_scope === "page" && <span style={{ color: "#555" }}> (this page)</span>}.{" "}
+              <span style={{ color: "#e05555" }}>{data.dbscan_outlier_count} flagged</span> by DBSCAN
+              {data.counts_scope === "page" && <span style={{ color: "#555" }}> (this page)</span>}.{" "}
               <span style={{ color: "#e05555" }}>{data.markov_outlier_count} flagged</span> by Markov.
               {filterTags.length > 0 && (
                 <span style={{ color: "#7ec8e3" }}>{" "}· {sortedRows.length} shown</span>
@@ -761,7 +795,10 @@ export default function OrgFamilyDrilldown({ family, apiBase, onMacSiteSelect, o
           )}
 
           <div style={{ marginTop: "8px", fontSize: "11px", color: "#444" }}>
-            ▲IF = Isolation Forest outlier within site peer group. DBSCAN = flagged site-wide. Markov = anomaly (anomalous connection-chain transitions) or repeated (stuck failure loop) — hover for episode counts. Click a row to open MAC timeline.
+            ▲IF = Isolation Forest outlier {searchQuery ? `(${data.scope || "site"}-scope)` : "within site peer group"}.
+            DBSCAN = {searchQuery ? `flagged ${data.scope === "org" ? "org-wide" : "site-wide"}` : "flagged site-wide"}.
+            Markov = anomaly (anomalous connection-chain transitions) or repeated (stuck failure loop) — always site-WLAN scoped; hover for episode counts.
+            Click a row to open MAC timeline.
           </div>
         </>
       )}
