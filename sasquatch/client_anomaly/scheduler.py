@@ -543,6 +543,32 @@ async def _run_org_pipeline_body(
         except Exception:
             log.exception("[org pipeline] Phase 5 summary cache populate failed (non-fatal)")
 
+        # ── Phase 5b: Rebuild client_summary table for drilldowns ────────
+        # Per-(mac, site, wlan) rollup that backs the Device Family Drilldown
+        # and Device Family Search endpoints. Truncate-and-rebuild per scope.
+        # Best-effort: failures log and are swallowed.
+        try:
+            from . import client_summary_builder as _builder
+            _cache_redis = aioredis.from_url(REDIS_URL, decode_responses=True)
+            try:
+                scope_pairs: list[tuple[str, str]] = []
+                for sid in site_ids:
+                    for wlan in wlans_by_site.get(sid, []):
+                        scope_pairs.append((sid, wlan))
+                summary_stats = await _builder.rebuild_summary_table(
+                    _cache_redis, scope_pairs, org_id=MIST_ORG_ID,
+                )
+                log.info(
+                    "[org pipeline] Phase 5b client_summary: scopes_built=%d "
+                    "scopes_failed=%d rows=%d stale_rows_swept=%d",
+                    summary_stats["scopes_built"], summary_stats["scopes_failed"],
+                    summary_stats["rows_total"], summary_stats["stale_rows_swept"],
+                )
+            finally:
+                await _cache_redis.aclose()
+        except Exception:
+            log.exception("[org pipeline] Phase 5b client_summary rebuild failed (non-fatal)")
+
         # ── Done ─────────────────────────────────────────────────────────
         await _record_last_timestamp(_LAST_DETECTION_KEY)
 

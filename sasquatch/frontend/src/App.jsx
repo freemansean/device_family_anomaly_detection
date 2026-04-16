@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from "react";
 import FamilyDrilldown from "./components/FamilyDrilldown";
+import OrgFamilyDrilldown from "./components/OrgFamilyDrilldown";
 import FindingsFeed from "./components/FindingsFeed";
 import MacDrilldown from "./components/MacDrilldown";
 import OrgOverview from "./components/OrgOverview";
@@ -212,7 +213,7 @@ export default function App() {
   const [selectedSite, setSelectedSite] = useState(null); // site ID string
   const [selectedMac, setSelectedMac] = useState(null);
   const [selectedFamily, setSelectedFamily] = useState(null);
-  const [view, setView] = useState("overview"); // "overview" | "findings" | "family" | "mac"
+  const [view, setView] = useState("overview"); // "overview" | "findings" | "family" | "mac" | "org-family"
   const [siteSearch, setSiteSearch] = useState("");
   const [siteDropdownOpen, setSiteDropdownOpen] = useState(false);
   const [discoveryRefreshToken, setDiscoveryRefreshToken] = useState(0);
@@ -222,6 +223,13 @@ export default function App() {
   const [macDropdownOpen, setMacDropdownOpen] = useState(false);
   const [macResults, setMacResults] = useState([]);
   const [macSearchLoading, setMacSearchLoading] = useState(false);
+
+  // Device family search (org-wide)
+  const [familySearch, setFamilySearch] = useState("");
+  const [familyDropdownOpen, setFamilyDropdownOpen] = useState(false);
+  const [familyResults, setFamilyResults] = useState([]);
+  const [familySearchLoading, setFamilySearchLoading] = useState(false);
+  const [familySearchQuery, setFamilySearchQuery] = useState(null); // non-null = multi-family search mode
 
   // WLAN scope
   const [wlans, setWlans] = useState([]); // list of SSID name strings
@@ -378,6 +386,35 @@ export default function App() {
     }, 220);
     return () => { cancelled = true; clearTimeout(timer); };
   }, [macSearch]);
+
+  // Debounced device family search. Requires >= 2 characters and matches the
+  // backend substring search so operators can type any chunk of a composite
+  // family name (e.g. "MacBook" to find "Apple | MacBook Pro | macOS 14").
+  useEffect(() => {
+    const norm = (familySearch || "").trim();
+    if (norm.length < 2) {
+      setFamilyResults([]);
+      setFamilySearchLoading(false);
+      return;
+    }
+    let cancelled = false;
+    setFamilySearchLoading(true);
+    const timer = setTimeout(async () => {
+      try {
+        const r = await apiFetch(`${API_BASE}/api/v1/org/families/search?q=${encodeURIComponent(norm)}&limit=50`);
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const data = await r.json();
+        if (cancelled) return;
+        setFamilyResults(Array.isArray(data.results) ? data.results : []);
+      } catch (e) {
+        if (!cancelled) setFamilyResults([]);
+        console.error("family search failed", e);
+      } finally {
+        if (!cancelled) setFamilySearchLoading(false);
+      }
+    }, 220);
+    return () => { cancelled = true; clearTimeout(timer); };
+  }, [familySearch]);
 
   // Fetch available WLANs whenever the selected site changes.
   // Auto-select the first WLAN alphabetically. If the previously-selected WLAN
@@ -886,6 +923,35 @@ export default function App() {
     setMacDropdownOpen(false);
   }
 
+  // Navigate to an org-wide family drilldown from the header search. Switches
+  // to the Organization scope (OrgFamilyDrilldown aggregates across every site)
+  // and drops the user straight into the drilldown view.
+  function handleFamilySearchSelect(result) {
+    if (!result) return;
+    setSelectedSite(ORG_FOCUS_VALUE);
+    setSelectedFamily(result.family);
+    setFamilySearchQuery(null);
+    setSelectedMac(null);
+    setView("org-family");
+    setFamilySearch("");
+    setFamilyResults([]);
+    setFamilyDropdownOpen(false);
+  }
+
+  // Enter on the family search input → multi-family search drilldown
+  function handleFamilySearchSubmit() {
+    const q = (familySearch || "").trim();
+    if (q.length < 2) return;
+    setSelectedSite(ORG_FOCUS_VALUE);
+    setSelectedFamily(null);
+    setFamilySearchQuery(q);
+    setSelectedMac(null);
+    setView("org-family");
+    setFamilySearch("");
+    setFamilyResults([]);
+    setFamilyDropdownOpen(false);
+  }
+
   return (
     <div style={{ fontFamily: "monospace", padding: "16px", background: "#111", minHeight: "100vh", color: "#e0e0e0" }}>
       <style>{ACTION_BTN_PULSE_STYLE}</style>
@@ -1118,8 +1184,51 @@ export default function App() {
             </span>
           )}
 
-          {/* Client MAC search — positioned on the right, under Config / Sign Out */}
-          <div style={{ marginLeft: "auto", display: "flex", gap: "8px", alignItems: "center" }}>
+          {/* Device family search + Client MAC search — right side of header */}
+          <div style={{ marginLeft: "auto", display: "flex", gap: "14px", alignItems: "center" }}>
+            <div style={{ display: "flex", gap: "8px", alignItems: "center" }}>
+              <span style={{ color: "#888", fontSize: "13px" }}>Device Family:</span>
+              <div style={{ position: "relative" }}>
+                <input
+                  type="text"
+                  value={familySearch}
+                  placeholder="Search family…"
+                  onFocus={() => setFamilyDropdownOpen(true)}
+                  onChange={(e) => { setFamilySearch(e.target.value); setFamilyDropdownOpen(true); }}
+                  onBlur={() => setTimeout(() => setFamilyDropdownOpen(false), 150)}
+                  onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); handleFamilySearchSubmit(); } }}
+                  style={{ background: "#222", color: "#e0e0e0", border: "1px solid #444", padding: "4px 8px", borderRadius: "4px", width: "220px", cursor: "text", fontFamily: "monospace" }}
+                />
+                {familyDropdownOpen && familySearch && (
+                  <div style={{ position: "absolute", top: "100%", right: 0, zIndex: 100, background: "#1a1a1a", border: "1px solid #444", borderRadius: "4px", marginTop: "2px", maxHeight: "320px", overflowY: "auto", width: "420px", boxShadow: "0 4px 12px rgba(0,0,0,0.5)" }}>
+                    {(() => {
+                      const norm = familySearch.trim();
+                      if (norm.length < 2) {
+                        return <div style={{ padding: "8px 10px", color: "#555", fontSize: "12px" }}>Type at least 2 characters…</div>;
+                      }
+                      if (familySearchLoading) {
+                        return <div style={{ padding: "8px 10px", color: "#555", fontSize: "12px" }}>Searching…</div>;
+                      }
+                      if (familyResults.length === 0) {
+                        return <div style={{ padding: "8px 10px", color: "#555", fontSize: "12px" }}>No families match</div>;
+                      }
+                      return familyResults.map((r) => (
+                        <div
+                          key={r.family}
+                          onMouseDown={() => handleFamilySearchSelect(r)}
+                          style={{ padding: "6px 10px", cursor: "pointer", borderBottom: "1px solid #2a2a2a", background: "transparent" }}
+                          onMouseEnter={e => e.currentTarget.style.background = "#252525"}
+                          onMouseLeave={e => e.currentTarget.style.background = "transparent"}
+                        >
+                          <div style={{ color: "#e0e0e0", fontSize: "12px" }}>{r.family}</div>
+                        </div>
+                      ));
+                    })()}
+                  </div>
+                )}
+              </div>
+            </div>
+          <div style={{ display: "flex", gap: "8px", alignItems: "center" }}>
             <span style={{ color: "#888", fontSize: "13px" }}>Client:</span>
             <div style={{ position: "relative" }}>
               <input
@@ -1184,6 +1293,7 @@ export default function App() {
               )}
             </div>
           </div>
+          </div>
 
         </div>
 
@@ -1228,6 +1338,17 @@ export default function App() {
           // default without waiting on the auto-select effect. The other four
           // tabs still read `wlan` and stay blank until a WLAN is selected.
           <OrgOverview apiBase={API_BASE} onSiteSelect={handleSiteSelect} onMacSiteSelect={handleOrgMacSelect} refreshToken={discoveryRefreshToken} wlan={selectedWlan} onLoaded={() => setWlanLoading(false)} detectionInProgress={orgDetectPolling} />
+        )}
+        {selectedSite === ORG_FOCUS_VALUE && view === "org-family" && (selectedFamily || familySearchQuery) && (
+          <OrgFamilyDrilldown
+            family={selectedFamily || familySearchQuery}
+            apiBase={API_BASE}
+            onMacSiteSelect={handleOrgMacSelect}
+            onBack={() => { setSelectedFamily(null); setFamilySearchQuery(null); setView("overview"); }}
+            wlan={selectedWlan}
+            allWlans
+            searchQuery={familySearchQuery}
+          />
         )}
         {selectedSite && selectedSite !== ORG_FOCUS_VALUE && view === "overview" && selectedWlan && (
           <SiteOverview siteId={selectedSite} apiBase={API_BASE} onMacSelect={handleMacSelect} onFamilySelect={handleFamilySelect} refreshToken={discoveryRefreshToken} wlan={selectedWlan} onLoaded={() => setWlanLoading(false)} />
