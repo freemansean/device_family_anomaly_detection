@@ -1210,6 +1210,21 @@ async def score_org_wide(
                 if ck in org_anomalies_flat and rec.get("is_markov_outlier"):
                     org_anomalies_flat[ck]["is_markov_outlier"] = True
                     org_anomalies_flat[ck]["markov_reason"] = rec.get("markov_reason")
+                    # Copy all Markov detail fields so org anomaly records
+                    # carry the same data as per-site records. Without this,
+                    # the MacDrilldown and OrgFamilyDrilldown show empty
+                    # Markov detail when falling back to org anomalies.
+                    for mk in (
+                        "markov_total_episodes",
+                        "markov_scoreable_episodes",
+                        "markov_anomalous_episodes",
+                        "markov_episode_anomaly_ratio",
+                        "is_stuck_loop",
+                        "stuck_loop_pair",
+                        "stuck_loop_fraction",
+                    ):
+                        if mk in rec:
+                            org_anomalies_flat[ck][mk] = rec[mk]
                     # Update composite is_outlier to reflect Markov
                     org_anomalies_flat[ck]["is_outlier"] = (
                         org_anomalies_flat[ck]["is_outlier"] or True
