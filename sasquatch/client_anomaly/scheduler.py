@@ -43,7 +43,7 @@ MIST_ORG_ID = os.getenv("MIST_ORG_ID", "")
 
 # Global mutex: only one operation (collecting or detecting) at a time.
 _GLOBAL_LOCK_KEY = "sasquatch:lock:global_operation"
-_GLOBAL_LOCK_TTL_SECONDS = 2 * 60 * 60  # 2 hours
+_GLOBAL_LOCK_TTL_SECONDS = 6 * 60 * 60  # 6 hours — covers a full 12hr multi-million-event collect with margin. `clear_stale_global_lock()` at startup handles the crash-before-release case; this TTL is only a backstop.
 
 # Redis keys for tracking last operation timestamps
 _LAST_COLLECTION_KEY = "sasquatch:last_collection"
