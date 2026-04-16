@@ -45,9 +45,29 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# CORS origins. Default to localhost (both hostnames + both dev ports). Operators
+# running on a LAN set SASQUATCH_CORS_ORIGINS to a comma-separated list, or the
+# literal "*" to allow all origins (the original permissive behavior, useful on
+# an isolated/demo network). Whatever origin the frontend is served from must
+# be in the list or the browser will block every response with a CORS error.
+_DEFAULT_CORS_ORIGINS = [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+]
+_cors_env = os.getenv("SASQUATCH_CORS_ORIGINS", "").strip()
+if _cors_env == "*":
+    _cors_origins: list[str] = ["*"]
+elif _cors_env:
+    _cors_origins = [o.strip() for o in _cors_env.split(",") if o.strip()]
+else:
+    _cors_origins = _DEFAULT_CORS_ORIGINS
+log.info("CORS allowed origins: %s", _cors_origins)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_cors_origins,
     allow_methods=["*"],
     allow_headers=["*"],
 )
