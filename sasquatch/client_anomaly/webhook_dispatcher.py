@@ -487,7 +487,15 @@ async def evaluate_and_dispatch(
             for f in qualifying
             if f.get("device_family")
         }
-        await alert_tracker.record_cycle(site_id, wlan, active_findings)
+        # Best-effort: alert history is auxiliary to the webhook dispatch itself.
+        # A Redis hiccup here must not block or crash the outbound webhook.
+        try:
+            await alert_tracker.record_cycle(site_id, wlan, active_findings)
+        except Exception:
+            log.exception(
+                "[%s] alert_tracker.record_cycle failed — continuing with dispatch",
+                wlan,
+            )
 
     if not qualifying:
         log.info(
@@ -520,15 +528,27 @@ async def evaluate_and_dispatch(
                 tshoot_tasks.append((i, mac_entry, target_site))
 
         if tshoot_tasks:
+            # return_exceptions=True so a single bad MAC (timeout, 500, malformed
+            # response) cannot crash the entire webhook dispatch. Failed lookups
+            # fall through as empty tshoot_results and are logged.
             results = await asyncio.gather(
-                *[_run_client_tshoot(t[2], t[1]["mac"]) for t in tshoot_tasks]
+                *[_run_client_tshoot(t[2], t[1]["mac"]) for t in tshoot_tasks],
+                return_exceptions=True,
             )
             # Group results back onto each finding.
             finding_tshoot: dict[int, list[dict]] = {i: [] for i in range(len(qualifying))}
             for (i, mac_entry, target_site), result in zip(tshoot_tasks, results):
+                if isinstance(result, BaseException):
+                    log.warning(
+                        "[%s] TSHOOT failed for MAC %s at site %s: %s",
+                        wlan, mac_entry["mac"], target_site, result,
+                    )
+                    tshoot_results = []
+                else:
+                    tshoot_results = result.get("results", [])
                 entry = {
                     "mac": mac_entry["mac"],
-                    "tshoot_results": result.get("results", []),
+                    "tshoot_results": tshoot_results,
                 }
                 # Preserve per-MAC site_id for org-scope consumers so they can
                 # correlate each tshoot block with its sites_affected entry.
@@ -560,9 +580,16 @@ async def evaluate_and_dispatch(
         "findings": slim_findings,
     }
 
+    # Summary log at INFO so ops can see dispatches without drowning in megabytes
+    # of findings + TSHOOT JSON. Full payload available at DEBUG.
+    preview_families = [f.get("device_family", "?") for f in qualifying[:3]]
+    more = max(0, len(qualifying) - 3)
     log.info(
-        f"[{wlan}] Dispatching webhook: {len(qualifying)} finding(s) passed dual alert gate "
-        f"(is_family_outlier + health_score < {threshold})\n"
-        f"Payload: {json.dumps(payload, indent=2)}"
+        "[%s] Dispatching webhook: %d finding(s) passed dual alert gate "
+        "(is_family_outlier + health_score < %s). Families: %s%s",
+        wlan, len(qualifying), threshold, preview_families,
+        f" (+{more} more)" if more else "",
     )
+    if log.isEnabledFor(logging.DEBUG):
+        log.debug("[%s] Full webhook payload: %s", wlan, json.dumps(payload, indent=2))
     return await _post_with_retry(effective_url, payload)
