@@ -2,6 +2,11 @@
 
 ## Open Work
 
+- [ ]  Break down client disassociation / AP disassociation
+- [ ]  Validate if we need “Security” Events
+- [x]  Make Device Family Drilldown cached — `client_summary` SQLite table (2026-04-15)
+- [ ]  Create site/org level ML detection for the search option
+
 ### Findings / Alerts UI rework (2026-04-11)
 
 Scope: [OrgAlerts.jsx](sasquatch/frontend/src/components/OrgAlerts.jsx), [OrgFindingsFeed.jsx](sasquatch/frontend/src/components/OrgFindingsFeed.jsx), [FindingsFeed.jsx](sasquatch/frontend/src/components/FindingsFeed.jsx). Related backend: `get_org_alerts` / per-site findings response shape in `api/routes.py` (check whether site-level findings already carry the dual-gate alert data the UI will need for item 4).
@@ -39,7 +44,7 @@ Scope: [OrgAlerts.jsx](sasquatch/frontend/src/components/OrgAlerts.jsx), [OrgFin
 
 - Seems we are generating alarms with device health scores above the threshold defined in the config. Validate that this is wired correctly
 
-- Speed optimizations as possible, database is starting to fail during page loads
+- Speed optimizations as possible, database is starting to fail during page loads (drilldowns migrated to `client_summary` table — 2026-04-15, remaining: evaluate if other views benefit from the same pattern)
 
 - Phase 4 per-site `score()` is silently skipping (site, wlan) combos in `run_org_pipeline`. Observed: `sasquatch:features:*` keys far outnumber `sasquatch:anomalies:*` keys. The per-site path returns 0 at `anomaly_detector.py:578-597` whenever `build_features` emits an empty dict (every MAC filtered below `ANOMALY_MIN_MAC_EVENTS`). `score_org_wide` is less sensitive because it pools MACs across all sites for the same WLAN, so a site that contributes zero per-site rows can still contribute to the org-wide alert count. Initial mitigation shipped 2026-04-10: `get_org_family_drilldown` now falls back to `sasquatch:org_anomalies:{site}:{wlan}` when the per-site anomalies key is missing, and Phase 4 emits a summary log + WARNING on empty-features returns.
   - [ ] Deploy-verify that `get_org_family_drilldown`'s `org_anomalies` fallback closes the "15/15 devices on the card, 4 MACs in the drilldown" gap for both the SA and non-SA branches.

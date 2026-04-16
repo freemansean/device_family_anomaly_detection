@@ -36,6 +36,7 @@ from ..anomaly_detector import (
     get_findings,
     score,
 )
+from .. import db
 from ..client_cache import get_client_cache, refresh_client_cache_org
 from ..event_collector import (
     EVENT_CATEGORIES,
@@ -1054,6 +1055,35 @@ async def search_org_clients(
     }
 
 
+@router.get("/org/families/search")
+async def search_org_families(
+    q: str = Query(..., description="Device family name fragment (case-insensitive)"),
+    limit: int = Query(50, ge=1, le=200, description="Max matches to return"),
+):
+    """
+    Substring-search device family names in the org client cache so the
+    header family search can autocomplete as the user types. Mirrors the
+    MAC prefix search shape: `{query, results, truncated}` where each result
+    is `{family, mac_count}`.
+    """
+    from .. import db as _db
+
+    norm = (q or "").strip()
+    if len(norm) < 2:
+        return {"query": norm, "results": [], "truncated": False}
+
+    results = await _db.search_families_by_prefix(
+        prefix=norm,
+        org_id=MIST_ORG_ID or None,
+        limit=limit,
+    )
+    return {
+        "query": norm,
+        "results": results,
+        "truncated": len(results) >= limit,
+    }
+
+
 _ORG_SITES_CACHE_KEY = "sasquatch:org_sites_map"
 _ORG_SITES_CACHE_TTL = 300  # 5 minutes
 
@@ -1927,16 +1957,143 @@ async def get_org_family_insights(wlan: str = Query(..., description="WLAN (SSID
         await redis_client.aclose()
 
 
-@router.get("/org/families/{family}/drilldown")
-async def get_org_family_drilldown(family: str, wlan: str = Query(..., description="WLAN (SSID) name to scope results to. Required.")):
+def _summary_row_to_drilldown(
+    row: dict,
+    site_map: dict[str, str],
+    include_wlan: bool = False,
+    include_device_family: bool = False,
+) -> dict:
     """
-    Org-wide per-MAC drilldown for a single device family.
+    Adapt a client_summary row dict (as returned by db.query_client_summary)
+    into the response shape the drilldown frontend already expects. Keeps the
+    payload field names identical to the legacy event-aggregation path so no
+    React changes are required.
+    """
+    sid = row.get("site_id") or ""
+    cats = {
+        "DHCP_SUCCESS": row.get("dhcp_success", 0) or 0,
+        "DHCP_FAILURE": row.get("dhcp_failure", 0) or 0,
+        "DNS_SUCCESS": row.get("dns_success", 0) or 0,
+        "DNS_FAILURE": row.get("dns_failure", 0) or 0,
+        "AUTH_SUCCESS": row.get("auth_success", 0) or 0,
+        "AUTH_FAILURE": row.get("auth_failure", 0) or 0,
+        "ROAM_SUCCESS": row.get("roam_success", 0) or 0,
+        "ROAM_FAILURE": row.get("roam_failure", 0) or 0,
+        "DISASSOC": row.get("disassoc", 0) or 0,
+        "ARP_SUCCESS": row.get("arp_success", 0) or 0,
+        "ARP_FAILURE": row.get("arp_failure", 0) or 0,
+        "CAPTIVE_PORTAL": row.get("captive_portal", 0) or 0,
+        "SECURITY": row.get("security", 0) or 0,
+        "COLLABORATION": row.get("collaboration", 0) or 0,
+        "OTHER": row.get("other", 0) or 0,
+    }
+    categories = {cat: cats.get(cat, 0) for cat in EVENT_CATEGORIES}
+    out = {
+        "mac": row.get("mac"),
+        "site_id": sid,
+        "site_name": site_map.get(sid, sid),
+        "if_score": row.get("if_score"),
+        "is_if_outlier": bool(row.get("is_if_outlier", False)),
+        "is_dbscan_outlier": bool(row.get("is_dbscan_outlier", False)),
+        "is_markov_outlier": bool(row.get("is_markov_outlier", False)),
+        "markov_episode_anomaly_ratio": 0.0,
+        "markov_scoreable_episodes": 0,
+        "markov_anomalous_episodes": 0,
+        "markov_reason": row.get("markov_reason"),
+        "event_count": row.get("total_events", 0) or 0,
+        "random_mac": bool(row.get("random_mac", False)),
+        "client_metadata": {
+            "family": row.get("device_family", ""),
+            "model": row.get("device_model", ""),
+            "manufacturer": row.get("device_manufacturer", ""),
+            "last_username": row.get("last_username", ""),
+        },
+        "categories": categories,
+        "total_events": row.get("total_events", 0) or 0,
+        "health_score": row.get("health_score"),
+        "service_alarm": bool(row.get("service_alarm", False)),
+    }
+    if include_wlan:
+        out["wlan"] = row.get("wlan", "")
+    if include_device_family:
+        out["device_family"] = row.get("device_family", "")
+    sa = row.get("service_account_family")
+    if sa:
+        out["service_account"] = {"family": sa, "last_username": row.get("last_username", "")}
+    return out
 
-    Service-account families ("{label}.service_account") are handled via a
-    separate code path: their underlying events are still tagged with the
-    real device family, so the rows are derived from sa anomaly records and
-    each row carries `primary_device_family` so the GUI can show the mix of
-    underlying device types sharing the username.
+
+def _tally_outliers(rows: list[dict]) -> tuple[int, int, int]:
+    if_count = sum(1 for r in rows if r.get("is_if_outlier"))
+    dbscan_count = sum(1 for r in rows if r.get("is_dbscan_outlier"))
+    markov_count = sum(1 for r in rows if r.get("is_markov_outlier"))
+    return if_count, dbscan_count, markov_count
+
+
+# Whitelist mapping from frontend sort column names to SQL ORDER BY expressions.
+# Keys that don't appear here are rejected (default sort used instead).
+_DRILLDOWN_SORT_COLS: dict[str, str] = {
+    "mac": "mac",
+    "site_name": "site_id",          # site_id is the best proxy; site_name lives in Mist, not SQLite
+    "wlan": "wlan",
+    "device_family": "device_family",
+    "if_score": "if_score IS NULL, if_score",
+    "health": "health_score IS NULL, health_score",
+    "markov_ratio": "is_markov_outlier",
+    "total_events": "total_events",
+    # Event category columns
+    "DHCP_SUCCESS": "dhcp_success",
+    "DHCP_FAILURE": "dhcp_failure",
+    "DNS_SUCCESS": "dns_success",
+    "DNS_FAILURE": "dns_failure",
+    "AUTH_SUCCESS": "auth_success",
+    "AUTH_FAILURE": "auth_failure",
+    "ROAM_SUCCESS": "roam_success",
+    "ROAM_FAILURE": "roam_failure",
+    "DISASSOC": "disassoc",
+    "ARP_SUCCESS": "arp_success",
+    "ARP_FAILURE": "arp_failure",
+    "CAPTIVE_PORTAL": "captive_portal",
+    "SECURITY": "security",
+    "COLLABORATION": "collaboration",
+    "OTHER": "other",
+}
+
+_DEFAULT_ORDER = "if_score IS NULL, if_score ASC"
+
+
+def _resolve_drilldown_order(sort: str | None, sort_dir: str | None) -> str:
+    """Build a safe ORDER BY clause from frontend sort params."""
+    if not sort or sort not in _DRILLDOWN_SORT_COLS:
+        return _DEFAULT_ORDER
+    direction = "DESC" if sort_dir == "desc" else "ASC"
+    col_expr = _DRILLDOWN_SORT_COLS[sort]
+    # For composite expressions (e.g. "if_score IS NULL, if_score"), append
+    # direction only to the last term — the NULL-sort prefix is always ASC.
+    parts = [p.strip() for p in col_expr.split(",")]
+    parts[-1] = f"{parts[-1]} {direction}"
+    return ", ".join(parts)
+
+
+@router.get("/org/families/{family}/drilldown")
+async def get_org_family_drilldown(
+    family: str,
+    wlan: str = Query(..., description="WLAN (SSID) name to scope results to. Required."),
+    page: int = Query(1, ge=1, description="Page number (1-based)"),
+    page_size: int = Query(500, ge=1, le=2000, description="Rows per page"),
+    sort: str | None = Query(None, description="Column to sort by"),
+    sort_dir: str | None = Query(None, description="Sort direction: asc or desc"),
+):
+    """
+    Org-wide per-MAC drilldown for a single device family (paginated).
+
+    Backed by the ``client_summary`` SQLite table (rebuilt each detection
+    cycle by ``client_summary_builder``). This replaces the previous path
+    which iterated every event in the 7-day window in Python.
+
+    Service-account families ("{label}.service_account") are filtered on
+    ``service_account_family`` instead of ``device_family`` so each row
+    carries the underlying hardware family in ``primary_device_family``.
     """
     if not MIST_ORG_ID or not MIST_API_TOKEN:
         raise HTTPException(status_code=500, detail="MIST_ORG_ID or MIST_API_TOKEN not configured.")
@@ -1946,198 +2103,207 @@ async def get_org_family_drilldown(family: str, wlan: str = Query(..., descripti
     sa_label = family[: -len(".service_account")] if is_sa_family else ""
 
     redis_client = _get_redis()
-    rows: list[dict] = []
-    total_if_outliers = 0
-    total_dbscan_outliers = 0
-    total_markov_outliers = 0
-    sa_member_families: set[str] = set()
-
     try:
         try:
             site_map = await _get_org_site_map(redis_client)
         except Exception:
             raise HTTPException(status_code=502, detail="Could not reach Mist API")
-
-        # Load all events once from SQLite.
-        all_events = await get_events()
-        events_by_site: dict[str, list[dict]] = defaultdict(list)
-        for evt in all_events:
-            sid = evt.get("site_id")
-            if sid and evt.get("wlan") == wlan:
-                events_by_site[sid].append(evt)
-
-        # Fetch anomalies and findings from Redis, client caches from SQLite.
-        #
-        # Fallback chain for per-site anomalies:
-        #   1. sasquatch:anomalies:{site}:{wlan}      — written by score() in Phase 4
-        #   2. sasquatch:org_anomalies:{site}:{wlan}  — written by score_org_wide() in Phase 3
-        #
-        # Phase 4 silently skips (site, wlan) combos where build_features wrote an
-        # empty feature dict (every MAC below ANOMALY_MIN_MAC_EVENTS), but Phase 3
-        # still scores those MACs via the org-wide peer pool and writes
-        # org_anomalies keyed by real MAC with an identical record shape. Without
-        # this fallback, the drilldown under-counts any alert card whose MACs were
-        # only scored org-wide — mirroring the fallback already in place in
-        # `get_mac_anomaly` (see routes.py ~2396).
-        site_ids_ordered = list(site_map.keys())
-        pipe = redis_client.pipeline()
-        for sid in site_ids_ordered:
-            pipe.get(_anomalies_redis_key(sid, wlan))
-            pipe.get(_findings_redis_key(sid, wlan))
-            pipe.get(_org_anomalies_redis_key(sid, wlan))
-        pipeline_results = await pipe.execute()
-        anomalies_by_site = {}
-        for i, sid in enumerate(site_ids_ordered):
-            per_site_raw = pipeline_results[i * 3]
-            org_raw = pipeline_results[i * 3 + 2]
-            if per_site_raw:
-                anomalies_by_site[sid] = json.loads(per_site_raw)
-            elif org_raw:
-                anomalies_by_site[sid] = json.loads(org_raw)
-            else:
-                anomalies_by_site[sid] = None
-        findings_by_site = {
-            sid: (json.loads(pipeline_results[i * 3 + 1]) if pipeline_results[i * 3 + 1] else [])
-            for i, sid in enumerate(site_ids_ordered)
-        }
-
-        # Client cache is org-wide (MAC unique across the org) — load once.
-        org_client_cache: dict = await get_client_cache() or {}
-
-        for site_id, site_name in site_map.items():
-            anomalies_raw_data = anomalies_by_site.get(site_id)
-            if not anomalies_raw_data:
-                continue
-
-            anomalies: dict = anomalies_raw_data
-            client_cache: dict = org_client_cache
-
-            if is_sa_family:
-                # Service-account branch: gather sa records (composite "{mac}#sa"
-                # keys whose device_family equals the sa family name). Each sa
-                # record points at a real primary_mac whose events still live
-                # under the primary device_family in events_by_site.
-                site_sa_records: dict[str, dict] = {}  # primary_mac → sa anomaly record
-                for ck, data in anomalies.items():
-                    if data.get("device_family") != family:
-                        continue
-                    if not data.get("is_service_account_record"):
-                        continue
-                    primary_mac = data.get("primary_mac") or ck
-                    site_sa_records[primary_mac] = data
-
-                if not site_sa_records:
-                    continue
-
-                mac_categories: dict[str, Counter] = defaultdict(Counter)
-                mac_total: dict[str, int] = defaultdict(int)
-                for event in events_by_site.get(site_id, []):
-                    mac = (event.get("mac") or "").replace(":", "").lower()
-                    if not mac or mac not in site_sa_records:
-                        continue
-                    mac_categories[mac][event.get("event_category", "OTHER")] += 1
-                    mac_total[mac] += 1
-
-                for primary_mac, data in site_sa_records.items():
-                    is_if_outlier = data.get("is_if_outlier", False)
-                    is_dbscan_outlier = data.get("is_dbscan_outlier", False)
-                    is_markov_outlier = data.get("is_markov_outlier", False)
-                    if is_if_outlier:
-                        total_if_outliers += 1
-                    if is_dbscan_outlier:
-                        total_dbscan_outliers += 1
-                    if is_markov_outlier:
-                        total_markov_outliers += 1
-                    primary_device_family = (
-                        data.get("primary_device_family")
-                        or client_cache.get(primary_mac, {}).get("family", "Unknown")
-                    )
-                    if primary_device_family:
-                        sa_member_families.add(primary_device_family)
-                    rows.append({
-                        "mac": primary_mac,
-                        "site_id": site_id,
-                        "site_name": site_name,
-                        "if_score": data.get("if_score"),
-                        "is_if_outlier": is_if_outlier,
-                        "is_dbscan_outlier": is_dbscan_outlier,
-                        "is_markov_outlier": is_markov_outlier,
-                        "markov_episode_anomaly_ratio": data.get("markov_episode_anomaly_ratio", 0.0),
-                        "markov_scoreable_episodes": data.get("markov_scoreable_episodes", 0),
-                        "markov_anomalous_episodes": data.get("markov_anomalous_episodes", 0),
-                        "markov_reason": data.get("markov_reason"),
-                        "event_count": data.get("event_count", 0),
-                        "random_mac": data.get("random_mac", False),
-                        "client_metadata": client_cache.get(primary_mac, {}),
-                        "categories": {cat: mac_categories[primary_mac].get(cat, 0) for cat in EVENT_CATEGORIES},
-                        "total_events": mac_total.get(primary_mac, data.get("event_count", 0)),
-                        "primary_device_family": primary_device_family,
-                        "last_username": data.get("last_username", ""),
-                        "is_service_account_record": True,
-                    })
-                continue
-
-            mac_categories = defaultdict(Counter)
-            mac_total = defaultdict(int)
-            family_macs: set[str] = set()
-            for event in events_by_site.get(site_id, []):
-                if event.get("device_family") != family:
-                    continue
-                mac = (event.get("mac") or "").replace(":", "").lower()
-                if not mac:
-                    continue
-                mac_categories[mac][event.get("event_category", "OTHER")] += 1
-                mac_total[mac] += 1
-                family_macs.add(mac)
-
-            for mac, data in anomalies.items():
-                if mac not in family_macs:
-                    continue
-                is_if_outlier = data.get("is_if_outlier", False)
-                is_dbscan_outlier = data.get("is_dbscan_outlier", False)
-                is_markov_outlier = data.get("is_markov_outlier", False)
-                if is_if_outlier:
-                    total_if_outliers += 1
-                if is_dbscan_outlier:
-                    total_dbscan_outliers += 1
-                if is_markov_outlier:
-                    total_markov_outliers += 1
-                rows.append({
-                    "mac": mac,
-                    "site_id": site_id,
-                    "site_name": site_name,
-                    "if_score": data.get("if_score"),
-                    "is_if_outlier": is_if_outlier,
-                    "is_dbscan_outlier": is_dbscan_outlier,
-                    "is_markov_outlier": is_markov_outlier,
-                    "markov_episode_anomaly_ratio": data.get("markov_episode_anomaly_ratio", 0.0),
-                    "markov_scoreable_episodes": data.get("markov_scoreable_episodes", 0),
-                    "markov_anomalous_episodes": data.get("markov_anomalous_episodes", 0),
-                    "markov_reason": data.get("markov_reason"),
-                    "event_count": data.get("event_count", 0),
-                    "random_mac": data.get("random_mac", False),
-                    "client_metadata": client_cache.get(mac, {}),
-                    "categories": {cat: mac_categories[mac].get(cat, 0) for cat in EVENT_CATEGORIES},
-                    "total_events": mac_total.get(mac, data.get("event_count", 0)),
-                    "service_account": data.get("service_account"),
-                })
     finally:
         await redis_client.aclose()
 
-    if not rows:
+    filter_kw = (
+        {"service_account_family": family, "wlan": wlan}
+        if is_sa_family
+        else {"family_exact": family, "wlan": wlan}
+    )
+
+    counts = await db.count_client_summary(**filter_kw)
+    if counts["total"] == 0:
         raise HTTPException(status_code=404, detail=f"No data found for family '{family}' across any site.")
 
-    rows.sort(key=lambda x: (x["if_score"] is None, x["if_score"] or 0))
+    offset = (page - 1) * page_size
+    order = _resolve_drilldown_order(sort, sort_dir)
+    summary_rows = await db.query_client_summary(
+        **filter_kw,
+        order_by=order,
+        limit=page_size,
+        offset=offset,
+    )
+
+    sa_member_families: set[str] = set()
+    rows: list[dict] = []
+    for sr in summary_rows:
+        r = _summary_row_to_drilldown(sr, site_map)
+        if is_sa_family:
+            r["primary_device_family"] = sr.get("device_family", "Unknown")
+            r["last_username"] = sr.get("last_username", "")
+            r["is_service_account_record"] = True
+            if sr.get("device_family"):
+                sa_member_families.add(sr["device_family"])
+        rows.append(r)
+
+    total_pages = (counts["total"] + page_size - 1) // page_size
 
     return {
         "family": family,
         "family_kind": family_kind,
         "service_account_label": sa_label,
         "service_account_member_families": sorted(sa_member_families),
-        "total_count": len(rows),
-        "if_outlier_count": total_if_outliers,
-        "dbscan_outlier_count": total_dbscan_outliers,
-        "markov_outlier_count": total_markov_outliers,
+        "total_count": counts["total"],
+        "if_outlier_count": counts["if_outlier"],
+        "dbscan_outlier_count": counts["dbscan_outlier"],
+        "markov_outlier_count": counts["markov_outlier"],
+        "page": page,
+        "page_size": page_size,
+        "total_pages": total_pages,
+        "rows": rows,
+        "category_keys": list(EVENT_CATEGORIES.keys()),
+    }
+
+
+@router.get("/org/families/{family}/drilldown-all-wlans")
+async def get_org_family_drilldown_all_wlans(
+    family: str,
+    page: int = Query(1, ge=1, description="Page number (1-based)"),
+    page_size: int = Query(500, ge=1, le=2000, description="Rows per page"),
+    sort: str | None = Query(None, description="Column to sort by"),
+    sort_dir: str | None = Query(None, description="Sort direction: asc or desc"),
+):
+    """
+    Org-wide per-MAC drilldown for a single device family across ALL WLANs
+    (paginated).
+
+    Backed by the ``client_summary`` SQLite table. Each row carries a
+    ``wlan`` field; a MAC may appear once per (site, wlan) it was seen on.
+    """
+    if not MIST_ORG_ID or not MIST_API_TOKEN:
+        raise HTTPException(status_code=500, detail="MIST_ORG_ID or MIST_API_TOKEN not configured.")
+
+    is_sa_family = family.endswith(".service_account")
+    family_kind = "service_account" if is_sa_family else "device_family"
+    sa_label = family[: -len(".service_account")] if is_sa_family else ""
+
+    redis_client = _get_redis()
+    try:
+        try:
+            site_map = await _get_org_site_map(redis_client)
+        except Exception:
+            raise HTTPException(status_code=502, detail="Could not reach Mist API")
+    finally:
+        await redis_client.aclose()
+
+    filter_kw = (
+        {"service_account_family": family}
+        if is_sa_family
+        else {"family_exact": family}
+    )
+
+    counts = await db.count_client_summary(**filter_kw)
+    if counts["total"] == 0:
+        raise HTTPException(status_code=404, detail=f"No events found for family '{family}' across any site.")
+
+    offset = (page - 1) * page_size
+    order = _resolve_drilldown_order(sort, sort_dir)
+    summary_rows = await db.query_client_summary(
+        **filter_kw,
+        order_by=order,
+        limit=page_size,
+        offset=offset,
+    )
+
+    sa_member_families: set[str] = set()
+    rows: list[dict] = []
+    for sr in summary_rows:
+        r = _summary_row_to_drilldown(sr, site_map, include_wlan=True)
+        if is_sa_family:
+            r["primary_device_family"] = sr.get("device_family", "Unknown")
+            r["last_username"] = sr.get("last_username", "")
+            r["is_service_account_record"] = True
+            if sr.get("device_family"):
+                sa_member_families.add(sr["device_family"])
+        rows.append(r)
+
+    total_pages = (counts["total"] + page_size - 1) // page_size
+
+    return {
+        "family": family,
+        "family_kind": family_kind,
+        "service_account_label": sa_label,
+        "service_account_member_families": sorted(sa_member_families),
+        "total_count": counts["total"],
+        "if_outlier_count": counts["if_outlier"],
+        "dbscan_outlier_count": counts["dbscan_outlier"],
+        "markov_outlier_count": counts["markov_outlier"],
+        "page": page,
+        "page_size": page_size,
+        "total_pages": total_pages,
+        "rows": rows,
+        "category_keys": list(EVENT_CATEGORIES.keys()),
+    }
+
+
+@router.get("/org/families/search-drilldown")
+async def search_families_drilldown(
+    q: str = Query(..., description="Substring to match against device family names (case-insensitive)"),
+    page: int = Query(1, ge=1, description="Page number (1-based)"),
+    page_size: int = Query(500, ge=1, le=2000, description="Rows per page"),
+    sort: str | None = Query(None, description="Column to sort by"),
+    sort_dir: str | None = Query(None, description="Sort direction: asc or desc"),
+):
+    """
+    Multi-family drilldown: returns a paginated slice of the all-WLANs
+    drilldown for every device family whose name contains ``q``. Backed by
+    the ``client_summary`` table with a case-insensitive LIKE query.
+    """
+    if not MIST_ORG_ID or not MIST_API_TOKEN:
+        raise HTTPException(status_code=500, detail="MIST_ORG_ID or MIST_API_TOKEN not configured.")
+
+    norm = (q or "").strip().lower()
+    if len(norm) < 2:
+        raise HTTPException(status_code=400, detail="Query must be at least 2 characters.")
+
+    redis_client = _get_redis()
+    try:
+        try:
+            site_map = await _get_org_site_map(redis_client)
+        except Exception:
+            raise HTTPException(status_code=502, detail="Could not reach Mist API")
+    finally:
+        await redis_client.aclose()
+
+    counts = await db.count_client_summary(family_substring=norm)
+    if counts["total"] == 0:
+        raise HTTPException(status_code=404, detail=f"No events found for families matching '{q}' across any site.")
+
+    offset = (page - 1) * page_size
+    order = _resolve_drilldown_order(sort, sort_dir)
+    summary_rows = await db.query_client_summary(
+        family_substring=norm,
+        order_by=order,
+        limit=page_size,
+        offset=offset,
+    )
+
+    rows: list[dict] = []
+    for sr in summary_rows:
+        r = _summary_row_to_drilldown(sr, site_map, include_wlan=True, include_device_family=True)
+        rows.append(r)
+
+    total_pages = (counts["total"] + page_size - 1) // page_size
+
+    return {
+        "family": q,
+        "family_kind": "search",
+        "service_account_label": "",
+        "service_account_member_families": [],
+        "matched_families": counts["families"],
+        "total_count": counts["total"],
+        "if_outlier_count": counts["if_outlier"],
+        "dbscan_outlier_count": counts["dbscan_outlier"],
+        "markov_outlier_count": counts["markov_outlier"],
+        "page": page,
+        "page_size": page_size,
+        "total_pages": total_pages,
         "rows": rows,
         "category_keys": list(EVENT_CATEGORIES.keys()),
     }
@@ -2766,11 +2932,11 @@ async def get_mac_anomaly(site_id: str, mac: str, wlan: str = Query(..., descrip
     mac_normalized = mac.replace(":", "").lower()
 
     # Fallback chain for per-MAC anomaly scores:
-    #   1. Per-site anomalies (written by score() in Phase 4 of the org pipeline)
-    #   2. Org anomalies (written by score_org_wide() in Phase 3 — explicitly persisted
+    #   1. Per-site anomalies (written by score() in Phase 3 of the org pipeline)
+    #   2. Org anomalies (written by score_org_wide() in Phase 4 — explicitly persisted
     #      per-site keyed by MAC for exactly this drilldown use case)
     # The per-site key is absent for many (site, wlan) combinations in practice
-    # (e.g. when Phase 4 was skipped or the WLAN had too few peers to run per-family
+    # (e.g. when per-site score() was skipped or the WLAN had too few peers to run per-family
     # IF), so falling back to the org-wide record lets drilldown work whenever ANY
     # scoring pass covered this MAC. If neither pass includes it, we still return
     # a useful payload — events + metadata with empty scores — rather than 404'ing.

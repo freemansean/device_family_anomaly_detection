@@ -132,6 +132,7 @@ sasquatch/
 │   ├── health_scorer.py         # Per-family health score (separate from anomaly pipeline)
 │   ├── webhook_dispatcher.py    # Dual-gate alert dispatch (anomaly + health)
 │   ├── alert_tracker.py         # Persistent alert session history (7-day, per-site)
+│   ├── client_summary_builder.py # Materialised per-(mac, site, wlan) summary table builder (Phase 5b)
 │   ├── summary_cache.py         # Pre-computed dashboard aggregates (org/site overview, alerts, findings)
 │   ├── scheduler.py             # APScheduler job definitions
 │   └── api/
@@ -237,6 +238,74 @@ Used by the daily `client_refresh_job` to expose "last refreshed" in the
 admin UI and by the event collector startup check (the cache must have
 been written at least once before any collect runs).
 
+**`client_summary` table** — per-(mac, site_id, wlan) materialised rollup
+rebuilt each detection cycle by `client_summary_builder.py`. Backs the
+Device Family Drilldown and Device Family Search endpoints, replacing the
+previous O(n) full-event-table scan with an indexed SQLite SELECT.
+
+```sql
+CREATE TABLE client_summary (
+    mac TEXT NOT NULL,
+    site_id TEXT NOT NULL,
+    wlan TEXT NOT NULL,
+    org_id TEXT NOT NULL DEFAULT '',
+
+    device_family TEXT,
+    device_model TEXT,
+    device_manufacturer TEXT,
+    last_username TEXT,
+    service_account_family TEXT,
+    random_mac BOOLEAN DEFAULT FALSE,
+
+    health_score REAL,
+    if_score REAL,
+    centroid_dist_score REAL,
+    dbscan_label INTEGER,
+    is_if_outlier BOOLEAN DEFAULT FALSE,
+    is_dbscan_outlier BOOLEAN DEFAULT FALSE,
+    is_family_outlier BOOLEAN DEFAULT FALSE,
+    is_markov_outlier BOOLEAN DEFAULT FALSE,
+    markov_reason TEXT,
+    service_alarm BOOLEAN DEFAULT FALSE,
+
+    total_events INTEGER DEFAULT 0,
+    dhcp_success INTEGER DEFAULT 0,
+    dhcp_failure INTEGER DEFAULT 0,
+    dns_success INTEGER DEFAULT 0,
+    dns_failure INTEGER DEFAULT 0,
+    auth_success INTEGER DEFAULT 0,
+    auth_failure INTEGER DEFAULT 0,
+    roam_success INTEGER DEFAULT 0,
+    roam_failure INTEGER DEFAULT 0,
+    disassoc INTEGER DEFAULT 0,
+    arp_success INTEGER DEFAULT 0,
+    arp_failure INTEGER DEFAULT 0,
+    captive_portal INTEGER DEFAULT 0,
+    security INTEGER DEFAULT 0,
+    collaboration INTEGER DEFAULT 0,
+    other INTEGER DEFAULT 0,
+
+    first_seen REAL,
+    last_seen REAL,
+    built_at REAL NOT NULL,
+
+    PRIMARY KEY (mac, site_id, wlan)
+);
+
+CREATE INDEX idx_summary_family ON client_summary(device_family);
+CREATE INDEX idx_summary_family_wlan ON client_summary(device_family, wlan);
+CREATE INDEX idx_summary_site_wlan ON client_summary(site_id, wlan);
+CREATE INDEX idx_summary_health ON client_summary(health_score);
+CREATE INDEX idx_summary_username ON client_summary(last_username);
+CREATE INDEX idx_summary_sa_family ON client_summary(service_account_family);
+CREATE INDEX idx_summary_mac ON client_summary(mac);
+```
+
+Rebuild strategy: truncate-and-rebuild per `(site_id, wlan)` each detection
+cycle in Phase 5b. After rebuilding all active scopes, stale rows for scopes
+no longer in the events table are swept. The table is never read during
+detection — only by the drilldown API routes.
+
 **Migrations** — `db._init_schema()` runs all `CREATE TABLE IF NOT EXISTS`
 DDL on startup, then runs forward-only migration helpers
 (`_migrate_clients_to_org_scope`, `_migrate_clients_add_last_username`)
@@ -252,6 +321,8 @@ migrations idempotent and additive.
   `has_org_client_cache`, `search_clients_by_mac_prefix`,
   `delete_clients_for_org`, `get_service_account_usernames`,
   `normalize_username` (sync)
+- Client summary: `upsert_client_summaries`, `delete_client_summaries_for_scope`,
+  `delete_client_summaries_not_in`, `query_client_summary`
 
 ---
 

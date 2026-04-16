@@ -123,6 +123,62 @@ CREATE TABLE IF NOT EXISTS client_refresh_log (
     refreshed_at REAL NOT NULL,
     client_count INTEGER NOT NULL DEFAULT 0
 );
+
+CREATE TABLE IF NOT EXISTS client_summary (
+    mac TEXT NOT NULL,
+    site_id TEXT NOT NULL,
+    wlan TEXT NOT NULL,
+    org_id TEXT NOT NULL DEFAULT '',
+
+    device_family TEXT,
+    device_model TEXT,
+    device_manufacturer TEXT,
+    last_username TEXT,
+    service_account_family TEXT,
+    random_mac BOOLEAN DEFAULT FALSE,
+
+    health_score REAL,
+    if_score REAL,
+    centroid_dist_score REAL,
+    dbscan_label INTEGER,
+    is_if_outlier BOOLEAN DEFAULT FALSE,
+    is_dbscan_outlier BOOLEAN DEFAULT FALSE,
+    is_family_outlier BOOLEAN DEFAULT FALSE,
+    is_markov_outlier BOOLEAN DEFAULT FALSE,
+    markov_reason TEXT,
+    service_alarm BOOLEAN DEFAULT FALSE,
+
+    total_events INTEGER DEFAULT 0,
+    dhcp_success INTEGER DEFAULT 0,
+    dhcp_failure INTEGER DEFAULT 0,
+    dns_success INTEGER DEFAULT 0,
+    dns_failure INTEGER DEFAULT 0,
+    auth_success INTEGER DEFAULT 0,
+    auth_failure INTEGER DEFAULT 0,
+    roam_success INTEGER DEFAULT 0,
+    roam_failure INTEGER DEFAULT 0,
+    disassoc INTEGER DEFAULT 0,
+    arp_success INTEGER DEFAULT 0,
+    arp_failure INTEGER DEFAULT 0,
+    captive_portal INTEGER DEFAULT 0,
+    security INTEGER DEFAULT 0,
+    collaboration INTEGER DEFAULT 0,
+    other INTEGER DEFAULT 0,
+
+    first_seen REAL,
+    last_seen REAL,
+    built_at REAL NOT NULL,
+
+    PRIMARY KEY (mac, site_id, wlan)
+);
+
+CREATE INDEX IF NOT EXISTS idx_summary_family ON client_summary(device_family);
+CREATE INDEX IF NOT EXISTS idx_summary_family_wlan ON client_summary(device_family, wlan);
+CREATE INDEX IF NOT EXISTS idx_summary_site_wlan ON client_summary(site_id, wlan);
+CREATE INDEX IF NOT EXISTS idx_summary_health ON client_summary(health_score);
+CREATE INDEX IF NOT EXISTS idx_summary_username ON client_summary(last_username);
+CREATE INDEX IF NOT EXISTS idx_summary_sa_family ON client_summary(service_account_family);
+CREATE INDEX IF NOT EXISTS idx_summary_mac ON client_summary(mac);
 """
 
 
@@ -667,6 +723,65 @@ async def search_clients_by_mac_prefix(
     return results
 
 
+async def search_families_by_prefix(
+    prefix: str,
+    org_id: Optional[str] = None,
+    limit: int = 50,
+) -> list[dict]:
+    """
+    Substring-match device family names in the events table (within the
+    retention window) and return each matching family with its distinct MAC
+    count.
+
+    Counting from events rather than the clients table ensures the number
+    shown in the autocomplete dropdown matches what the all-WLANs drilldown
+    will actually display — only MACs with recent events, not the full
+    client cache (which includes MACs that haven't been seen in weeks).
+
+    Matching is case-insensitive and unanchored (``LIKE '%prefix%'``) so the
+    operator can type any distinctive chunk of a composite family name such
+    as ``"MacBook"`` to find ``"Apple | MacBook Pro | macOS 14"``.
+
+    Returns a list of ``{"family": str, "mac_count": int}`` dicts sorted by
+    ``mac_count`` descending so the most populous matches land at the top of
+    the autocomplete.
+    """
+    norm = (prefix or "").strip().lower()
+    if len(norm) < 2:
+        return []
+
+    conn = await get_connection()
+    cutoff = time.time() - EVENTS_RETENTION_SECONDS
+    like_pattern = f"%{norm}%"
+
+    if org_id:
+        rows = await conn.execute_fetchall(
+            """SELECT device_family, COUNT(DISTINCT mac) AS mac_count
+               FROM events
+               WHERE org_id = ? AND timestamp >= ?
+                 AND device_family IS NOT NULL AND device_family != ''
+                 AND LOWER(device_family) LIKE ?
+               GROUP BY device_family
+               ORDER BY mac_count DESC, device_family ASC
+               LIMIT ?""",
+            (org_id, cutoff, like_pattern, int(limit)),
+        )
+    else:
+        rows = await conn.execute_fetchall(
+            """SELECT device_family, COUNT(DISTINCT mac) AS mac_count
+               FROM events
+               WHERE timestamp >= ?
+                 AND device_family IS NOT NULL AND device_family != ''
+                 AND LOWER(device_family) LIKE ?
+               GROUP BY device_family
+               ORDER BY mac_count DESC, device_family ASC
+               LIMIT ?""",
+            (cutoff, like_pattern, int(limit)),
+        )
+
+    return [{"family": row[0], "mac_count": int(row[1])} for row in rows]
+
+
 async def delete_clients_for_org(org_id: str) -> int:
     """Delete all client records for an org. Returns row count deleted."""
     conn = await get_connection()
@@ -674,6 +789,243 @@ async def delete_clients_for_org(org_id: str) -> int:
     await conn.execute("DELETE FROM client_refresh_log WHERE org_id = ?", (org_id,))
     await conn.commit()
     return cursor.rowcount
+
+
+# ---------------------------------------------------------------------------
+# Client summary (per-device materialised rollup for drilldowns)
+# ---------------------------------------------------------------------------
+
+# Column order used by both the INSERT and the row-dict adapter below.
+_CLIENT_SUMMARY_COLS: tuple[str, ...] = (
+    "mac", "site_id", "wlan", "org_id",
+    "device_family", "device_model", "device_manufacturer",
+    "last_username", "service_account_family", "random_mac",
+    "health_score", "if_score", "centroid_dist_score", "dbscan_label",
+    "is_if_outlier", "is_dbscan_outlier", "is_family_outlier",
+    "is_markov_outlier", "markov_reason", "service_alarm",
+    "total_events",
+    "dhcp_success", "dhcp_failure",
+    "dns_success", "dns_failure",
+    "auth_success", "auth_failure",
+    "roam_success", "roam_failure",
+    "disassoc",
+    "arp_success", "arp_failure",
+    "captive_portal", "security", "collaboration", "other",
+    "first_seen", "last_seen", "built_at",
+)
+
+
+async def upsert_client_summaries(rows: list[dict]) -> int:
+    """
+    Bulk-upsert per-(mac, site_id, wlan) summary rows.
+
+    Each row dict must carry the keys in ``_CLIENT_SUMMARY_COLS``; missing
+    keys default to ``None``. Uses ``INSERT OR REPLACE`` so the primary key
+    upsert is idempotent — callers following the truncate-and-rebuild pattern
+    (see ``delete_client_summaries_for_scope``) will typically have emptied
+    the scope first.
+
+    Returns number of rows written.
+    """
+    if not rows:
+        return 0
+    conn = await get_connection()
+    placeholders = ", ".join("?" * len(_CLIENT_SUMMARY_COLS))
+    col_list = ", ".join(_CLIENT_SUMMARY_COLS)
+    tuples = [tuple(r.get(c) for c in _CLIENT_SUMMARY_COLS) for r in rows]
+    await conn.executemany(
+        f"INSERT OR REPLACE INTO client_summary ({col_list}) VALUES ({placeholders})",
+        tuples,
+    )
+    await conn.commit()
+    return len(tuples)
+
+
+async def delete_client_summaries_for_scope(site_id: str, wlan: str) -> int:
+    """Delete every summary row for a single (site_id, wlan) scope."""
+    conn = await get_connection()
+    cursor = await conn.execute(
+        "DELETE FROM client_summary WHERE site_id = ? AND wlan = ?",
+        (site_id, wlan),
+    )
+    await conn.commit()
+    return cursor.rowcount
+
+
+async def delete_client_summaries_not_in(scopes: list[tuple[str, str]]) -> int:
+    """
+    Delete any summary row whose (site_id, wlan) is not in ``scopes``.
+
+    Called at the tail of a detection cycle to drop rows for scopes that no
+    longer have events (e.g. a WLAN was removed, or a site aged out of the
+    retention window). Without this sweep, stale rows would persist and pollute
+    drilldown results.
+    """
+    conn = await get_connection()
+    if not scopes:
+        cursor = await conn.execute("DELETE FROM client_summary")
+        await conn.commit()
+        return cursor.rowcount
+    # Build a VALUES list for anti-join; SQLite caps variable count at 999,
+    # so chunk if needed. In practice scopes is O(sites * wlans) ~= low hundreds.
+    deleted = 0
+    chunk = 200
+    for i in range(0, len(scopes), chunk):
+        batch = scopes[i:i + chunk]
+        placeholders = ", ".join("(?, ?)" for _ in batch)
+        params: list = []
+        for sid, w in batch:
+            params.extend([sid, w])
+        # Two-step: collect ids first, then delete — simpler than NOT IN VALUES.
+        pass
+    # Simpler and correct: fetch every (site, wlan) present, delete the diff.
+    existing = await conn.execute_fetchall(
+        "SELECT DISTINCT site_id, wlan FROM client_summary"
+    )
+    keep = {(s, w) for s, w in scopes}
+    to_delete = [(s, w) for (s, w) in existing if (s, w) not in keep]
+    for sid, w in to_delete:
+        cursor = await conn.execute(
+            "DELETE FROM client_summary WHERE site_id = ? AND wlan = ?",
+            (sid, w),
+        )
+        deleted += cursor.rowcount
+    await conn.commit()
+    return deleted
+
+
+def _row_to_summary_dict(row) -> dict:
+    """Adapt an aiosqlite.Row from a SELECT * into a plain dict."""
+    return {c: row[i] for i, c in enumerate(_CLIENT_SUMMARY_COLS)}
+
+
+def _summary_where(
+    *,
+    family_exact: Optional[str] = None,
+    family_substring: Optional[str] = None,
+    wlan: Optional[str] = None,
+    site_id: Optional[str] = None,
+    service_account_family: Optional[str] = None,
+    last_username: Optional[str] = None,
+) -> tuple[str, list]:
+    """Build a WHERE clause + param list for client_summary queries."""
+    conditions: list[str] = []
+    params: list = []
+    if family_exact is not None:
+        conditions.append("device_family = ?")
+        params.append(family_exact)
+    if family_substring is not None:
+        conditions.append("LOWER(device_family) LIKE ?")
+        params.append(f"%{family_substring.lower()}%")
+    if wlan is not None:
+        conditions.append("wlan = ?")
+        params.append(wlan)
+    if site_id is not None:
+        conditions.append("site_id = ?")
+        params.append(site_id)
+    if service_account_family is not None:
+        conditions.append("service_account_family = ?")
+        params.append(service_account_family)
+    if last_username is not None:
+        conditions.append("last_username = ?")
+        params.append(last_username)
+    where = (" WHERE " + " AND ".join(conditions)) if conditions else ""
+    return where, params
+
+
+async def query_client_summary(
+    *,
+    family_exact: Optional[str] = None,
+    family_substring: Optional[str] = None,
+    wlan: Optional[str] = None,
+    site_id: Optional[str] = None,
+    service_account_family: Optional[str] = None,
+    last_username: Optional[str] = None,
+    limit: Optional[int] = None,
+    offset: Optional[int] = None,
+    order_by: Optional[str] = None,
+) -> list[dict]:
+    """
+    Query the client_summary table with optional filters.
+
+    - ``family_exact``: exact match on device_family (used by the WLAN-scoped
+      drilldown when the UI passes a single family).
+    - ``family_substring``: case-insensitive substring match on device_family
+      (used by the search-drilldown substring endpoint).
+    - ``wlan`` / ``site_id``: scope filters.
+    - ``service_account_family`` / ``last_username``: back the service-account
+      drilldown and future per-username filters.
+    - ``limit``: optional row cap.
+    - ``offset``: skip this many rows (used with ``limit`` for pagination).
+    - ``order_by``: raw SQL ORDER BY clause (e.g. ``"if_score ASC"``).
+
+    Returns a list of dicts, one per row, keyed by ``_CLIENT_SUMMARY_COLS``.
+    """
+    where, params = _summary_where(
+        family_exact=family_exact, family_substring=family_substring,
+        wlan=wlan, site_id=site_id, service_account_family=service_account_family,
+        last_username=last_username,
+    )
+
+    order_sql = f" ORDER BY {order_by}" if order_by else ""
+    limit_sql = f" LIMIT {int(limit)}" if limit is not None else ""
+    offset_sql = f" OFFSET {int(offset)}" if offset is not None else ""
+    sql = f"SELECT * FROM client_summary{where}{order_sql}{limit_sql}{offset_sql}"
+
+    conn = await get_connection()
+    rows = await conn.execute_fetchall(sql, params)
+    return [_row_to_summary_dict(r) for r in rows]
+
+
+async def count_client_summary(
+    *,
+    family_exact: Optional[str] = None,
+    family_substring: Optional[str] = None,
+    wlan: Optional[str] = None,
+    site_id: Optional[str] = None,
+    service_account_family: Optional[str] = None,
+    last_username: Optional[str] = None,
+) -> dict:
+    """
+    Return aggregate counts for a client_summary query without fetching rows.
+
+    Returns ``{total, if_outlier, dbscan_outlier, markov_outlier, families}``
+    where ``families`` is a sorted list of distinct device_family values.
+    """
+    where, params = _summary_where(
+        family_exact=family_exact, family_substring=family_substring,
+        wlan=wlan, site_id=site_id, service_account_family=service_account_family,
+        last_username=last_username,
+    )
+
+    conn = await get_connection()
+    row = (await conn.execute_fetchall(
+        f"SELECT COUNT(*), "
+        f"SUM(CASE WHEN is_if_outlier THEN 1 ELSE 0 END), "
+        f"SUM(CASE WHEN is_dbscan_outlier THEN 1 ELSE 0 END), "
+        f"SUM(CASE WHEN is_markov_outlier THEN 1 ELSE 0 END) "
+        f"FROM client_summary{where}",
+        params,
+    ))[0]
+
+    family_rows = await conn.execute_fetchall(
+        f"SELECT DISTINCT device_family FROM client_summary{where} "
+        f"ORDER BY device_family",
+        params,
+    )
+
+    return {
+        "total": row[0] or 0,
+        "if_outlier": row[1] or 0,
+        "dbscan_outlier": row[2] or 0,
+        "markov_outlier": row[3] or 0,
+        "families": [r[0] for r in family_rows if r[0]],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Misc org helpers
+# ---------------------------------------------------------------------------
 
 
 async def has_org_client_cache(org_id: str) -> bool:
