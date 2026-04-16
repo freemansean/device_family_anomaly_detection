@@ -9,6 +9,7 @@ event.
 """
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -248,11 +249,26 @@ async def fetch_all_clients_org(org_id: str, on_page=None) -> list[dict]:
     all_clients: list[dict] = []
     page = 0
     total_hint: int | None = None
+    # Hard ceiling — 10k pages × 1000/page = 10M clients, far larger than any real org.
+    # Guards against a malformed circular `next` cursor from Mist.
+    _MAX_PAGES = 10000
     async with httpx.AsyncClient(timeout=30.0) as client:
         while url:
+            if page >= _MAX_PAGES:
+                raise RuntimeError(
+                    f"Org client pagination exceeded {_MAX_PAGES} pages — aborting. "
+                    f"Last URL: {url[:200]}"
+                )
             resp = await client.get(url, headers=_auth_headers())
             resp.raise_for_status()
-            data = resp.json()
+            try:
+                data = resp.json()
+            except json.JSONDecodeError as exc:
+                snippet = resp.text[:200] if resp.text else "<empty>"
+                raise RuntimeError(
+                    f"Org client fetch: non-JSON response on page {page + 1}: {exc}. "
+                    f"Body prefix: {snippet}"
+                ) from exc
             batch = data.get("results", [])
             # Capture total record count the first time the API reports it —
             # Mist does not necessarily include it on every page, so latch the
