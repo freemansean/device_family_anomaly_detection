@@ -3,12 +3,40 @@ import { apiFetch } from "../api";
 import { familyColor } from "./familyColors";
 import OrgFamilyDrilldown from "./OrgFamilyDrilldown";
 import OrgClusterViz from "./OrgClusterViz";
+import ColumnSelector, { loadVisibleFromStorage } from "./ColumnSelector";
 
 const CATEGORIES = [
   "DHCP_SUCCESS", "DHCP_FAILURE", "DNS_SUCCESS", "DNS_FAILURE",
   "AUTH_SUCCESS", "AUTH_FAILURE", "ROAM_SUCCESS", "ROAM_FAILURE",
   "DISASSOC", "ARP_SUCCESS", "ARP_FAILURE", "CAPTIVE_PORTAL", "SECURITY", "COLLABORATION", "OTHER",
 ];
+
+const COLUMN_DEFS = [
+  { key: "family",        label: "Device Family", required: true },
+  { key: "pca",           label: "PCA" },
+  { key: "count",         label: "Count" },
+  { key: "events",        label: "Events" },
+  { key: "sites",         label: "Sites" },
+  { key: "if",            label: "IF" },
+  { key: "db",            label: "DB" },
+  { key: "markov",        label: "Markov" },
+  { key: "health",        label: "Health" },
+  { key: "service_alarm", label: "Service Alarm" },
+  ...CATEGORIES.map(c => ({ key: `cat_${c}`, label: c })),
+];
+
+const DEFAULT_VISIBLE = {
+  family: true, pca: true, count: true, events: true, sites: true,
+  if: true, db: true, markov: true, health: true, service_alarm: true,
+  cat_DHCP_SUCCESS: true, cat_DHCP_FAILURE: true,
+  cat_DNS_SUCCESS: false, cat_DNS_FAILURE: false,
+  cat_AUTH_SUCCESS: true, cat_AUTH_FAILURE: true,
+  cat_ROAM_SUCCESS: true, cat_ROAM_FAILURE: true,
+  cat_DISASSOC: false,
+  cat_ARP_SUCCESS: false, cat_ARP_FAILURE: false,
+  cat_CAPTIVE_PORTAL: false, cat_SECURITY: false,
+  cat_COLLABORATION: false, cat_OTHER: false,
+};
 
 const SEVERITY_COLOR = { significant: "#e05555", moderate: "#e0a835", minimal: "#4ea8c4" };
 const SEVERITY_RANK  = { significant: 3, moderate: 2, minimal: 1 };
@@ -111,6 +139,9 @@ export default function OrgFamilyInsights({ apiBase, refreshToken, onMacSiteSele
   const [sortDir, setSortDir]         = useState("desc");
   const [pcaFamilies, setPcaFamilies] = useState(null); // null until seeded from data
   const [pcaSeeded, setPcaSeeded]     = useState(false);
+  const [visibleCols, setVisibleCols] = useState(() =>
+    loadVisibleFromStorage("orgFamilyInsights.columns.v1", DEFAULT_VISIBLE)
+  );
 
   const load = useCallback(() => {
     setLoading(true);
@@ -284,6 +315,13 @@ export default function OrgFamilyInsights({ apiBase, refreshToken, onMacSiteSele
         >
           uncheck all PCA
         </span>
+        <div style={{ flex: 1 }} />
+        <ColumnSelector
+          columns={COLUMN_DEFS}
+          visible={visibleCols}
+          onChange={setVisibleCols}
+          storageKey="orgFamilyInsights.columns.v1"
+        />
       </div>
 
       <div style={{ display: "flex", gap: "16px", alignItems: "flex-start" }}>
@@ -291,89 +329,111 @@ export default function OrgFamilyInsights({ apiBase, refreshToken, onMacSiteSele
         <table style={{ borderCollapse: "collapse", fontSize: "12px" }}>
           <thead>
             <tr>
-              <th
-                style={{ ...thStyle, cursor: "pointer", userSelect: "none" }}
-                onClick={() => handleSort("family")}
-              >
-                Device Family<SortIndicator active={sortKey === "family"} dir={sortDir} />
-              </th>
-              <th
-                style={{ ...thStyle, whiteSpace: "nowrap", textAlign: "center" }}
-                title="PCA — include this family in the PCA cluster view on the right."
-              >
-                PCA
-              </th>
-              <th
-                style={{ ...thStyle, whiteSpace: "nowrap", cursor: "pointer", userSelect: "none" }}
-                title="Count — total MACs in this device family across all sites."
-                onClick={() => handleSort("count")}
-              >
-                Count<SortIndicator active={sortKey === "count"} dir={sortDir} />
-              </th>
-              <th
-                style={{ ...thStyle, whiteSpace: "nowrap", color: "#444", cursor: "pointer", userSelect: "none" }}
-                onClick={() => handleSort("events")}
-              >
-                Events<SortIndicator active={sortKey === "events"} dir={sortDir} />
-              </th>
-              <th
-                style={{ ...thStyle, whiteSpace: "nowrap", color: "#444", cursor: "pointer", userSelect: "none" }}
-                onClick={() => handleSort("sites")}
-              >
-                Sites<SortIndicator active={sortKey === "sites"} dir={sortDir} />
-              </th>
-              <th
-                style={{ ...thStyle, whiteSpace: "nowrap", cursor: "pointer", userSelect: "none" }}
-                title="Isolation Forest centroid detection — flags the whole family as behaving differently from all other families (any site)."
-                onClick={() => handleSort("anomaly")}
-              >
-                IF<SortIndicator active={sortKey === "anomaly"} dir={sortDir} />
-              </th>
-              <th
-                style={{ ...thStyle, whiteSpace: "nowrap", cursor: "pointer", userSelect: "none" }}
-                title="DBSCAN — worst fraction of individual MACs flagged as site-wide behavioral outliers across all sites."
-                onClick={() => handleSort("dbscan")}
-              >
-                DB<SortIndicator active={sortKey === "dbscan"} dir={sortDir} />
-              </th>
-              <th
-                style={{ ...thStyle, whiteSpace: "nowrap", cursor: "pointer", userSelect: "none" }}
-                title="Markov Chain episode analysis — flags families where clients show anomalous event chain patterns."
-                onClick={() => handleSort("markov")}
-              >
-                Markov<SortIndicator active={sortKey === "markov"} dir={sortDir} />
-              </th>
-              <th
-                style={{ ...thStyle, whiteSpace: "nowrap", minWidth: "70px", cursor: "pointer", userSelect: "none" }}
-                title="Family health score — volume-weighted failure rate across AUTH, ROAM, DHCP, DNS, ARP org-wide. 1.0 = no failures."
-                onClick={() => handleSort("health")}
-              >
-                Health<SortIndicator active={sortKey === "health"} dir={sortDir} />
-              </th>
-              <th
-                style={{ ...thStyle, whiteSpace: "nowrap", minWidth: "80px", cursor: "pointer", userSelect: "none" }}
-                title="Service Alarm — services where >50% of clients in this family are individually unhealthy across the entire org-wide device-family scope. Sort by alarm count (ties broken by worst health)."
-                onClick={() => handleSort("service_alarm")}
-              >
-                Service Alarm<SortIndicator active={sortKey === "service_alarm"} dir={sortDir} />
-              </th>
-              {CATEGORIES.map(c => (
+              {visibleCols.family && (
                 <th
-                  key={c}
-                  style={{
-                    ...thStyle,
-                    writingMode: "vertical-rl",
-                    transform: "rotate(180deg)",
-                    padding: "4px 2px",
-                    fontSize: "10px",
-                    cursor: "pointer",
-                    userSelect: "none",
-                    color: sortKey === c ? "#7ec8e3" : undefined,
-                  }}
-                  onClick={() => handleSort(c)}
+                  style={{ ...thStyle, cursor: "pointer", userSelect: "none" }}
+                  onClick={() => handleSort("family")}
                 >
-                  {c}
+                  Device Family<SortIndicator active={sortKey === "family"} dir={sortDir} />
                 </th>
+              )}
+              {visibleCols.pca && (
+                <th
+                  style={{ ...thStyle, whiteSpace: "nowrap", textAlign: "center" }}
+                  title="PCA — include this family in the PCA cluster view on the right."
+                >
+                  PCA
+                </th>
+              )}
+              {visibleCols.count && (
+                <th
+                  style={{ ...thStyle, whiteSpace: "nowrap", cursor: "pointer", userSelect: "none" }}
+                  title="Count — total MACs in this device family across all sites."
+                  onClick={() => handleSort("count")}
+                >
+                  Count<SortIndicator active={sortKey === "count"} dir={sortDir} />
+                </th>
+              )}
+              {visibleCols.events && (
+                <th
+                  style={{ ...thStyle, whiteSpace: "nowrap", color: "#444", cursor: "pointer", userSelect: "none" }}
+                  onClick={() => handleSort("events")}
+                >
+                  Events<SortIndicator active={sortKey === "events"} dir={sortDir} />
+                </th>
+              )}
+              {visibleCols.sites && (
+                <th
+                  style={{ ...thStyle, whiteSpace: "nowrap", color: "#444", cursor: "pointer", userSelect: "none" }}
+                  onClick={() => handleSort("sites")}
+                >
+                  Sites<SortIndicator active={sortKey === "sites"} dir={sortDir} />
+                </th>
+              )}
+              {visibleCols.if && (
+                <th
+                  style={{ ...thStyle, whiteSpace: "nowrap", cursor: "pointer", userSelect: "none" }}
+                  title="Isolation Forest centroid detection — flags the whole family as behaving differently from all other families (any site)."
+                  onClick={() => handleSort("anomaly")}
+                >
+                  IF<SortIndicator active={sortKey === "anomaly"} dir={sortDir} />
+                </th>
+              )}
+              {visibleCols.db && (
+                <th
+                  style={{ ...thStyle, whiteSpace: "nowrap", cursor: "pointer", userSelect: "none" }}
+                  title="DBSCAN — worst fraction of individual MACs flagged as site-wide behavioral outliers across all sites."
+                  onClick={() => handleSort("dbscan")}
+                >
+                  DB<SortIndicator active={sortKey === "dbscan"} dir={sortDir} />
+                </th>
+              )}
+              {visibleCols.markov && (
+                <th
+                  style={{ ...thStyle, whiteSpace: "nowrap", cursor: "pointer", userSelect: "none" }}
+                  title="Markov Chain episode analysis — flags families where clients show anomalous event chain patterns."
+                  onClick={() => handleSort("markov")}
+                >
+                  Markov<SortIndicator active={sortKey === "markov"} dir={sortDir} />
+                </th>
+              )}
+              {visibleCols.health && (
+                <th
+                  style={{ ...thStyle, whiteSpace: "nowrap", minWidth: "70px", cursor: "pointer", userSelect: "none" }}
+                  title="Family health score — volume-weighted failure rate across AUTH, ROAM, DHCP, DNS, ARP org-wide. 1.0 = no failures."
+                  onClick={() => handleSort("health")}
+                >
+                  Health<SortIndicator active={sortKey === "health"} dir={sortDir} />
+                </th>
+              )}
+              {visibleCols.service_alarm && (
+                <th
+                  style={{ ...thStyle, whiteSpace: "nowrap", minWidth: "80px", cursor: "pointer", userSelect: "none" }}
+                  title="Service Alarm — services where >50% of clients in this family are individually unhealthy across the entire org-wide device-family scope. Sort by alarm count (ties broken by worst health)."
+                  onClick={() => handleSort("service_alarm")}
+                >
+                  Service Alarm<SortIndicator active={sortKey === "service_alarm"} dir={sortDir} />
+                </th>
+              )}
+              {CATEGORIES.map(c => (
+                visibleCols[`cat_${c}`] && (
+                  <th
+                    key={c}
+                    style={{
+                      ...thStyle,
+                      writingMode: "vertical-rl",
+                      transform: "rotate(180deg)",
+                      padding: "4px 2px",
+                      fontSize: "10px",
+                      cursor: "pointer",
+                      userSelect: "none",
+                      color: sortKey === c ? "#7ec8e3" : undefined,
+                    }}
+                    onClick={() => handleSort(c)}
+                  >
+                    {c}
+                  </th>
+                )
               ))}
             </tr>
           </thead>
@@ -398,80 +458,92 @@ export default function OrgFamilyInsights({ apiBase, refreshToken, onMacSiteSele
               return (
                 <tr key={family} style={rowBg ? { background: rowBg } : undefined}>
                   {/* Family name — clickable to drill down */}
-                  <td
-                    style={{ ...tdStyle, whiteSpace: "nowrap", cursor: "pointer" }}
-                    onClick={() => setSelectedFamily(family)}
-                  >
-                    <span style={{
-                      display: "inline-block", width: 8, height: 8,
-                      borderRadius: "50%", background: isSaFamily ? SA_COLOR : color,
-                      marginRight: "6px", verticalAlign: "middle",
-                    }} />
-                    <span style={{ color: isSaFamily ? SA_COLOR : ((fdata.worst_dbscan_severity || isFamOut || fdata.is_family_markov_outlier_any_site) ? "#e0e0e0" : "#ccc"), textDecoration: "underline", textDecorationColor: isSaFamily ? `${SA_COLOR}55` : "#444" }}>{displayName}</span>
-                    {isSaFamily && (
-                      <span
-                        style={{ background: "transparent", color: SA_COLOR, border: `1px solid ${SA_COLOR}55`, borderRadius: "3px", padding: "0 4px", fontSize: "9px", fontWeight: "bold", letterSpacing: "0.05em", marginLeft: "6px", verticalAlign: "middle" }}
-                        title={saMembers.length ? `Spans ${saMembers.length} device families: ${saMembers.join(", ")}` : "Service account"}
-                      >
-                        SVC ACCT
-                      </span>
-                    )}
-                  </td>
+                  {visibleCols.family && (
+                    <td
+                      style={{ ...tdStyle, whiteSpace: "nowrap", cursor: "pointer" }}
+                      onClick={() => setSelectedFamily(family)}
+                    >
+                      <span style={{
+                        display: "inline-block", width: 8, height: 8,
+                        borderRadius: "50%", background: isSaFamily ? SA_COLOR : color,
+                        marginRight: "6px", verticalAlign: "middle",
+                      }} />
+                      <span style={{ color: isSaFamily ? SA_COLOR : ((fdata.worst_dbscan_severity || isFamOut || fdata.is_family_markov_outlier_any_site) ? "#e0e0e0" : "#ccc"), textDecoration: "underline", textDecorationColor: isSaFamily ? `${SA_COLOR}55` : "#444" }}>{displayName}</span>
+                      {isSaFamily && (
+                        <span
+                          style={{ background: "transparent", color: SA_COLOR, border: `1px solid ${SA_COLOR}55`, borderRadius: "3px", padding: "0 4px", fontSize: "9px", fontWeight: "bold", letterSpacing: "0.05em", marginLeft: "6px", verticalAlign: "middle" }}
+                          title={saMembers.length ? `Spans ${saMembers.length} device families: ${saMembers.join(", ")}` : "Service account"}
+                        >
+                          SVC ACCT
+                        </span>
+                      )}
+                    </td>
+                  )}
 
                   {/* PCA: include this family in the cluster viz */}
-                  <td
-                    style={{ ...tdStyle, textAlign: "center", cursor: "pointer" }}
-                    onClick={() => togglePca(family)}
-                    title={`Include ${family} in PCA visualization`}
-                  >
-                    <input
-                      type="checkbox"
-                      readOnly
-                      checked={pcaFamilies?.has(family) ?? false}
-                      style={{ cursor: "pointer", accentColor: "#2a5a7a", pointerEvents: "none" }}
-                    />
-                  </td>
+                  {visibleCols.pca && (
+                    <td
+                      style={{ ...tdStyle, textAlign: "center", cursor: "pointer" }}
+                      onClick={() => togglePca(family)}
+                      title={`Include ${family} in PCA visualization`}
+                    >
+                      <input
+                        type="checkbox"
+                        readOnly
+                        checked={pcaFamilies?.has(family) ?? false}
+                        style={{ cursor: "pointer", accentColor: "#2a5a7a", pointerEvents: "none" }}
+                      />
+                    </td>
+                  )}
 
                   {/* Count — device family size (MACs across all sites) */}
-                  <td
-                    style={{ ...tdStyle, textAlign: "right", color: "#aaa", fontSize: "11px", fontVariantNumeric: "tabular-nums" }}
-                    title={`${fdata.client_count ?? 0} MACs in ${family} across all sites`}
-                  >
-                    {fdata.client_count ?? 0}
-                  </td>
+                  {visibleCols.count && (
+                    <td
+                      style={{ ...tdStyle, textAlign: "right", color: "#aaa", fontSize: "11px", fontVariantNumeric: "tabular-nums" }}
+                      title={`${fdata.client_count ?? 0} MACs in ${family} across all sites`}
+                    >
+                      {fdata.client_count ?? 0}
+                    </td>
+                  )}
 
                   {/* Event count */}
-                  <td style={{ ...tdStyle, textAlign: "right", color: "#555", fontSize: "11px", fontVariantNumeric: "tabular-nums" }}>
-                    {fdata.total_events > 999
-                      ? `${(fdata.total_events / 1000).toFixed(1)}k`
-                      : fdata.total_events}
-                  </td>
+                  {visibleCols.events && (
+                    <td style={{ ...tdStyle, textAlign: "right", color: "#555", fontSize: "11px", fontVariantNumeric: "tabular-nums" }}>
+                      {fdata.total_events > 999
+                        ? `${(fdata.total_events / 1000).toFixed(1)}k`
+                        : fdata.total_events}
+                    </td>
+                  )}
 
                   {/* Site count */}
-                  <td style={{ ...tdStyle, textAlign: "center", color: "#555", fontSize: "11px" }}>
-                    {siteCount}/{sitesTotal}
-                  </td>
+                  {visibleCols.sites && (
+                    <td style={{ ...tdStyle, textAlign: "center", color: "#555", fontSize: "11px" }}>
+                      {siteCount}/{sitesTotal}
+                    </td>
+                  )}
 
                   {/* IF: Centroid Isolation Forest — whole-family outlier any site */}
-                  <td style={{ ...tdStyle, textAlign: "center" }}>
-                    {isFamOut ? (
-                      <span
-                        title={anomalyTip}
-                        style={{
-                          background: "#2a1a3a", color: "#b06ad4",
-                          border: "1px solid #6a3a8a", borderRadius: "3px",
-                          padding: "1px 6px", fontSize: "10px", fontWeight: "bold", cursor: "default",
-                        }}
-                      >
-                        family
-                      </span>
-                    ) : (
-                      <span style={{ color: "#2d7a4f", fontSize: "10px" }}>OK</span>
-                    )}
-                  </td>
+                  {visibleCols.if && (
+                    <td style={{ ...tdStyle, textAlign: "center" }}>
+                      {isFamOut ? (
+                        <span
+                          title={anomalyTip}
+                          style={{
+                            background: "#2a1a3a", color: "#b06ad4",
+                            border: "1px solid #6a3a8a", borderRadius: "3px",
+                            padding: "1px 6px", fontSize: "10px", fontWeight: "bold", cursor: "default",
+                          }}
+                        >
+                          family
+                        </span>
+                      ) : (
+                        <span style={{ color: "#2d7a4f", fontSize: "10px" }}>OK</span>
+                      )}
+                    </td>
+                  )}
 
                   {/* DB: DBSCAN — worst severity across sites */}
-                  {(() => {
+                  {visibleCols.db && (() => {
                     const dbSev = fdata.worst_dbscan_severity;
                     return (
                       <td style={{ ...tdStyle, textAlign: "center" }}>
@@ -501,7 +573,7 @@ export default function OrgFamilyInsights({ apiBase, refreshToken, onMacSiteSele
                   })()}
 
                   {/* Markov: chain episode anomaly any site */}
-                  {(() => {
+                  {visibleCols.markov && (() => {
                     const isMarkov = fdata.is_family_markov_outlier_any_site;
                     const mRatio   = fdata.worst_markov_ratio;
                     const mReason  = fdata.markov_family_reason;
@@ -526,7 +598,7 @@ export default function OrgFamilyInsights({ apiBase, refreshToken, onMacSiteSele
                   })()}
 
                   {/* Health score */}
-                  {(() => {
+                  {visibleCols.health && (() => {
                     const score = fdata.health_score;
                     const components = fdata.health_components ?? {};
                     const tip = score != null
@@ -554,15 +626,18 @@ export default function OrgFamilyInsights({ apiBase, refreshToken, onMacSiteSele
                   })()}
 
                   {/* Service Alarm — per-family service cards (org-wide rollup) */}
-                  <td style={{ ...tdStyle, minWidth: "80px" }}>
-                    <ServiceAlarmCards
-                      alarms={fdata.service_alarms || []}
-                      serviceHealth={fdata.service_health || {}}
-                    />
-                  </td>
+                  {visibleCols.service_alarm && (
+                    <td style={{ ...tdStyle, minWidth: "80px" }}>
+                      <ServiceAlarmCards
+                        alarms={fdata.service_alarms || []}
+                        serviceHealth={fdata.service_health || {}}
+                      />
+                    </td>
+                  )}
 
                   {/* Category cells */}
                   {CATEGORIES.map(cat => {
+                    if (!visibleCols[`cat_${cat}`]) return null;
                     const cell    = fdata.categories?.[cat];
                     const ratio   = cell?.ratio ?? 0;
                     const count   = cell?.count ?? 0;
@@ -595,39 +670,54 @@ export default function OrgFamilyInsights({ apiBase, refreshToken, onMacSiteSele
             {/* All Other Devices row */}
             {other.length > 0 && (
               <tr style={{ borderTop: "1px solid #2a2a2a" }}>
-                <td style={{ ...tdStyle, whiteSpace: "nowrap", color: "#555", fontStyle: "italic" }}>
-                  <span style={{
-                    display: "inline-block", width: 8, height: 8,
-                    borderRadius: "50%", background: "#444",
-                    marginRight: "6px", verticalAlign: "middle",
-                  }} />
-                  All Other Devices
-                  <span style={{ color: "#333", fontSize: "11px", marginLeft: "6px" }}>
-                    ({other.length} types)
-                  </span>
-                </td>
-                <td style={{ ...tdStyle, textAlign: "center" }}>
-                  <span style={{ color: "#333", fontSize: "10px" }}>—</span>
-                </td>
-                <td style={{ ...tdStyle, textAlign: "right", color: "#555", fontSize: "11px", fontVariantNumeric: "tabular-nums" }}>
-                  {otherClientCount}
-                </td>
-                <td style={{ ...tdStyle, textAlign: "right", color: "#444", fontSize: "11px" }}>
-                  {otherTotal > 999 ? `${(otherTotal / 1000).toFixed(1)}k` : otherTotal}
-                </td>
-                <td style={{ ...tdStyle }} />
-                <td style={{ ...tdStyle, textAlign: "center" }}>
-                  <span style={{ color: "#333", fontSize: "10px" }}>—</span>
-                </td>
-                <td style={{ ...tdStyle, textAlign: "center" }}>
-                  <span style={{ color: "#333", fontSize: "10px" }}>—</span>
-                </td>
-                <td style={{ ...tdStyle, textAlign: "center" }}>
-                  <span style={{ color: "#333", fontSize: "10px" }}>—</span>
-                </td>
-                <td style={tdStyle} />
-                <td style={tdStyle} />
+                {visibleCols.family && (
+                  <td style={{ ...tdStyle, whiteSpace: "nowrap", color: "#555", fontStyle: "italic" }}>
+                    <span style={{
+                      display: "inline-block", width: 8, height: 8,
+                      borderRadius: "50%", background: "#444",
+                      marginRight: "6px", verticalAlign: "middle",
+                    }} />
+                    All Other Devices
+                    <span style={{ color: "#333", fontSize: "11px", marginLeft: "6px" }}>
+                      ({other.length} types)
+                    </span>
+                  </td>
+                )}
+                {visibleCols.pca && (
+                  <td style={{ ...tdStyle, textAlign: "center" }}>
+                    <span style={{ color: "#333", fontSize: "10px" }}>—</span>
+                  </td>
+                )}
+                {visibleCols.count && (
+                  <td style={{ ...tdStyle, textAlign: "right", color: "#555", fontSize: "11px", fontVariantNumeric: "tabular-nums" }}>
+                    {otherClientCount}
+                  </td>
+                )}
+                {visibleCols.events && (
+                  <td style={{ ...tdStyle, textAlign: "right", color: "#444", fontSize: "11px" }}>
+                    {otherTotal > 999 ? `${(otherTotal / 1000).toFixed(1)}k` : otherTotal}
+                  </td>
+                )}
+                {visibleCols.sites && <td style={{ ...tdStyle }} />}
+                {visibleCols.if && (
+                  <td style={{ ...tdStyle, textAlign: "center" }}>
+                    <span style={{ color: "#333", fontSize: "10px" }}>—</span>
+                  </td>
+                )}
+                {visibleCols.db && (
+                  <td style={{ ...tdStyle, textAlign: "center" }}>
+                    <span style={{ color: "#333", fontSize: "10px" }}>—</span>
+                  </td>
+                )}
+                {visibleCols.markov && (
+                  <td style={{ ...tdStyle, textAlign: "center" }}>
+                    <span style={{ color: "#333", fontSize: "10px" }}>—</span>
+                  </td>
+                )}
+                {visibleCols.health && <td style={tdStyle} />}
+                {visibleCols.service_alarm && <td style={tdStyle} />}
                 {CATEGORIES.map(cat => {
+                  if (!visibleCols[`cat_${cat}`]) return null;
                   const count = otherCounts[cat] ?? 0;
                   const ratio = otherTotal > 0 ? count / otherTotal : 0;
                   const isFail = cat.includes("FAILURE") || cat === "SECURITY";

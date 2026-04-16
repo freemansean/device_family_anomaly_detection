@@ -1,5 +1,6 @@
 import { useState, useEffect } from "react";
 import { apiFetch } from "../api";
+import ColumnSelector, { loadVisibleFromStorage } from "./ColumnSelector";
 
 const SEVERITY_COLOR = { significant: "#e05555", moderate: "#e0a835", minimal: "#4ea8c4" };
 const SA_COLOR = "#d4a06a";
@@ -24,6 +25,38 @@ const CATEGORY_LABELS = {
 };
 
 const EVENT_CATEGORIES = Object.keys(CATEGORY_LABELS);
+
+const COLUMN_DEFS = [
+  { key: "mac",              label: "MAC", required: true },
+  { key: "primary_family",   label: "Primary Family" },
+  { key: "health",           label: "Health" },
+  { key: "service_alarm",    label: "Service Alarm" },
+  { key: "if_score",         label: "IF Score" },
+  { key: "if_flag",          label: "▲IF" },
+  { key: "dbscan",           label: "DBSCAN" },
+  { key: "markov",           label: "Markov" },
+  ...EVENT_CATEGORIES.map(c => ({ key: `cat_${c}`, label: CATEGORY_LABELS[c] })),
+  { key: "total_events",     label: "Total" },
+  { key: "model",            label: "Model" },
+  { key: "os",               label: "OS" },
+  { key: "manufacturer",     label: "Manufacturer" },
+];
+
+const DEFAULT_VISIBLE = {
+  mac: true, primary_family: true,
+  health: true, service_alarm: true, if_score: true, if_flag: true,
+  dbscan: true, markov: true,
+  cat_DHCP_SUCCESS: true, cat_DHCP_FAILURE: true,
+  cat_DNS_SUCCESS: false, cat_DNS_FAILURE: false,
+  cat_AUTH_SUCCESS: true, cat_AUTH_FAILURE: true,
+  cat_ROAM_SUCCESS: true, cat_ROAM_FAILURE: true,
+  cat_DISASSOC: false,
+  cat_ARP_SUCCESS: false, cat_ARP_FAILURE: false,
+  cat_CAPTIVE_PORTAL: false, cat_SECURITY: false,
+  cat_COLLABORATION: false, cat_OTHER: false,
+  total_events: true,
+  model: false, os: false, manufacturer: false,
+};
 
 function scoreBar(ifScore) {
   if (ifScore === null || ifScore === undefined) return null;
@@ -118,6 +151,9 @@ export default function FamilyDrilldown({ siteId, family, apiBase, onMacSelect, 
 
   const [sortCol, setSortCol] = useState("if_score");
   const [sortDir, setSortDir] = useState("desc");
+  const [visibleCols, setVisibleCols] = useState(() =>
+    loadVisibleFromStorage("familyDrilldown.columns.v1", DEFAULT_VISIBLE)
+  );
 
   useEffect(() => {
     setIfLoading(true);
@@ -252,6 +288,13 @@ export default function FamilyDrilldown({ siteId, family, apiBase, onMacSelect, 
             SVC ACCT
           </span>
         )}
+        <div style={{ flex: 1 }} />
+        <ColumnSelector
+          columns={COLUMN_DEFS}
+          visible={visibleCols}
+          onChange={setVisibleCols}
+          storageKey="familyDrilldown.columns.v1"
+        />
       </div>
 
       {ifData?.family_kind === "service_account" && ifData?.service_account_member_families?.length > 0 && (
@@ -296,25 +339,25 @@ export default function FamilyDrilldown({ siteId, family, apiBase, onMacSelect, 
                 <thead>
                   <tr>
                     {/* IF columns */}
-                    <SortTh col="mac">MAC</SortTh>
-                    {ifData.family_kind === "service_account" && (
+                    {visibleCols.mac && <SortTh col="mac">MAC</SortTh>}
+                    {visibleCols.primary_family && ifData.family_kind === "service_account" && (
                       <th style={thStyle}>Primary Family</th>
                     )}
-                    <SortTh col="health" style={{ minWidth: "90px" }}>Health</SortTh>
-                    <th style={{ ...thStyle, minWidth: "100px" }}>Service Alarm</th>
-                    <SortTh col="if_score" style={{ minWidth: "120px" }}>IF Score</SortTh>
-                    <th style={thStyle}>▲IF</th>
-                    <th style={thStyle}>DBSCAN</th>
-                    <th style={thStyle}>Markov</th>
+                    {visibleCols.health && <SortTh col="health" style={{ minWidth: "90px" }}>Health</SortTh>}
+                    {visibleCols.service_alarm && <th style={{ ...thStyle, minWidth: "100px" }}>Service Alarm</th>}
+                    {visibleCols.if_score && <SortTh col="if_score" style={{ minWidth: "120px" }}>IF Score</SortTh>}
+                    {visibleCols.if_flag && <th style={thStyle}>▲IF</th>}
+                    {visibleCols.dbscan && <th style={thStyle}>DBSCAN</th>}
+                    {visibleCols.markov && <th style={thStyle}>Markov</th>}
                     {/* Event category columns */}
                     {EVENT_CATEGORIES.map((cat) => (
-                      <SortTh key={cat} col={cat}>{CATEGORY_LABELS[cat]}</SortTh>
+                      visibleCols[`cat_${cat}`] && <SortTh key={cat} col={cat}>{CATEGORY_LABELS[cat]}</SortTh>
                     ))}
-                    <SortTh col="total_events">Total</SortTh>
+                    {visibleCols.total_events && <SortTh col="total_events">Total</SortTh>}
                     {/* Metadata */}
-                    <th style={thStyle}>Model</th>
-                    <th style={thStyle}>OS</th>
-                    <th style={thStyle}>Manufacturer</th>
+                    {visibleCols.model && <th style={thStyle}>Model</th>}
+                    {visibleCols.os && <th style={thStyle}>OS</th>}
+                    {visibleCols.manufacturer && <th style={thStyle}>Manufacturer</th>}
                   </tr>
                 </thead>
                 <tbody>
@@ -329,102 +372,120 @@ export default function FamilyDrilldown({ siteId, family, apiBase, onMacSelect, 
                         onMouseEnter={(e) => e.currentTarget.style.background = "#1a2530"}
                         onMouseLeave={(e) => e.currentTarget.style.background = rowBg}
                       >
-                        <td style={{ ...tdStyle, color: "#7ec8e3", fontFamily: "monospace", whiteSpace: "nowrap" }}>
-                          {row.mac}
-                          {row.random_mac && (
-                            <span style={{ color: "#555", fontSize: "10px", marginLeft: "6px" }}>rnd</span>
-                          )}
-                          {row.last_username && (
-                            <span style={{ color: SA_COLOR, fontSize: "10px", marginLeft: "6px", fontFamily: "monospace" }}
-                              title={`username: ${row.last_username}`}>
-                              {row.last_username}
-                            </span>
-                          )}
-                        </td>
-                        {ifData.family_kind === "service_account" && (
+                        {visibleCols.mac && (
+                          <td style={{ ...tdStyle, color: "#7ec8e3", fontFamily: "monospace", whiteSpace: "nowrap" }}>
+                            {row.mac}
+                            {row.random_mac && (
+                              <span style={{ color: "#555", fontSize: "10px", marginLeft: "6px" }}>rnd</span>
+                            )}
+                            {row.last_username && (
+                              <span style={{ color: SA_COLOR, fontSize: "10px", marginLeft: "6px", fontFamily: "monospace" }}
+                                title={`username: ${row.last_username}`}>
+                                {row.last_username}
+                              </span>
+                            )}
+                          </td>
+                        )}
+                        {visibleCols.primary_family && ifData.family_kind === "service_account" && (
                           <td style={{ ...tdStyle, color: "#888", fontSize: "11px", whiteSpace: "nowrap" }}>
                             {row.primary_device_family || "—"}
                           </td>
                         )}
-                        <td style={{ ...tdStyle, minWidth: "90px" }}>
-                          {(() => {
-                            const h = computeMacHealth(row.categories);
-                            if (h === null) return <span style={{ color: "#444" }}>—</span>;
-                            const color = healthColor(h);
-                            const pct = Math.round(h * 100);
-                            return (
-                              <div style={{ display: "flex", alignItems: "center", gap: "5px" }}>
-                                <div style={{ width: "40px", height: "6px", background: "#222", borderRadius: "2px", overflow: "hidden" }}>
-                                  <div style={{ width: `${pct}%`, height: "100%", background: color, borderRadius: "2px" }} />
+                        {visibleCols.health && (
+                          <td style={{ ...tdStyle, minWidth: "90px" }}>
+                            {(() => {
+                              const h = computeMacHealth(row.categories);
+                              if (h === null) return <span style={{ color: "#444" }}>—</span>;
+                              const color = healthColor(h);
+                              const pct = Math.round(h * 100);
+                              return (
+                                <div style={{ display: "flex", alignItems: "center", gap: "5px" }}>
+                                  <div style={{ width: "40px", height: "6px", background: "#222", borderRadius: "2px", overflow: "hidden" }}>
+                                    <div style={{ width: `${pct}%`, height: "100%", background: color, borderRadius: "2px" }} />
+                                  </div>
+                                  <span style={{ fontSize: "11px", color }}>{pct}%</span>
                                 </div>
-                                <span style={{ fontSize: "11px", color }}>{pct}%</span>
-                              </div>
-                            );
-                          })()}
-                        </td>
-                        <td style={{ ...tdStyle, minWidth: "100px" }}>
-                          <ServiceAlarmCards alarms={computeMacServiceAlarms(row.categories)} />
-                        </td>
-                        <td style={{ ...tdStyle, minWidth: "120px" }}>
-                          {bar ? (
-                            <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
-                              <div style={{ width: "60px", height: "8px", background: "#222", borderRadius: "2px", overflow: "hidden" }}>
-                                <div style={{ width: `${Math.round(bar.fraction * 100)}%`, height: "100%", background: bar.color, borderRadius: "2px" }} />
-                              </div>
-                              <span style={{ color: "#888", fontSize: "11px" }}>{row.if_score.toFixed(3)}</span>
-                            </div>
-                          ) : (
-                            <span style={{ color: "#555" }}>—</span>
-                          )}
-                        </td>
-                        <td style={{ ...tdStyle, textAlign: "center" }}>
-                          {row.is_if_outlier ? (
-                            <span style={{
-                              color: SEVERITY_COLOR.significant, fontSize: "10px",
-                              background: SEVERITY_COLOR.significant + "22", padding: "1px 5px",
-                              borderRadius: "3px", border: `1px solid ${SEVERITY_COLOR.significant}44`,
-                            }}>▲</span>
-                          ) : (
-                            <span style={{ color: "#333", fontSize: "10px" }}>—</span>
-                          )}
-                        </td>
-                        <td style={{ ...tdStyle, textAlign: "center" }}>
-                          {row.is_dbscan_outlier ? (
-                            <span style={{
-                              color: SEVERITY_COLOR.significant, fontSize: "10px",
-                              background: SEVERITY_COLOR.significant + "22", padding: "1px 5px",
-                              borderRadius: "3px", border: `1px solid ${SEVERITY_COLOR.significant}44`,
-                            }}>YES</span>
-                          ) : (
-                            <span style={{ color: "#444", fontSize: "10px" }}>—</span>
-                          )}
-                        </td>
-                        <td style={{ ...tdStyle, textAlign: "center" }}>
-                          {row.is_markov_outlier ? (
-                            <span style={{
-                              color: "#4ab0e8", fontSize: "10px",
-                              background: "#1a2a3a", padding: "1px 5px",
-                              borderRadius: "3px", border: "1px solid #2a6a8a",
-                            }}
-                              title={`Markov ${row.markov_reason || "anomaly"}${row.markov_episode_anomaly_ratio != null ? ` — ${(row.markov_episode_anomaly_ratio * 100).toFixed(0)}% of episodes anomalous` : ""}`}
-                            >
-                              {row.markov_reason || "chain"}
-                            </span>
-                          ) : (
-                            <span style={{ color: "#333", fontSize: "10px" }}>—</span>
-                          )}
-                        </td>
-                        {EVENT_CATEGORIES.map((cat) => (
-                          <td key={cat} style={{ ...tdStyle, color: (row.categories[cat] || 0) > 0 ? "#aaa" : "#333", textAlign: "right" }}>
-                            {(row.categories[cat] || 0) > 0 ? row.categories[cat] : "—"}
+                              );
+                            })()}
                           </td>
+                        )}
+                        {visibleCols.service_alarm && (
+                          <td style={{ ...tdStyle, minWidth: "100px" }}>
+                            <ServiceAlarmCards alarms={computeMacServiceAlarms(row.categories)} />
+                          </td>
+                        )}
+                        {visibleCols.if_score && (
+                          <td style={{ ...tdStyle, minWidth: "120px" }}>
+                            {bar ? (
+                              <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+                                <div style={{ width: "60px", height: "8px", background: "#222", borderRadius: "2px", overflow: "hidden" }}>
+                                  <div style={{ width: `${Math.round(bar.fraction * 100)}%`, height: "100%", background: bar.color, borderRadius: "2px" }} />
+                                </div>
+                                <span style={{ color: "#888", fontSize: "11px" }}>{row.if_score.toFixed(3)}</span>
+                              </div>
+                            ) : (
+                              <span style={{ color: "#555" }}>—</span>
+                            )}
+                          </td>
+                        )}
+                        {visibleCols.if_flag && (
+                          <td style={{ ...tdStyle, textAlign: "center" }}>
+                            {row.is_if_outlier ? (
+                              <span style={{
+                                color: SEVERITY_COLOR.significant, fontSize: "10px",
+                                background: SEVERITY_COLOR.significant + "22", padding: "1px 5px",
+                                borderRadius: "3px", border: `1px solid ${SEVERITY_COLOR.significant}44`,
+                              }}>▲</span>
+                            ) : (
+                              <span style={{ color: "#333", fontSize: "10px" }}>—</span>
+                            )}
+                          </td>
+                        )}
+                        {visibleCols.dbscan && (
+                          <td style={{ ...tdStyle, textAlign: "center" }}>
+                            {row.is_dbscan_outlier ? (
+                              <span style={{
+                                color: SEVERITY_COLOR.significant, fontSize: "10px",
+                                background: SEVERITY_COLOR.significant + "22", padding: "1px 5px",
+                                borderRadius: "3px", border: `1px solid ${SEVERITY_COLOR.significant}44`,
+                              }}>YES</span>
+                            ) : (
+                              <span style={{ color: "#444", fontSize: "10px" }}>—</span>
+                            )}
+                          </td>
+                        )}
+                        {visibleCols.markov && (
+                          <td style={{ ...tdStyle, textAlign: "center" }}>
+                            {row.is_markov_outlier ? (
+                              <span style={{
+                                color: "#4ab0e8", fontSize: "10px",
+                                background: "#1a2a3a", padding: "1px 5px",
+                                borderRadius: "3px", border: "1px solid #2a6a8a",
+                              }}
+                                title={`Markov ${row.markov_reason || "anomaly"}${row.markov_episode_anomaly_ratio != null ? ` — ${(row.markov_episode_anomaly_ratio * 100).toFixed(0)}% of episodes anomalous` : ""}`}
+                              >
+                                {row.markov_reason || "chain"}
+                              </span>
+                            ) : (
+                              <span style={{ color: "#333", fontSize: "10px" }}>—</span>
+                            )}
+                          </td>
+                        )}
+                        {EVENT_CATEGORIES.map((cat) => (
+                          visibleCols[`cat_${cat}`] && (
+                            <td key={cat} style={{ ...tdStyle, color: (row.categories[cat] || 0) > 0 ? "#aaa" : "#333", textAlign: "right" }}>
+                              {(row.categories[cat] || 0) > 0 ? row.categories[cat] : "—"}
+                            </td>
+                          )
                         ))}
-                        <td style={{ ...tdStyle, color: "#ccc", textAlign: "right", fontWeight: "500" }}>
-                          {row.total_events}
-                        </td>
-                        <td style={{ ...tdStyle, color: "#999" }}>{row.meta.model || "—"}</td>
-                        <td style={{ ...tdStyle, color: "#999" }}>{row.meta.os || "—"}</td>
-                        <td style={{ ...tdStyle, color: "#999" }}>{row.meta.manufacturer || "—"}</td>
+                        {visibleCols.total_events && (
+                          <td style={{ ...tdStyle, color: "#ccc", textAlign: "right", fontWeight: "500" }}>
+                            {row.total_events}
+                          </td>
+                        )}
+                        {visibleCols.model && <td style={{ ...tdStyle, color: "#999" }}>{row.meta.model || "—"}</td>}
+                        {visibleCols.os && <td style={{ ...tdStyle, color: "#999" }}>{row.meta.os || "—"}</td>}
+                        {visibleCols.manufacturer && <td style={{ ...tdStyle, color: "#999" }}>{row.meta.manufacturer || "—"}</td>}
                       </tr>
                     );
                   })}
