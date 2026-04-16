@@ -157,7 +157,8 @@ CREATE TABLE IF NOT EXISTS client_summary (
     auth_failure INTEGER DEFAULT 0,
     roam_success INTEGER DEFAULT 0,
     roam_failure INTEGER DEFAULT 0,
-    disassoc INTEGER DEFAULT 0,
+    disassoc_ap INTEGER DEFAULT 0,
+    disassoc_client INTEGER DEFAULT 0,
     arp_success INTEGER DEFAULT 0,
     arp_failure INTEGER DEFAULT 0,
     captive_portal INTEGER DEFAULT 0,
@@ -228,11 +229,38 @@ async def _migrate_clients_add_last_username(conn: aiosqlite.Connection) -> None
     await conn.commit()
 
 
+async def _migrate_client_summary_split_disassoc(conn: aiosqlite.Connection) -> None:
+    """
+    Replace the legacy single `disassoc` column on `client_summary` with
+    `disassoc_ap` and `disassoc_client`. Additive + in-place: adds the new
+    columns if missing, then drops the old one if present. The next detection
+    cycle rebuilds the scope from events, so the new columns re-populate
+    correctly without any backfill — AP vs Client is derivable only from the
+    raw event_type, which the summary row no longer has.
+    """
+    cursor = await conn.execute("PRAGMA table_info(client_summary)")
+    cols = await cursor.fetchall()
+    if not cols:
+        return
+    col_names = {row[1] for row in cols}
+    if "disassoc_ap" not in col_names:
+        log.info("Adding disassoc_ap column to client_summary")
+        await conn.execute("ALTER TABLE client_summary ADD COLUMN disassoc_ap INTEGER DEFAULT 0")
+    if "disassoc_client" not in col_names:
+        log.info("Adding disassoc_client column to client_summary")
+        await conn.execute("ALTER TABLE client_summary ADD COLUMN disassoc_client INTEGER DEFAULT 0")
+    if "disassoc" in col_names:
+        log.info("Dropping legacy disassoc column from client_summary")
+        await conn.execute("ALTER TABLE client_summary DROP COLUMN disassoc")
+    await conn.commit()
+
+
 async def _init_schema(conn: aiosqlite.Connection):
     """Create tables and indexes if they don't exist."""
     await _migrate_clients_to_org_scope(conn)
     await conn.executescript(_SCHEMA_SQL)
     await _migrate_clients_add_last_username(conn)
+    await _migrate_client_summary_split_disassoc(conn)
     await conn.commit()
 
 
@@ -808,7 +836,7 @@ _CLIENT_SUMMARY_COLS: tuple[str, ...] = (
     "dns_success", "dns_failure",
     "auth_success", "auth_failure",
     "roam_success", "roam_failure",
-    "disassoc",
+    "disassoc_ap", "disassoc_client",
     "arp_success", "arp_failure",
     "captive_portal", "security", "collaboration", "other",
     "first_seen", "last_seen", "built_at",
@@ -970,7 +998,11 @@ async def query_client_summary(
     order_sql = f" ORDER BY {order_by}" if order_by else ""
     limit_sql = f" LIMIT {int(limit)}" if limit is not None else ""
     offset_sql = f" OFFSET {int(offset)}" if offset is not None else ""
-    sql = f"SELECT * FROM client_summary{where}{order_sql}{limit_sql}{offset_sql}"
+    # Explicit column list (not SELECT *) so positional hydration in
+    # _row_to_summary_dict stays correct even after ALTER TABLE has appended
+    # columns to the physical table in a different order.
+    col_list = ", ".join(_CLIENT_SUMMARY_COLS)
+    sql = f"SELECT {col_list} FROM client_summary{where}{order_sql}{limit_sql}{offset_sql}"
 
     conn = await get_connection()
     rows = await conn.execute_fetchall(sql, params)
