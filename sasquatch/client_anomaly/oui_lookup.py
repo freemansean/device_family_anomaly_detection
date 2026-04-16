@@ -93,7 +93,13 @@ def build_db(source_path: str | None = None) -> int:
         log.info("Parsing OUI file: %s", source_path)
     else:
         log.info("Downloading OUI registry from %s", _IEEE_URL)
-        with urllib.request.urlopen(_IEEE_URL, timeout=30) as resp:  # noqa: S310
+# The IEEE server returns HTTP 418 if the request looks like a bot/scraper.
+# Spoofing a standard browser User-Agent header gets us through.
+        req = urllib.request.Request(
+            _IEEE_URL,
+            headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36"}
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
             text = resp.read().decode("utf-8", errors="replace")
         log.info("Download complete: %d bytes", len(text))
 
