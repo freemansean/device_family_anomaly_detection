@@ -337,7 +337,22 @@ async def get_events(
     query = f"SELECT raw_json FROM events WHERE {where} ORDER BY timestamp"
 
     rows = await conn.execute_fetchall(query, params)
-    return [json.loads(row[0]) for row in rows]
+    # Decode per-row so a single corrupt raw_json blob doesn't take out the
+    # entire read (which would cascade through feature_engineer, summary builder,
+    # drilldown routes, etc.). Bad rows are logged and skipped.
+    events: list[dict] = []
+    _bad = 0
+    for row in rows:
+        try:
+            events.append(json.loads(row[0]))
+        except (json.JSONDecodeError, TypeError):
+            _bad += 1
+    if _bad:
+        log.warning(
+            "get_events: skipped %d row(s) with malformed raw_json (site_id=%s wlan=%s)",
+            _bad, site_id, wlan,
+        )
+    return events
 
 
 async def get_event_count(
@@ -894,19 +909,10 @@ async def delete_client_summaries_not_in(scopes: list[tuple[str, str]]) -> int:
         cursor = await conn.execute("DELETE FROM client_summary")
         await conn.commit()
         return cursor.rowcount
-    # Build a VALUES list for anti-join; SQLite caps variable count at 999,
-    # so chunk if needed. In practice scopes is O(sites * wlans) ~= low hundreds.
+    # Fetch every (site, wlan) currently present, delete the diff against `scopes`.
+    # Scope count is O(sites * wlans) — low hundreds in practice — so a per-row
+    # DELETE is fine and avoids the SQLite 999-variable cap on VALUES-based anti-joins.
     deleted = 0
-    chunk = 200
-    for i in range(0, len(scopes), chunk):
-        batch = scopes[i:i + chunk]
-        placeholders = ", ".join("(?, ?)" for _ in batch)
-        params: list = []
-        for sid, w in batch:
-            params.extend([sid, w])
-        # Two-step: collect ids first, then delete — simpler than NOT IN VALUES.
-        pass
-    # Simpler and correct: fetch every (site, wlan) present, delete the diff.
     existing = await conn.execute_fetchall(
         "SELECT DISTINCT site_id, wlan FROM client_summary"
     )

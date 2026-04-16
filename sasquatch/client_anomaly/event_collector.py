@@ -393,11 +393,26 @@ async def iter_events_org(
     total_fetched = 0
     page = 0
     total_hint: Optional[int] = None
+    # Hard ceiling on pagination so a malformed/circular `next` cursor from Mist
+    # cannot wedge a collect. 20k pages × 1000/page = 20M events — well above any
+    # realistic 12-hour window.
+    _MAX_PAGES = 20000
     async with httpx.AsyncClient(timeout=30.0) as client:
         while url:
+            if page >= _MAX_PAGES:
+                raise RuntimeError(
+                    f"[org] Pagination exceeded {_MAX_PAGES} pages — aborting. "
+                    f"Last URL: {url[:200]}"
+                )
             resp = await client.get(url, headers=_auth_headers())
             resp.raise_for_status()
-            data = resp.json()
+            try:
+                data = resp.json()
+            except json.JSONDecodeError as exc:
+                snippet = resp.text[:200] if resp.text else "<empty>"
+                raise RuntimeError(
+                    f"[org] Non-JSON response on page {page + 1}: {exc}. Body prefix: {snippet}"
+                ) from exc
             # Debug: log response shape to diagnose empty-results issues
             if page == 0:
                 if isinstance(data, dict):
