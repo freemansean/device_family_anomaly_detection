@@ -918,6 +918,8 @@ def create_scheduler() -> AsyncIOScheduler:
             hours=poll_hours,
             id="org_event_poll",
             name="Org-Level Event Poll",
+            max_instances=1,
+            coalesce=True,
         )
         log.info("Org event poll scheduled every %d hour(s)", poll_hours)
 

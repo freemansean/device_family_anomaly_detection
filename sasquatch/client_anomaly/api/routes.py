@@ -54,6 +54,8 @@ from ..scheduler import (
     _LAST_COLLECTION_KEY,
     _ORG_DETECT_PROGRESS_KEY,
     _ORG_DETECT_PROGRESS_TTL,
+    _acquire_global_lock,
+    _release_global_lock,
     _run_org_pipeline_body,
     _transfer_global_lock,
     get_auto_detect_enabled,
@@ -147,21 +149,20 @@ async def _org_collect_background_task() -> None:
       2. ``collecting_events`` — stream org-wide client events into SQLite.
     """
     progress_key = "sasquatch:progress:org_collect"
-    lock_key = _GLOBAL_LOCK_KEY
     started = _time.time()
 
-    redis_client = _get_redis()
+    # Acquire the global mutex via the shared helper so the TTL matches the
+    # hourly poll path (6 hours). A 12hr multi-million-event collect can
+    # easily outlive a 2-hour TTL; if the lock expires mid-collect, the
+    # hourly poll's own _acquire_global_lock succeeds and a second
+    # /clients/events pagination runs concurrently with detect. That race
+    # was the root cause of the 2026-04-17 OOM.
+    redis_client, acquired = await _acquire_global_lock("collecting")
 
     async def wp(data: dict) -> None:
         data["started_at"] = started
         await redis_client.set(progress_key, json.dumps(data), ex=300)
 
-    acquired = await redis_client.set(
-        lock_key,
-        json.dumps({"operation": "collecting", "started_at": started}),
-        nx=True,
-        ex=2 * 60 * 60,
-    )
     if not acquired:
         await wp({"phase": "error", "message": "Another operation is already running"})
         await redis_client.aclose()
@@ -306,8 +307,7 @@ async def _org_collect_background_task() -> None:
         log.exception("Org-level collection failed")
         await wp({"phase": "error", "message": str(exc)})
     finally:
-        await redis_client.delete(lock_key)
-        await redis_client.aclose()
+        await _release_global_lock(redis_client)
 
 
 @router.post("/org/collect-full")
