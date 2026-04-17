@@ -56,6 +56,7 @@ from ..scheduler import (
     _ORG_DETECT_PROGRESS_TTL,
     _acquire_global_lock,
     _release_global_lock,
+    _release_phase_memory,
     _run_org_pipeline_body,
     _transfer_global_lock,
     get_auto_detect_enabled,
@@ -278,6 +279,7 @@ async def _org_collect_background_task() -> None:
         if await get_auto_detect_enabled():
             log.info("[org-collect] Auto-detect enabled — chaining to detection pipeline")
             await _transfer_global_lock(redis_client, "detecting")
+            await _release_phase_memory("org-collect collect→detect")
             try:
                 site_map = await _get_org_site_map(redis_client)
             except Exception:

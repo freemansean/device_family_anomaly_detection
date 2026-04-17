@@ -12,6 +12,8 @@ or the UI. A global mutex (sasquatch:lock:global_operation) ensures only one
 operation (collecting or detecting) runs at a time.
 """
 
+import asyncio
+import gc
 import json
 import logging
 import os
@@ -115,6 +117,33 @@ async def _transfer_global_lock(redis_client: aioredis.Redis, to_op: str) -> Non
         _GLOBAL_LOCK_KEY,
         json.dumps({"operation": to_op, "started_at": _time.time()}),
         ex=_GLOBAL_LOCK_TTL_SECONDS,
+    )
+
+
+async def _release_phase_memory(phase_label: str) -> None:
+    """
+    Belt-and-suspenders memory release between pipeline phases.
+
+    The collect→detect auto-chain runs both phases in the same task, so
+    Python's refcount-based GC does not always free large collect-side
+    buffers (event dicts, HTTP response bodies held by httpx, pandas
+    scratch frames) before the detect phase starts allocating dense
+    NumPy feature matrices and PCA intermediates. On a multi-million-event
+    org this overlap has caused OOM kills. Force a full generational
+    collect and yield briefly so the event loop can settle before the
+    next phase begins.
+
+    No-op when there is nothing to free; safe to call unconditionally.
+    """
+    collected = gc.collect()
+    # Yield the event loop so any pending tasks (e.g. httpx connection
+    # teardown) complete and their buffers are released before the next
+    # phase's heavy allocations.
+    await asyncio.sleep(0)
+    log.info(
+        "[gc] %s phase boundary: collected %d objects",
+        phase_label,
+        collected,
     )
 
 
@@ -808,6 +837,7 @@ async def org_event_poll_job() -> None:
         if await get_auto_detect_enabled():
             log.info("[org-poll] Auto-detect enabled — chaining to detection pipeline")
             await _transfer_global_lock(lock_client, "detecting")
+            await _release_phase_memory("org-poll collect→detect")
             try:
                 site_map = await _get_cached_site_map(lock_client)
             except Exception:
