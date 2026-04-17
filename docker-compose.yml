@@ -19,8 +19,9 @@ services:
     environment:
       - REDIS_URL=redis://redis:6379
       - SASQUATCH_CORS_ORIGINS=*
+      - SASQUATCH_SQLITE_PATH=/unsupervised_anomaly/sqlite/sasquatch.db
     volumes:
-      - sqlite-data:/unsupervised_anomaly/sasquatch/client_anomaly/data
+      - sqlite-data:/unsupervised_anomaly/sqlite
       - logs:/unsupervised_anomaly/logs
     ports:
       - "8000:8000"

@@ -14,10 +14,12 @@ RUN pip install --no-cache-dir --quiet -r requirements.txt
 COPY sasquatch/ sasquatch/
 COPY redis.conf ./
 
-# OUI database — download at build time so first boot is fast.
-# Falls back gracefully if the download fails (app still works, OUI = Unknown).
+# OUI database — download at build time so device family classification works
+# on first boot. Fails the build if the download fails; silent fallback to
+# "Unknown" produced a sparse family set with no visible signal that the
+# OUI DB was missing.
 RUN mkdir -p sasquatch/client_anomaly/data \
-    && (cd sasquatch && python -m client_anomaly.oui_lookup || true)
+    && cd sasquatch && python -m client_anomaly.oui_lookup
 
 # Logs directory
 RUN mkdir -p logs
