@@ -1,0 +1,15 @@
+.venv/
+venv/
+node_modules/
+sasquatch/frontend/dist/
+data/
+logs/
+*.db
+*.db-wal
+*.db-shm
+dump.rdb
+.env
+.git/
+__pycache__/
+*.pyc
+.DS_Store

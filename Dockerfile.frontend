@@ -1,0 +1,14 @@
+# Build the React frontend, serve with nginx
+FROM node:18-alpine AS build
+WORKDIR /build
+COPY sasquatch/frontend/package.json sasquatch/frontend/package-lock.json* ./
+RUN npm install --silent
+COPY sasquatch/frontend/ ./
+# Default API URL — in Docker, the browser hits the nginx proxy on the same origin
+ENV VITE_API_BASE_URL=""
+RUN npm run build
+
+FROM nginx:alpine
+COPY --from=build /build/dist/ /usr/share/nginx/html/
+# nginx.conf is bind-mounted via docker-compose.yml
+EXPOSE 3000
