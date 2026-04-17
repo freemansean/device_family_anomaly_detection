@@ -641,11 +641,13 @@ that the hourly path overrides to `_ORG_HOURLY_FLUSH_BATCH_SIZE`.
 for any code path that genuinely needs the full list — avoid using it for org-wide
 multi-hour collects.
 
-**Auto-enable hourly polling on successful full collect:** When `collect_org_full()`
-completes successfully, `_org_collect_background_task` (in `api/routes.py`) sets the
-Redis key `sasquatch:event_polling_enabled = "1"`. The hourly `org_event_poll_job`
-in `scheduler.py` gates on this key, so a successful manual full collect transparently
-arms the hourly top-up loop without requiring the operator to flip the UI toggle.
+**Hourly polling is opt-in (disabled by default).** The hourly `org_event_poll_job`
+in `scheduler.py` gates on `sasquatch:event_polling_enabled`; a missing key counts
+as disabled. The operator enables it explicitly via `POST /api/v1/org/polling`
+once they are comfortable with the resource cost. Earlier revisions auto-enabled
+the key after the first successful full collect, which led to the hourly poll
+firing while a long-running manual collect/detect was still in flight under
+constrained Docker memory limits — the auto-enable has been removed.
 
 **Rate limit handling — `_check_rate_limit()`:** After every paginated response, the
 helper checks `X-RateLimit-Remaining` / `X-RateLimit-Reset` headers and sleeps until
@@ -1599,10 +1601,13 @@ Any code path that calls `build_features` + `score` must also call `score_health
 in between, so health data is never stale relative to anomaly data.
 
 **Auto-detect chaining:** The Redis flag `sasquatch:auto_detect_enabled`
-(default `"1"` — missing key counts as enabled) controls whether detection
-automatically runs after a successful collect. When on, `_org_collect_background_task`
-calls `_run_org_pipeline_body()` inline after `collect_org_full()`, and
-`org_event_poll_job` does the same after its hourly event pull. The global
+(default **disabled** — a missing key counts as off; only the explicit string
+`"1"` enables the chain) controls whether detection automatically runs after
+a successful collect. When on, `_org_collect_background_task` calls
+`_run_org_pipeline_body()` inline after `collect_org_full()`, and
+`org_event_poll_job` does the same after its hourly event pull. Default is
+off because back-to-back collect+detect on a multi-million-event org has
+caused OOM kills under constrained Docker memory limits. The global
 mutex is handed off from `collecting` → `detecting` in place via
 `_transfer_global_lock()` so a competing manual trigger cannot sneak in
 between the two phases. `get_auto_detect_enabled()` / `set_auto_detect_enabled()`
@@ -1612,9 +1617,8 @@ Event Polling button).
 
 **`org_event_poll_job` — hourly event-only top-up:**
 - Gated by the Redis key `sasquatch:event_polling_enabled` (set to `"1"` to enable).
-- `_org_collect_background_task` sets that key to `"1"` automatically when a manual
-  full collect (`POST /api/v1/org/collect-full` → `collect_org_full`) succeeds, so
-  the operator does not have to flip the toggle separately.
+  Default: disabled. A missing key counts as off — the operator must explicitly
+  enable the hourly poll via `POST /api/v1/org/polling`.
 - The job calls `collect_org(MIST_ORG_ID)`, which streams the trailing 1 hour by
   Unix timestamp and flushes to SQLite every `_ORG_HOURLY_FLUSH_BATCH_SIZE` (25k)
   events. When `sasquatch:auto_detect_enabled` is on, detection is chained
@@ -1657,16 +1661,16 @@ GET  /api/v1/org/summary                             → per-site event counts, 
                                                        org_finding_count) read from sasquatch:org_findings:{wlan}
 POST /api/v1/org/collect-full                        → trigger a full org-wide event collection over the
                                                        trailing 12 hours (start/end Unix timestamps); runs in
-                                                       a background task; on success sets
-                                                       sasquatch:event_polling_enabled = "1" so the hourly
-                                                       org_event_poll_job starts topping up automatically
+                                                       a background task. Hourly polling and auto-detect
+                                                       remain disabled unless the operator has explicitly
+                                                       toggled them on.
 GET  /api/v1/org/collect-progress                    → phase/page/event counters for an in-flight collect
 GET  /api/v1/org/hourly-progress                     → phase/page/event counters for an in-flight hourly poll
                                                        (mirrors collect-progress schema, no clients phase)
 GET  /api/v1/org/polling                             → {enabled: bool} — current state of the hourly poll flag
 POST /api/v1/org/polling                             → {enabled: bool} — manually toggle the hourly poll flag
 GET  /api/v1/org/auto-detect                         → {enabled: bool} — current state of the auto-detect flag
-                                                       (default enabled; controls whether detection chains
+                                                       (default disabled; controls whether detection chains
                                                        after a successful collect)
 POST /api/v1/org/auto-detect                         → {enabled: bool} — manually toggle the auto-detect flag
 POST /api/v1/org/detect                              → re-runs build_features + score_health + score (per-site) for all
@@ -1911,9 +1915,10 @@ invokes `run_org_pipeline()` in `scheduler.py`:
 
 Event collection is decoupled from detection. The hourly `org_event_poll_job`
 streams 1-hour windows from the org events endpoint into SQLite when
-`sasquatch:event_polling_enabled = "1"` (set automatically after the first
-successful manual `POST /api/v1/org/collect-full`). Both jobs use the same
-global mutex so a poll cannot overlap with a manual collect or detect run.
+`sasquatch:event_polling_enabled = "1"`. The flag defaults to disabled and
+is only toggled on by an explicit `POST /api/v1/org/polling` — manual full
+collects no longer auto-enable it. Both jobs use the same global mutex so a
+poll cannot overlap with a manual collect or detect run.
 
 The org-level pipeline uses the same `score_org_wide()` function in
 `anomaly_detector.py` and the same dual alert gate in `webhook_dispatcher.py`.

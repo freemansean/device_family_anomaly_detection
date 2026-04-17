@@ -251,12 +251,10 @@ async def _org_collect_background_task() -> None:
             datetime.now(timezone.utc).isoformat(),
         )
 
-        # Auto-enable hourly event polling once a successful full collect lands.
-        # The hourly job (org_event_poll_job in scheduler.py) gates on this key,
-        # so flipping it here means subsequent hourly increments will run without
-        # requiring the operator to flip the toggle in the UI.
-        await redis_client.set("sasquatch:event_polling_enabled", "1")
-        log.info("Org event polling auto-enabled after successful full collect")
+        # Hourly polling is opt-in. The operator enables it explicitly via
+        # POST /api/v1/org/polling once they are comfortable with the resource
+        # cost. Auto-enabling it here caused overlap with long-running manual
+        # collects and detects under Docker memory limits.
 
         await wp({
             "phase": "complete",

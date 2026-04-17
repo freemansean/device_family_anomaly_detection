@@ -122,16 +122,17 @@ async def get_auto_detect_enabled() -> bool:
     """
     Return whether collect→detect auto-chain is enabled.
 
-    Default is enabled: a missing key counts as on. Only the explicit string
-    "0" disables it. This matches the operator expectation that a fresh deploy
-    runs detection automatically after every collect.
+    Default is disabled: a missing key counts as off. Only the explicit string
+    "1" enables it. Detection on a large org is memory-intensive; back-to-back
+    collect+detect in a constrained container has caused OOM kills in the
+    past, so the operator must explicitly opt in via /api/v1/org/auto-detect.
     """
     client = aioredis.from_url(REDIS_URL, decode_responses=True)
     try:
         val = await client.get(_AUTO_DETECT_ENABLED_KEY)
     finally:
         await client.aclose()
-    return val != "0"
+    return val == "1"
 
 
 async def set_auto_detect_enabled(enabled: bool) -> None:
