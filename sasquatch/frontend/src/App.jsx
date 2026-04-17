@@ -9,7 +9,7 @@ import { apiFetch } from "./api";
 
 const ORG_FOCUS_VALUE = "__org__";
 
-const API_BASE = import.meta.env.VITE_API_BASE_URL || "http://localhost:8000";
+const API_BASE = import.meta.env.VITE_API_BASE_URL ?? "";
 
 const ACTION_BTN_PULSE_STYLE = `
 @keyframes sq-btn-pulse {
