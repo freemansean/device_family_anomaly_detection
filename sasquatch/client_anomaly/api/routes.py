@@ -2115,6 +2115,7 @@ def _summary_row_to_drilldown(
         "client_metadata": {
             "family": row.get("device_family", ""),
             "model": row.get("device_model", ""),
+            "os": row.get("device_os", ""),
             "manufacturer": row.get("device_manufacturer", ""),
             "last_username": row.get("last_username", ""),
         },

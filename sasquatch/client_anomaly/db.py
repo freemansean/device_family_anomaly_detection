@@ -133,6 +133,7 @@ CREATE TABLE IF NOT EXISTS client_summary (
     device_family TEXT,
     device_model TEXT,
     device_manufacturer TEXT,
+    device_os TEXT,
     last_username TEXT,
     service_account_family TEXT,
     random_mac BOOLEAN DEFAULT FALSE,
@@ -255,12 +256,30 @@ async def _migrate_client_summary_split_disassoc(conn: aiosqlite.Connection) -> 
     await conn.commit()
 
 
+async def _migrate_client_summary_add_device_os(conn: aiosqlite.Connection) -> None:
+    """
+    Add `device_os` to `client_summary`. The next detection cycle rebuilds
+    the scope from the client cache, so the column populates without a
+    backfill.
+    """
+    cursor = await conn.execute("PRAGMA table_info(client_summary)")
+    cols = await cursor.fetchall()
+    if not cols:
+        return
+    col_names = {row[1] for row in cols}
+    if "device_os" not in col_names:
+        log.info("Adding device_os column to client_summary")
+        await conn.execute("ALTER TABLE client_summary ADD COLUMN device_os TEXT")
+    await conn.commit()
+
+
 async def _init_schema(conn: aiosqlite.Connection):
     """Create tables and indexes if they don't exist."""
     await _migrate_clients_to_org_scope(conn)
     await conn.executescript(_SCHEMA_SQL)
     await _migrate_clients_add_last_username(conn)
     await _migrate_client_summary_split_disassoc(conn)
+    await _migrate_client_summary_add_device_os(conn)
     await conn.commit()
 
 
@@ -841,7 +860,7 @@ async def delete_clients_for_org(org_id: str) -> int:
 # Column order used by both the INSERT and the row-dict adapter below.
 _CLIENT_SUMMARY_COLS: tuple[str, ...] = (
     "mac", "site_id", "wlan", "org_id",
-    "device_family", "device_model", "device_manufacturer",
+    "device_family", "device_model", "device_manufacturer", "device_os",
     "last_username", "service_account_family", "random_mac",
     "health_score", "if_score", "centroid_dist_score", "dbscan_label",
     "is_if_outlier", "is_dbscan_outlier", "is_family_outlier",
