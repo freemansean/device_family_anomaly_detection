@@ -335,12 +335,124 @@ async def trigger_org_collect_full(background_tasks: BackgroundTasks):
     return {"status": "started", "operation": "org_collect_full"}
 
 
+async def _org_collect_events_only_background_task() -> None:
+    """
+    Events-only 12hr org-level collection. Skips the client-cache refresh phase
+    of /org/collect-full — uses the cache already in SQLite to enrich events.
+    Writes progress to sasquatch:progress:org_events_only and holds the same
+    global mutex as /org/collect-full so it cannot overlap with other work.
+    Does not auto-chain detect.
+    """
+    progress_key = "sasquatch:progress:org_events_only"
+    started = _time.time()
+
+    redis_client, acquired = await _acquire_global_lock("collecting")
+
+    async def wp(data: dict) -> None:
+        data["started_at"] = started
+        await redis_client.set(progress_key, json.dumps(data), ex=300)
+
+    if not acquired:
+        await wp({"phase": "error", "message": "Another operation is already running"})
+        await redis_client.aclose()
+        return
+
+    try:
+        await wp({
+            "phase": "collecting_events",
+            "pages_fetched": 0,
+            "events_fetched": 0,
+            "total_events_estimated": None,
+            "expected_event_pages": None,
+            "status": "Gathering client events...",
+        })
+
+        async def on_page(page: int, fetched: int, total: Optional[int]) -> None:
+            expected_pages = (total + 999) // 1000 if total else None
+            if expected_pages:
+                status = (
+                    f"Gathering client events — page {page}/{expected_pages} "
+                    f"({fetched:,}/{total:,})"
+                )
+            else:
+                status = f"Gathering client events — page {page}"
+            await wp({
+                "phase": "collecting_events",
+                "pages_fetched": page,
+                "events_fetched": fetched,
+                "total_events_estimated": total,
+                "expected_event_pages": expected_pages,
+                "status": status,
+            })
+
+        site_results = await collect_org_full(MIST_ORG_ID, on_page=on_page)
+        total_events = sum(site_results.values())
+
+        await redis_client.set(
+            _LAST_COLLECTION_KEY,
+            datetime.now(timezone.utc).isoformat(),
+        )
+
+        await wp({
+            "phase": "complete",
+            "pages_fetched": -1,
+            "events_fetched": total_events,
+            "site_counts": site_results,
+            "sites_with_events": len(site_results),
+            "status": (
+                f"Complete — {total_events:,} events across "
+                f"{len(site_results)} sites"
+            ),
+        })
+    except Exception as exc:
+        log.exception("Org-level events-only collection failed")
+        await wp({"phase": "error", "message": str(exc)})
+    finally:
+        await _release_global_lock(redis_client)
+
+
+@router.post("/org/collect-events-only")
+async def trigger_org_collect_events_only(background_tasks: BackgroundTasks):
+    """
+    Trigger a 12hr org-level event collection that skips the client-cache refresh.
+    Uses the existing SQLite client cache for enrichment. Same global mutex as
+    /org/collect-full, no auto-detect chaining.
+    """
+    if not MIST_ORG_ID:
+        raise HTTPException(status_code=400, detail="MIST_ORG_ID not configured")
+    if not MIST_API_TOKEN:
+        raise HTTPException(status_code=400, detail="MIST_API_TOKEN not configured")
+
+    lock_status = await get_global_lock_status()
+    if lock_status:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Another operation is already running: {lock_status.get('operation', 'unknown')}",
+        )
+
+    background_tasks.add_task(_org_collect_events_only_background_task)
+    return {"status": "started", "operation": "org_collect_events_only"}
+
+
 @router.get("/org/collect-progress")
 async def get_org_collect_progress():
     """Return progress of an ongoing org-level event collection."""
     redis_client = _get_redis()
     try:
         raw = await redis_client.get("sasquatch:progress:org_collect")
+        if raw:
+            return json.loads(raw)
+        return {"phase": "idle"}
+    finally:
+        await redis_client.aclose()
+
+
+@router.get("/org/events-only-progress")
+async def get_org_events_only_progress():
+    """Return progress of an ongoing events-only org-level collection."""
+    redis_client = _get_redis()
+    try:
+        raw = await redis_client.get("sasquatch:progress:org_events_only")
         if raw:
             return json.loads(raw)
         return {"phase": "idle"}

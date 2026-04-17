@@ -72,17 +72,19 @@ function OrgCollectProgress({ progress, mode = "full" }) {
   } = progress;
 
   const isHourly = mode === "hourly";
+  const isEventsOnly = mode === "events_only";
+  const skipClients = isHourly || isEventsOnly;
 
   let pct = 0;
   let label = "";
   let color = "#7ec8e3";
 
   // Phase allocations for the full collect: clients = 0-30%, events = 30-90%.
-  // Hourly poll skips the client cache refresh, so events get the full 0-95%.
+  // Hourly poll and events-only skip the client cache refresh, so events get 0-95%.
   const CLIENTS_START = 0;
-  const CLIENTS_SPAN = isHourly ? 0 : 30;
-  const EVENTS_START = isHourly ? 0 : 30;
-  const EVENTS_SPAN = isHourly ? 95 : 60;
+  const CLIENTS_SPAN = skipClients ? 0 : 30;
+  const EVENTS_START = skipClients ? 0 : 30;
+  const EVENTS_SPAN = skipClients ? 95 : 60;
 
   const eventsPrefix = isHourly ? "Hourly poll" : "Gathering client events";
 
@@ -124,7 +126,7 @@ function OrgCollectProgress({ progress, mode = "full" }) {
     const countSuffix = eventsTotal
       ? `${(events_fetched || 0).toLocaleString()}/${eventsTotal.toLocaleString()} events`
       : `${(events_fetched || 0).toLocaleString()} events`;
-    const clientsSuffix = (!isHourly && clients_fetched)
+    const clientsSuffix = (!skipClients && clients_fetched)
       ? ` (${clients_fetched.toLocaleString()} clients cached)`
       : "";
     label = `${eventsPrefix}… ${countSuffix} — ${pageSuffix}${clientsSuffix}`;
@@ -134,7 +136,7 @@ function OrgCollectProgress({ progress, mode = "full" }) {
     pct = 100;
     color = "#2d7a4f";
     const parts = [];
-    if (!isHourly && clients_fetched) parts.push(`${clients_fetched.toLocaleString()} clients`);
+    if (!skipClients && clients_fetched) parts.push(`${clients_fetched.toLocaleString()} clients`);
     parts.push(`${(events_fetched || 0).toLocaleString()} events`);
     const donePrefix = isHourly ? "Hourly poll done" : "Done";
     label = `${donePrefix} — ${parts.join(", ")}`;
@@ -282,6 +284,8 @@ export default function App() {
   const [autoDetectEnabled, setAutoDetectEnabled] = useState(true);
   const [orgCollectProgress, setOrgCollectProgress] = useState(null);
   const [orgCollectPolling, setOrgCollectPolling] = useState(false);
+  const [orgEventsOnlyProgress, setOrgEventsOnlyProgress] = useState(null);
+  const [orgEventsOnlyPolling, setOrgEventsOnlyPolling] = useState(false);
   const [orgDetectProgress, setOrgDetectProgress] = useState(null);
   const [orgDetectPolling, setOrgDetectPolling] = useState(false);
   const [orgHourlyProgress, setOrgHourlyProgress] = useState(null);
@@ -487,6 +491,25 @@ export default function App() {
     }, 750);
     return () => clearInterval(poll);
   }, [orgCollectPolling]);
+
+  // Poll progress while an events-only collection is running
+  useEffect(() => {
+    if (!orgEventsOnlyPolling) return;
+    const poll = setInterval(async () => {
+      try {
+        const r = await apiFetch(`${API_BASE}/api/v1/org/events-only-progress`);
+        const data = await r.json();
+        setOrgEventsOnlyProgress(data);
+        if (data.phase === "complete" || data.phase === "error" || data.phase === "idle") {
+          setOrgEventsOnlyPolling(false);
+          setAS("eventsOnly", data.phase === "complete" ? "ok" : data.phase === "error" ? "error" : "idle");
+          if (data.phase === "complete") setDiscoveryRefreshToken((t) => t + 1);
+          setTimeout(() => { setAS("eventsOnly", "idle"); setOrgEventsOnlyProgress(null); }, data.phase === "complete" ? 5000 : 4000);
+        }
+      } catch (e) { console.error(e); }
+    }, 750);
+    return () => clearInterval(poll);
+  }, [orgEventsOnlyPolling]);
 
   // Hourly poll status bar — poll /org/hourly-progress whenever event polling
   // is enabled. The hourly job is scheduler-driven, not user-triggered, so this
@@ -718,6 +741,23 @@ export default function App() {
       setOrgCollectPolling(false);
       setAS("collect", "error");
       setTimeout(() => { setAS("collect", "idle"); setOrgCollectProgress(null); }, 4000);
+    }
+  }
+
+  // Org-wide events-only collect (skips client-cache refresh)
+  async function handleCollectEventsOnly() {
+    if (activeOperation) return;
+    setAS("eventsOnly", "loading");
+    setOrgEventsOnlyProgress({ phase: "starting" });
+    setOrgEventsOnlyPolling(true);
+    try {
+      const r = await apiFetch(`${API_BASE}/api/v1/org/collect-events-only`, { method: "POST" });
+      if (!r.ok && r.status !== 409) throw new Error(`HTTP ${r.status}`);
+    } catch (e) {
+      setOrgEventsOnlyProgress({ phase: "error", message: e.message });
+      setOrgEventsOnlyPolling(false);
+      setAS("eventsOnly", "error");
+      setTimeout(() => { setAS("eventsOnly", "idle"); setOrgEventsOnlyProgress(null); }, 4000);
     }
   }
 
@@ -1075,6 +1115,7 @@ export default function App() {
               <div style={{ position: "absolute", top: "100%", left: 0, zIndex: 100, background: "#1a1a1a", border: "1px solid #444", borderRadius: "4px", marginTop: "2px", minWidth: "180px", boxShadow: "0 4px 12px rgba(0,0,0,0.5)" }}>
                 {[
                   { key: "collect", label: "Build Cache", handler: handleCollectEvents, loadLabel: "Building…", okLabel: "Built ✓", confirmLabel: "Are you sure?", blockedByActiveOp: true },
+                  { key: "eventsOnly", label: "Collect Events Only", handler: handleCollectEventsOnly, loadLabel: "Collecting…", okLabel: "Done ✓", blockedByActiveOp: true },
                   { key: "detect", label: "Run Detection", handler: handleDetect, loadLabel: "Detecting…", okLabel: "Done ✓", blockedByActiveOp: true },
                   { key: "clientRefresh", label: "Client Refresh", handler: handleClientRefresh, loadLabel: "Refreshing…", okLabel: "Refreshed ✓" },
                   { key: "flush", label: "Flush Data", handler: handleFlush, loadLabel: "Flushing…", okLabel: "Flushed ✓", confirmLabel: "Confirm Flush?" },
@@ -1300,6 +1341,7 @@ export default function App() {
 
         {/* Progress bars */}
         <OrgCollectProgress progress={orgCollectProgress} />
+        <OrgCollectProgress progress={orgEventsOnlyProgress} mode="events_only" />
         <OrgCollectProgress progress={orgHourlyProgress} mode="hourly" />
         <OrgDetectProgress progress={orgDetectProgress} />
         <OrgDetectProgress progress={orgHourlyDetectProgress} mode="hourly" />
