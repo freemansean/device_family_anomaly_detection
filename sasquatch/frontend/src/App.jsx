@@ -306,6 +306,7 @@ export default function App() {
   const [activeOperation, setActiveOperation] = useState(null); // null or operation string from /org/job-status
   const [actionState, setActionState] = useState({
     clientRefresh: "idle", // idle | loading | ok | error
+    clientExport: "idle",  // idle | loading | ok | error
     flush: "idle",         // idle | confirm | loading | ok | error
     detect: "idle",        // idle | loading | ok | error
     collect: "idle",       // idle | confirm | loading | ok | error
@@ -709,6 +710,31 @@ export default function App() {
     } catch {
       setAS("clientRefresh", "error");
       setTimeout(() => setAS("clientRefresh", "idle"), 3000);
+    }
+  }
+
+  async function handleClientExport() {
+    setAS("clientExport", "loading");
+    try {
+      const r = await apiFetch(`${API_BASE}/api/v1/org/clients/export.csv`);
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const blob = await r.blob();
+      const disposition = r.headers.get("Content-Disposition") || "";
+      const match = /filename="?([^"]+)"?/.exec(disposition);
+      const filename = match ? match[1] : `sasquatch_client_cache_${new Date().toISOString().replace(/[:.]/g, "-")}.csv`;
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+      setAS("clientExport", "ok");
+      setTimeout(() => setAS("clientExport", "idle"), 2000);
+    } catch {
+      setAS("clientExport", "error");
+      setTimeout(() => setAS("clientExport", "idle"), 3000);
     }
   }
 
@@ -1138,6 +1164,7 @@ export default function App() {
                   { key: "eventsOnly", label: "Collect Events Only", handler: handleCollectEventsOnly, loadLabel: "Collecting…", okLabel: "Done ✓", blockedByActiveOp: true },
                   { key: "detect", label: "Run Detection", handler: handleDetect, loadLabel: "Detecting…", okLabel: "Done ✓", blockedByActiveOp: true },
                   { key: "clientRefresh", label: "Client Refresh", handler: handleClientRefresh, loadLabel: "Refreshing…", okLabel: "Refreshed ✓" },
+                  { key: "clientExport", label: "Download Client Cache (CSV)", handler: handleClientExport, loadLabel: "Preparing…", okLabel: "Downloaded ✓" },
                   { key: "flush", label: "Flush Data", handler: handleFlush, loadLabel: "Flushing…", okLabel: "Flushed ✓", confirmLabel: "Confirm Flush?" },
                 ].map(item => {
                   const s = actionState[item.key];

@@ -259,19 +259,25 @@ export default function OrgFamilyDrilldown({ family, apiBase, onMacSiteSelect, o
     loadVisibleFromStorage("orgFamilyDrilldown.columns.v3", DEFAULT_VISIBLE)
   );
 
+  // Build the `&filter_tag=...` query-param tail once per render so the two
+  // fetch paths (main table + CSV export) apply the same filters server-side.
+  const filterTagParams = filterTags
+    .map(t => `&filter_tag=${encodeURIComponent(t)}`)
+    .join("");
+
   useEffect(() => {
     setLoading(true);
     setError(null);
     const sortParams = `&sort=${encodeURIComponent(sortCol)}&sort_dir=${encodeURIComponent(sortDir)}`;
     let url;
     if (macSearchQuery) {
-      url = `${apiBase}/api/v1/org/clients/search-drilldown?mac_prefix=${encodeURIComponent(macSearchQuery)}&page=${page}&page_size=${PAGE_SIZE}${sortParams}&scope=${scope}`;
+      url = `${apiBase}/api/v1/org/clients/search-drilldown?mac_prefix=${encodeURIComponent(macSearchQuery)}&page=${page}&page_size=${PAGE_SIZE}${sortParams}&scope=${scope}${filterTagParams}`;
     } else if (searchQuery) {
-      url = `${apiBase}/api/v1/org/families/search-drilldown?q=${encodeURIComponent(searchQuery)}&page=${page}&page_size=${PAGE_SIZE}${sortParams}&scope=${scope}`;
+      url = `${apiBase}/api/v1/org/families/search-drilldown?q=${encodeURIComponent(searchQuery)}&page=${page}&page_size=${PAGE_SIZE}${sortParams}&scope=${scope}${filterTagParams}`;
     } else if (allWlans) {
-      url = `${apiBase}/api/v1/org/families/${encodeURIComponent(family)}/drilldown-all-wlans?page=${page}&page_size=${PAGE_SIZE}${sortParams}`;
+      url = `${apiBase}/api/v1/org/families/${encodeURIComponent(family)}/drilldown-all-wlans?page=${page}&page_size=${PAGE_SIZE}${sortParams}${filterTagParams}`;
     } else {
-      url = `${apiBase}/api/v1/org/families/${encodeURIComponent(family)}/drilldown?wlan=${encodeURIComponent(wlan)}&page=${page}&page_size=${PAGE_SIZE}${sortParams}`;
+      url = `${apiBase}/api/v1/org/families/${encodeURIComponent(family)}/drilldown?wlan=${encodeURIComponent(wlan)}&page=${page}&page_size=${PAGE_SIZE}${sortParams}${filterTagParams}`;
     }
     apiFetch(url)
       .then(r => {
@@ -280,10 +286,11 @@ export default function OrgFamilyDrilldown({ family, apiBase, onMacSiteSelect, o
       })
       .then(d => { setData(d); setLoading(false); })
       .catch(e => { setError(String(e)); setLoading(false); });
-  }, [family, apiBase, wlan, allWlans, searchQuery, macSearchQuery, page, sortCol, sortDir, scope]);
+  }, [family, apiBase, wlan, allWlans, searchQuery, macSearchQuery, page, sortCol, sortDir, scope, filterTagParams]);
 
-  // Reset to page 1 when the query/family/scope changes
-  useEffect(() => { setPage(1); }, [family, wlan, allWlans, searchQuery, macSearchQuery, scope]);
+  // Reset to page 1 when the query/family/scope/filter changes — otherwise we
+  // could land on a page index that no longer exists under the new total.
+  useEffect(() => { setPage(1); }, [family, wlan, allWlans, searchQuery, macSearchQuery, scope, filterTagParams]);
 
   const handleExportCsv = async () => {
     if (!data || exporting) return;
@@ -305,26 +312,16 @@ export default function OrgFamilyDrilldown({ family, apiBase, onMacSiteSelect, o
       const totalPages = data.total_pages || 1;
       let allRows = [];
       for (let p = 1; p <= totalPages; p++) {
-        const url = `${baseUrl}${sep}page=${p}&page_size=${PAGE_SIZE}${sortParams}`;
+        const url = `${baseUrl}${sep}page=${p}&page_size=${PAGE_SIZE}${sortParams}${filterTagParams}`;
         const r = await apiFetch(url);
         if (!r.ok) break;
         const d = await r.json();
         allRows = allRows.concat(d.rows || []);
       }
-      // Apply client-side filter tags
-      const filtered = filterTags.length > 0
-        ? allRows.filter((row) => {
-            const alarms = computeMacServiceAlarms(row.categories);
-            const alarmStr = alarms.map(a => a.svc).join(" ");
-            const haystack = [
-              row.mac, row.site_name, row.wlan || "", row.device_family || "",
-              row.last_username || "", alarmStr, alarms.length > 0 ? "alarm" : "",
-            ].join(" ").toLowerCase();
-            return filterTags.every(tag => haystack.includes(tag.toLowerCase()));
-          })
-        : allRows;
+      // Filter tags are already applied server-side via `filterTagParams`, so
+      // `allRows` is already the filtered set — no client-side trim here.
       const csvName = macSearchQuery ? `mac_${macSearchQuery}` : family;
-      downloadDrilldownCsv(filtered, csvName, {
+      downloadDrilldownCsv(allRows, csvName, {
         includeWlan: !!allWlans || !!searchQuery || !!macSearchQuery,
         includeDeviceFamily: !!searchQuery || !!macSearchQuery,
         includePrimaryFamily: data?.family_kind === "service_account",
@@ -344,24 +341,10 @@ export default function OrgFamilyDrilldown({ family, apiBase, onMacSiteSelect, o
     setPage(1);
   };
 
-  const filteredRows = data ? data.rows.filter((row) => {
-    if (filterTags.length === 0) return true;
-    const alarms = computeMacServiceAlarms(row.categories);
-    const alarmStr = alarms.map(a => a.svc).join(" ");
-    const haystack = [
-      row.mac,
-      row.site_name,
-      row.wlan || "",
-      row.device_family || "",
-      row.last_username || "",
-      alarmStr,
-      alarms.length > 0 ? "alarm" : "",
-    ].join(" ").toLowerCase();
-    return filterTags.every(tag => haystack.includes(tag.toLowerCase()));
-  }) : [];
-
-  // Sorting is handled server-side; filteredRows preserves the API order.
-  const sortedRows = filteredRows;
+  // Filtering + sorting both live server-side now — ``data.rows`` is already
+  // the filtered, paginated, ordered page we want to render. Keeping the
+  // ``sortedRows`` alias so downstream JSX doesn't need to change.
+  const sortedRows = data ? data.rows : [];
 
   const SortTh = ({ col, children, style = {} }) => (
     <th style={{ ...thStyle, ...style }}>
@@ -603,20 +586,19 @@ export default function OrgFamilyDrilldown({ family, apiBase, onMacSiteSelect, o
               </span>
             ))}
             <div style={{ fontSize: "12px", color: "#666" }}>
-              {data.total_count} clients across all sites.{" "}
+              {data.total_count} clients{filterTags.length > 0 ? " match" : " across all sites"}.{" "}
               <span style={{ color: "#e05555" }}>{data.if_outlier_count} flagged</span> by Isolation Forest
               {data.counts_scope === "page" && <span style={{ color: "#555" }}> (this page)</span>}.{" "}
               <span style={{ color: "#e05555" }}>{data.dbscan_outlier_count} flagged</span> by DBSCAN
               {data.counts_scope === "page" && <span style={{ color: "#555" }}> (this page)</span>}.{" "}
               <span style={{ color: "#e05555" }}>{data.markov_outlier_count} flagged</span> by Markov.
-              {filterTags.length > 0 && (
-                <span style={{ color: "#7ec8e3" }}>{" "}· {sortedRows.length} shown</span>
-              )}
             </div>
           </div>
 
           {sortedRows.length === 0 ? (
-            <div style={{ color: "#555", fontSize: "13px" }}>No clients found.</div>
+            <div style={{ color: "#555", fontSize: "13px" }}>
+              {filterTags.length > 0 ? "No clients match the current filter." : "No clients found."}
+            </div>
           ) : (
             <div style={{ overflowX: "auto" }}>
               <table style={{ borderCollapse: "collapse", fontSize: "12px" }}>

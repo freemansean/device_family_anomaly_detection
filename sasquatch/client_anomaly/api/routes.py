@@ -24,6 +24,7 @@ import httpx
 import numpy as np
 import redis.asyncio as aioredis
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Query
+from fastapi.responses import StreamingResponse
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 
@@ -1087,6 +1088,82 @@ async def trigger_org_client_refresh():
     }
 
 
+@router.get("/org/clients/export.csv")
+async def export_org_client_cache_csv():
+    """
+    Stream the org-wide client cache as CSV for operator download.
+
+    One row per MAC, columns match `db.CLIENT_EXPORT_COLUMNS`. Rows are
+    streamed from SQLite via an async cursor so memory usage stays flat
+    regardless of cache size. ``updated_at`` is emitted as ISO-8601 UTC
+    so the CSV is readable without post-processing; ``random_mac`` is
+    rendered as ``true`` / ``false``.
+
+    Site names are attached as an extra ``last_site_name`` column when the
+    Mist sites map is available (cached 5 min in Redis). If the lookup fails
+    the column is left blank rather than blocking the download.
+    """
+    if not MIST_ORG_ID:
+        raise HTTPException(status_code=500, detail="MIST_ORG_ID not configured.")
+
+    if not await db.has_org_client_cache(MIST_ORG_ID):
+        raise HTTPException(
+            status_code=404,
+            detail="Client cache has not been populated. Run /org/refresh first.",
+        )
+
+    site_map: dict[str, str] = {}
+    redis_client = _get_redis()
+    try:
+        site_map = await _get_org_site_map(redis_client)
+    except Exception:
+        log.exception("Site-name lookup failed for CSV export — continuing without names")
+    finally:
+        await redis_client.aclose()
+
+    import csv
+    import io
+
+    header = list(db.CLIENT_EXPORT_COLUMNS) + ["last_site_name"]
+
+    async def _rows():
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+        writer.writerow(header)
+        yield buf.getvalue()
+        buf.seek(0); buf.truncate(0)
+
+        async for row in db.iter_org_client_rows(MIST_ORG_ID):
+            mac, family, mfg, model, os_, random_mac, username, ssid, ap, site_id, updated_at = row
+            updated_iso = (
+                datetime.fromtimestamp(float(updated_at), tz=timezone.utc).isoformat()
+                if updated_at is not None else ""
+            )
+            writer.writerow([
+                mac or "",
+                family or "",
+                mfg or "",
+                model or "",
+                os_ or "",
+                "true" if bool(random_mac) else "false",
+                username or "",
+                ssid or "",
+                ap or "",
+                site_id or "",
+                updated_iso,
+                site_map.get(site_id or "", ""),
+            ])
+            yield buf.getvalue()
+            buf.seek(0); buf.truncate(0)
+
+    filename = f"sasquatch_client_cache_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.csv"
+    return StreamingResponse(
+        _rows(),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
 @router.get("/org/clients/search")
 async def search_org_clients(
     mac: str = Query(
@@ -1207,6 +1284,35 @@ async def _get_org_site_map(redis_client) -> dict[str, str]:
 async def _get_org_site_ids(redis_client) -> list[str]:
     """Return org site IDs from the cached site map."""
     return list((await _get_org_site_map(redis_client)).keys())
+
+
+def _resolve_filter_tags(
+    raw_tags: list[str] | None,
+    site_map: dict[str, str],
+) -> list[dict]:
+    """
+    Normalise drilldown filter-tag query-params into the shape ``db.py`` expects.
+
+    Each raw tag is lowercased/trimmed and paired with the list of site_ids
+    whose display name contains that tag as a substring — so a tag like
+    ``"Oakland"`` matches every MAC stored at any Oakland site, matching the
+    frontend haystack that includes ``row.site_name``.
+
+    Empty / whitespace-only tags are dropped. The result is passed through to
+    ``_summary_where`` and AND-joined against the structural scope filters.
+    """
+    if not raw_tags:
+        return []
+    resolved: list[dict] = []
+    seen: set[str] = set()
+    for raw in raw_tags:
+        text = (raw or "").strip().lower()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        site_ids = [sid for sid, name in site_map.items() if text in (name or "").lower()]
+        resolved.append({"text": text, "site_ids": site_ids})
+    return resolved
 
 
 @router.get("/org/progress")
@@ -2136,13 +2242,50 @@ def _summary_row_to_drilldown(
 
 # Whitelist mapping from frontend sort column names to SQL ORDER BY expressions.
 # Keys that don't appear here are rejected (default sort used instead).
+# Per-MAC Health in the drilldown UI is derived client-side from the category
+# counts on each row (see ``computeMacHealth`` in OrgFamilyDrilldown.jsx):
+#
+#   success = auth_success + roam_success + dhcp_success + dns_success + arp_success
+#   failure = auth_failure + roam_failure + dhcp_failure + dns_failure + arp_failure
+#   health  = 1 - failure / (success + failure)   (null when total == 0)
+#
+# The ``client_summary.health_score`` column is family-level, not per-MAC, so
+# sorting by it produces giant ties inside a single family and the UI appears
+# unsorted. Replicate the per-MAC formula in SQL so the backend sort order
+# matches exactly what the cells render. ``1 - failure/total`` and
+# ``failure/total`` sort in opposite directions; we order by the failure ratio
+# and let the frontend's asc/desc toggle flip it (asc failure-ratio = desc
+# health, which is what the user wants when they click "Health ▼"). The
+# composite ``(total = 0)`` prefix keeps null-health rows at the bottom under
+# ASC and at the top under DESC, matching the existing IS NULL treatment used
+# by if_score.
+_HEALTH_TOTAL_SQL = (
+    "(auth_success + auth_failure + roam_success + roam_failure "
+    "+ dhcp_success + dhcp_failure + dns_success + dns_failure "
+    "+ arp_success + arp_failure)"
+)
+_HEALTH_FAILURE_SQL = (
+    "(auth_failure + roam_failure + dhcp_failure + dns_failure + arp_failure)"
+)
+# Per-MAC health score: 1 - failure/total. Null when no outcome-bearing events.
+_HEALTH_SCORE_SQL = (
+    f"CASE WHEN {_HEALTH_TOTAL_SQL} > 0 "
+    f"THEN 1.0 - CAST({_HEALTH_FAILURE_SQL} AS REAL) / {_HEALTH_TOTAL_SQL} "
+    "ELSE NULL END"
+)
+
 _DRILLDOWN_SORT_COLS: dict[str, str] = {
     "mac": "mac",
     "site_name": "site_id",          # site_id is the best proxy; site_name lives in Mist, not SQLite
     "wlan": "wlan",
     "device_family": "device_family",
     "if_score": "if_score IS NULL, if_score",
-    "health": "health_score IS NULL, health_score",
+    # Ordering by the per-MAC health score itself (1 - failure/total) so ASC
+    # puts least-healthy rows first — same directional semantics as the old
+    # family-level ``health_score`` sort, just computed per-MAC so ties within
+    # a family now order by real per-MAC health. Null-total rows land last
+    # under ASC / first under DESC via the ``(total = 0)`` prefix term.
+    "health": f"({_HEALTH_TOTAL_SQL} = 0), {_HEALTH_SCORE_SQL}",
     "markov_ratio": "is_markov_outlier",
     "total_events": "total_events",
     # Event category columns
@@ -2167,6 +2310,32 @@ _DRILLDOWN_SORT_COLS: dict[str, str] = {
 _DEFAULT_ORDER = "if_score IS NULL, if_score ASC"
 
 
+def _split_top_level_commas(expr: str) -> list[str]:
+    """
+    Split an ORDER BY expression on top-level commas only.
+
+    A naive ``split(",")`` would shred composite expressions that carry
+    parenthesised sub-terms (e.g. the ``CASE WHEN ... END`` inside the Health
+    sort). This walker tracks paren depth and cuts only when depth is zero.
+    """
+    parts: list[str] = []
+    depth = 0
+    buf: list[str] = []
+    for ch in expr:
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth = max(0, depth - 1)
+        if ch == "," and depth == 0:
+            parts.append("".join(buf).strip())
+            buf = []
+            continue
+        buf.append(ch)
+    if buf:
+        parts.append("".join(buf).strip())
+    return parts
+
+
 def _resolve_drilldown_order(sort: str | None, sort_dir: str | None) -> str:
     """Build a safe ORDER BY clause from frontend sort params."""
     if not sort or sort not in _DRILLDOWN_SORT_COLS:
@@ -2175,7 +2344,7 @@ def _resolve_drilldown_order(sort: str | None, sort_dir: str | None) -> str:
     col_expr = _DRILLDOWN_SORT_COLS[sort]
     # For composite expressions (e.g. "if_score IS NULL, if_score"), append
     # direction only to the last term — the NULL-sort prefix is always ASC.
-    parts = [p.strip() for p in col_expr.split(",")]
+    parts = _split_top_level_commas(col_expr)
     parts[-1] = f"{parts[-1]} {direction}"
     return ", ".join(parts)
 
@@ -2188,6 +2357,10 @@ async def get_org_family_drilldown(
     page_size: int = Query(500, ge=1, le=2000, description="Rows per page"),
     sort: str | None = Query(None, description="Column to sort by"),
     sort_dir: str | None = Query(None, description="Sort direction: asc or desc"),
+    filter_tag: list[str] = Query(
+        default=[],
+        description="Repeated free-text filter tags (AND-combined). Each tag is substring-matched against mac / site / WLAN / device_family / username / service-alarm keywords, so page size stays fixed and page count tracks the filtered total.",
+    ),
 ):
     """
     Org-wide per-MAC drilldown for a single device family (paginated).
@@ -2221,15 +2394,20 @@ async def get_org_family_drilldown(
         if is_sa_family
         else {"family_exact": family, "wlan": wlan}
     )
+    resolved_tags = _resolve_filter_tags(filter_tag, site_map)
 
-    counts = await db.count_client_summary(**filter_kw)
-    if counts["total"] == 0:
+    counts = await db.count_client_summary(**filter_kw, filter_tags=resolved_tags)
+    # When no user-supplied filter tags are present, a zero count means the
+    # family simply doesn't exist (404). With tags present, zero is a valid
+    # "filter narrowed to nothing" state — fall through and return an empty page.
+    if counts["total"] == 0 and not resolved_tags:
         raise HTTPException(status_code=404, detail=f"No data found for family '{family}' across any site.")
 
     offset = (page - 1) * page_size
     order = _resolve_drilldown_order(sort, sort_dir)
     summary_rows = await db.query_client_summary(
         **filter_kw,
+        filter_tags=resolved_tags,
         order_by=order,
         limit=page_size,
         offset=offset,
@@ -2273,6 +2451,10 @@ async def get_org_family_drilldown_all_wlans(
     page_size: int = Query(500, ge=1, le=2000, description="Rows per page"),
     sort: str | None = Query(None, description="Column to sort by"),
     sort_dir: str | None = Query(None, description="Sort direction: asc or desc"),
+    filter_tag: list[str] = Query(
+        default=[],
+        description="Repeated free-text filter tags (AND-combined) applied server-side so page size stays fixed.",
+    ),
 ):
     """
     Org-wide per-MAC drilldown for a single device family across ALL WLANs
@@ -2302,15 +2484,17 @@ async def get_org_family_drilldown_all_wlans(
         if is_sa_family
         else {"family_exact": family}
     )
+    resolved_tags = _resolve_filter_tags(filter_tag, site_map)
 
-    counts = await db.count_client_summary(**filter_kw)
-    if counts["total"] == 0:
+    counts = await db.count_client_summary(**filter_kw, filter_tags=resolved_tags)
+    if counts["total"] == 0 and not resolved_tags:
         raise HTTPException(status_code=404, detail=f"No events found for family '{family}' across any site.")
 
     offset = (page - 1) * page_size
     order = _resolve_drilldown_order(sort, sort_dir)
     summary_rows = await db.query_client_summary(
         **filter_kw,
+        filter_tags=resolved_tags,
         order_by=order,
         limit=page_size,
         offset=offset,
@@ -2355,6 +2539,10 @@ async def search_families_drilldown(
     sort: str | None = Query(None, description="Column to sort by"),
     sort_dir: str | None = Query(None, description="Sort direction: asc or desc"),
     scope: str = Query("site", pattern="^(site|org)$", description="Anomaly-flag scope for IF/DBSCAN/Centroid. Markov is site-WLAN only regardless."),
+    filter_tag: list[str] = Query(
+        default=[],
+        description="Repeated free-text filter tags (AND-combined) applied server-side so page size stays fixed.",
+    ),
 ):
     """
     Multi-family drilldown: returns a paginated slice of the all-WLANs
@@ -2383,14 +2571,17 @@ async def search_families_drilldown(
     finally:
         await redis_client.aclose()
 
-    counts = await db.count_client_summary(family_substring=norm)
-    if counts["total"] == 0:
+    resolved_tags = _resolve_filter_tags(filter_tag, site_map)
+
+    counts = await db.count_client_summary(family_substring=norm, filter_tags=resolved_tags)
+    if counts["total"] == 0 and not resolved_tags:
         raise HTTPException(status_code=404, detail=f"No events found for families matching '{q}' across any site.")
 
     offset = (page - 1) * page_size
     order = _resolve_drilldown_order(sort, sort_dir)
     summary_rows = await db.query_client_summary(
         family_substring=norm,
+        filter_tags=resolved_tags,
         order_by=order,
         limit=page_size,
         offset=offset,
@@ -2492,6 +2683,10 @@ async def search_clients_drilldown(
         pattern="^(site|org)$",
         description="Anomaly-flag scope for IF/DBSCAN/Centroid. Markov is site-WLAN only regardless.",
     ),
+    filter_tag: list[str] = Query(
+        default=[],
+        description="Repeated free-text filter tags (AND-combined) applied server-side so page size stays fixed.",
+    ),
 ):
     """
     Cross-site / cross-WLAN per-MAC drilldown for a MAC prefix (paginated).
@@ -2522,8 +2717,10 @@ async def search_clients_drilldown(
     finally:
         await redis_client.aclose()
 
-    counts = await db.count_client_summary(mac_prefix=norm)
-    if counts["total"] == 0:
+    resolved_tags = _resolve_filter_tags(filter_tag, site_map)
+
+    counts = await db.count_client_summary(mac_prefix=norm, filter_tags=resolved_tags)
+    if counts["total"] == 0 and not resolved_tags:
         raise HTTPException(
             status_code=404,
             detail=f"No events found for MACs matching prefix '{norm}' across any site.",
@@ -2533,6 +2730,7 @@ async def search_clients_drilldown(
     order = _resolve_drilldown_order(sort, sort_dir)
     summary_rows = await db.query_client_summary(
         mac_prefix=norm,
+        filter_tags=resolved_tags,
         order_by=order,
         limit=page_size,
         offset=offset,

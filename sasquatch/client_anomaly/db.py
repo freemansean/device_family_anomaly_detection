@@ -615,6 +615,32 @@ async def get_org_client_cache(org_id: str) -> dict[str, dict] | None:
     return result
 
 
+async def iter_org_client_rows(org_id: str):
+    """
+    Yield client rows for an org one tuple at a time so CSV export can stream
+    without holding the full cache in memory. Each tuple matches the column
+    order of ``CLIENT_EXPORT_COLUMNS``.
+    """
+    conn = await get_connection()
+    cursor = await conn.execute(
+        """SELECT mac, family, manufacturer, model, os, random_mac,
+                  last_username, last_ssid, last_ap, last_site_id, updated_at
+           FROM clients WHERE org_id = ? ORDER BY mac""",
+        (org_id,),
+    )
+    try:
+        async for row in cursor:
+            yield row
+    finally:
+        await cursor.close()
+
+
+CLIENT_EXPORT_COLUMNS: tuple[str, ...] = (
+    "mac", "family", "manufacturer", "model", "os", "random_mac",
+    "last_username", "last_ssid", "last_ap", "last_site_id", "updated_at",
+)
+
+
 async def get_service_account_usernames(
     org_id: str, min_count: int
 ) -> dict[str, dict]:
@@ -952,6 +978,78 @@ def _row_to_summary_dict(row) -> dict:
     return {c: row[i] for i, c in enumerate(_CLIENT_SUMMARY_COLS)}
 
 
+# Per-service SQL fragments that mirror computeMacServiceAlarms() in
+# OrgFamilyDrilldown.jsx: a MAC has a service alarm when that service has any
+# outcome-bearing events (success + failure > 0), at least one failure, and
+# success/total < 0.5. Kept here so alarm-keyword filter tags ("auth", "dhcp"…)
+# produce the same set of MACs the UI would have rendered under a client-side
+# filter.
+_SERVICE_ALARM_SQL: dict[str, str] = {
+    "auth": (
+        "(auth_success + auth_failure) > 0 AND auth_failure > 0 "
+        "AND CAST(auth_success AS REAL) / (auth_success + auth_failure) < 0.5"
+    ),
+    "roam": (
+        "(roam_success + roam_failure) > 0 AND roam_failure > 0 "
+        "AND CAST(roam_success AS REAL) / (roam_success + roam_failure) < 0.5"
+    ),
+    "dhcp": (
+        "(dhcp_success + dhcp_failure) > 0 AND dhcp_failure > 0 "
+        "AND CAST(dhcp_success AS REAL) / (dhcp_success + dhcp_failure) < 0.5"
+    ),
+    "dns": (
+        "(dns_success + dns_failure) > 0 AND dns_failure > 0 "
+        "AND CAST(dns_success AS REAL) / (dns_success + dns_failure) < 0.5"
+    ),
+    "arp": (
+        "(arp_success + arp_failure) > 0 AND arp_failure > 0 "
+        "AND CAST(arp_success AS REAL) / (arp_success + arp_failure) < 0.5"
+    ),
+}
+
+
+def _filter_tag_clause(tag: dict) -> tuple[str, list]:
+    """
+    Turn one resolved filter tag into a WHERE sub-clause.
+
+    ``tag`` shape::
+
+        {"text": "<lowercase user input>", "site_ids": [<optional>]}
+
+    Routes are responsible for pre-resolving site-name matches into ``site_ids``
+    via the Mist sites map; db.py stays pure-SQL and never touches Redis.
+
+    Semantics match the frontend haystack in OrgFamilyDrilldown.jsx: each tag
+    is OR-matched across mac / device_family / last_username / wlan / site_id,
+    plus the service-alarm keyword shortcuts (``auth``, ``roam``, ``dhcp``,
+    ``dns``, ``arp``) and the bare literal ``alarm`` (any service alarm). All
+    tags are AND-combined by the caller.
+    """
+    text = tag["text"]
+    like = f"%{text}%"
+    ors: list[str] = [
+        "LOWER(mac) LIKE ?",
+        "LOWER(COALESCE(device_family, '')) LIKE ?",
+        "LOWER(COALESCE(last_username, '')) LIKE ?",
+        "LOWER(COALESCE(wlan, '')) LIKE ?",
+    ]
+    params: list = [like, like, like, like]
+
+    site_ids = tag.get("site_ids") or []
+    if site_ids:
+        placeholders = ",".join("?" * len(site_ids))
+        ors.append(f"site_id IN ({placeholders})")
+        params.extend(site_ids)
+
+    if text == "alarm":
+        ors.append("service_alarm = 1")
+    svc_sql = _SERVICE_ALARM_SQL.get(text)
+    if svc_sql:
+        ors.append(f"({svc_sql})")
+
+    return "(" + " OR ".join(ors) + ")", params
+
+
 def _summary_where(
     *,
     family_exact: Optional[str] = None,
@@ -961,8 +1059,16 @@ def _summary_where(
     service_account_family: Optional[str] = None,
     last_username: Optional[str] = None,
     mac_prefix: Optional[str] = None,
+    filter_tags: Optional[list[dict]] = None,
 ) -> tuple[str, list]:
-    """Build a WHERE clause + param list for client_summary queries."""
+    """Build a WHERE clause + param list for client_summary queries.
+
+    ``filter_tags`` is an optional list of resolved tag dicts (see
+    ``_filter_tag_clause``); each tag's internal OR-block is AND-joined with
+    every other filter. Keeping the structural filters (``family_exact``,
+    ``wlan``, etc.) separate from the free-text tag filters means scope-defining
+    params still use indexed equality predicates while tags layer on top.
+    """
     conditions: list[str] = []
     params: list = []
     if family_exact is not None:
@@ -987,6 +1093,10 @@ def _summary_where(
         # Leading-anchored LIKE hits idx_summary_mac as a range scan.
         conditions.append("mac LIKE ?")
         params.append(f"{mac_prefix.lower()}%")
+    for tag in filter_tags or []:
+        clause, tag_params = _filter_tag_clause(tag)
+        conditions.append(clause)
+        params.extend(tag_params)
     where = (" WHERE " + " AND ".join(conditions)) if conditions else ""
     return where, params
 
@@ -1000,6 +1110,7 @@ async def query_client_summary(
     service_account_family: Optional[str] = None,
     last_username: Optional[str] = None,
     mac_prefix: Optional[str] = None,
+    filter_tags: Optional[list[dict]] = None,
     limit: Optional[int] = None,
     offset: Optional[int] = None,
     order_by: Optional[str] = None,
@@ -1014,6 +1125,8 @@ async def query_client_summary(
     - ``wlan`` / ``site_id``: scope filters.
     - ``service_account_family`` / ``last_username``: back the service-account
       drilldown and future per-username filters.
+    - ``filter_tags``: list of resolved free-text tag dicts from the drilldown
+      UI filter box — see ``_filter_tag_clause`` for the per-tag match semantics.
     - ``limit``: optional row cap.
     - ``offset``: skip this many rows (used with ``limit`` for pagination).
     - ``order_by``: raw SQL ORDER BY clause (e.g. ``"if_score ASC"``).
@@ -1024,6 +1137,7 @@ async def query_client_summary(
         family_exact=family_exact, family_substring=family_substring,
         wlan=wlan, site_id=site_id, service_account_family=service_account_family,
         last_username=last_username, mac_prefix=mac_prefix,
+        filter_tags=filter_tags,
     )
 
     order_sql = f" ORDER BY {order_by}" if order_by else ""
@@ -1049,6 +1163,7 @@ async def count_client_summary(
     service_account_family: Optional[str] = None,
     last_username: Optional[str] = None,
     mac_prefix: Optional[str] = None,
+    filter_tags: Optional[list[dict]] = None,
 ) -> dict:
     """
     Return aggregate counts for a client_summary query without fetching rows.
@@ -1060,6 +1175,7 @@ async def count_client_summary(
         family_exact=family_exact, family_substring=family_substring,
         wlan=wlan, site_id=site_id, service_account_family=service_account_family,
         last_username=last_username, mac_prefix=mac_prefix,
+        filter_tags=filter_tags,
     )
 
     conn = await get_connection()
