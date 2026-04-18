@@ -53,6 +53,7 @@ from sklearn.neighbors import NearestNeighbors
 from sklearn.preprocessing import StandardScaler
 
 from . import config
+from . import db as _db
 from .event_collector import get_events, sanitize_wlan_key
 from .feature_engineer import (
     SERVICE_ACCOUNT_SUFFIX,
@@ -200,7 +201,9 @@ def _auto_eps(X_reduced: np.ndarray, min_samples: int) -> float:
     """
     n = X_reduced.shape[0]
     k = max(2, min(min_samples, n - 1))
-    nn = NearestNeighbors(n_neighbors=k + 1).fit(X_reduced)
+    # ball_tree keeps memory O(n log n) on the 5-8 dim PCA-reduced input,
+    # vs. brute's O(n²) pairwise matrix that spiked ~800 MB on org-wide runs.
+    nn = NearestNeighbors(n_neighbors=k + 1, algorithm="ball_tree").fit(X_reduced)
     dists, _ = nn.kneighbors(X_reduced)
     kth = np.sort(dists[:, k])
     if kth.size < 2 or kth[-1] <= kth[0]:
@@ -271,7 +274,9 @@ def _run_dbscan(macs: list[str], feature_records: list[dict]) -> dict[str, dict]
         pca.explained_variance_ratio_.sum() * 100,
     )
 
-    db = DBSCAN(eps=eps, min_samples=min_samples)
+    # Match algorithm to _auto_eps's NearestNeighbors — ball_tree avoids the
+    # O(n²) pairwise matrix brute would build on the org-wide MAC population.
+    db = DBSCAN(eps=eps, min_samples=min_samples, algorithm="ball_tree")
     labels = db.fit_predict(X_reduced)
 
     return {
@@ -581,10 +586,12 @@ async def score(
             )
             return 0
 
-        # Load raw events for post-hoc explainer (only used for outliers)
+        # Load raw events for post-hoc explainer (only used for outliers).
+        # Trailing 24h window — see db.DETECTION_WINDOW_SECONDS.
         events = await get_events(
             site_id=site_id,
             wlan=wlan,
+            since=_db.get_detection_cutoff(),
         )
         mac_raw_events: dict[str, list[dict]] = defaultdict(list)
         for evt in events:
@@ -1342,9 +1349,11 @@ async def score_org_wide(
 
     async def _load_site_events(sid: str) -> "dict[str, list[dict]]":
         if sid not in raw_events_cache:
+            # Trailing 24h window — see db.DETECTION_WINDOW_SECONDS.
             evts = await get_events(
                 site_id=sid,
                 wlan=wlan,
+                since=_db.get_detection_cutoff(),
             )
             mac_raw: dict[str, list[dict]] = defaultdict(list)
             for evt in evts:

@@ -36,7 +36,24 @@ DB_PATH = os.getenv(
 )
 
 # Retention: events older than this are pruned on each write cycle.
+# This is the storage window — drilldowns, search, post-incident forensics
+# all read against this 7-day pool.
 EVENTS_RETENTION_SECONDS = 7 * 24 * 3600  # 7 days
+
+# Detection window: anomaly detection (feature_engineer.build_features and
+# anomaly_detector.score / score_org_wide) only considers events newer than
+# this. Decoupled from EVENTS_RETENTION_SECONDS so the storage horizon can
+# stay long for forensics while detection focuses on "current behavior".
+# Bounding the detection window also bounds Phase 3/4 working-set memory:
+# more days of data → more rare MACs → larger composite_features dict.
+DETECTION_WINDOW_SECONDS = 24 * 3600  # 24 hours
+
+
+def get_detection_cutoff() -> float:
+    """Unix timestamp marking the lower bound of the anomaly detection
+    window. Single source of truth for every detection-side `get_events`
+    call so the window can be tuned in one place."""
+    return time.time() - DETECTION_WINDOW_SECONDS
 
 # Module-level connection -- lazily initialised.
 _conn: Optional[aiosqlite.Connection] = None
@@ -332,12 +349,17 @@ async def get_events(
     site_id: Optional[str] = None,
     wlan: Optional[str] = None,
     since: Optional[float] = None,
+    mac: Optional[str] = None,
 ) -> list[dict]:
     """
-    Load events from SQLite, optionally filtered by site and/or WLAN.
+    Load events from SQLite, optionally filtered by site and/or WLAN and/or
+    MAC.
 
     By default returns events from the last EVENTS_RETENTION_SECONDS (7 days).
-    Pass `since` to override the cutoff timestamp.
+    Pass `since` to override the cutoff timestamp. Pass `mac` (normalized
+    form: no colons, lowercase — same as how event_collector stores it) to
+    pull only that MAC's events; this is the path the per-MAC drilldown
+    takes and uses idx_events_mac to avoid a full per-site scan.
     """
     conn = await get_connection()
     cutoff = since if since is not None else (time.time() - EVENTS_RETENTION_SECONDS)
@@ -351,6 +373,9 @@ async def get_events(
     if wlan:
         conditions.append("wlan = ?")
         params.append(wlan)
+    if mac:
+        conditions.append("mac = ?")
+        params.append(mac)
 
     where = " AND ".join(conditions)
     query = f"SELECT raw_json FROM events WHERE {where} ORDER BY timestamp"
@@ -395,6 +420,164 @@ async def get_event_count(
     query = f"SELECT COUNT(*) FROM events WHERE {where}"
     rows = await conn.execute_fetchall(query, params)
     return rows[0][0] if rows else 0
+
+
+async def get_event_counts_by_site_wlan() -> dict[tuple[str, str], int]:
+    """
+    SQL-side per-(site_id, wlan) event count across the **detection window**
+    (DETECTION_WINDOW_SECONDS, currently 24h), not the storage retention
+    window. Used by Phase 2 to filter out scopes with no in-window events
+    before doing per-scope feature builds — must match the window the
+    detection-side `get_events` calls use, or Phase 2 would emit work for
+    scopes whose events are all stale.
+
+    Replaces the previous pattern of `get_events()` (full org corpus, every
+    raw_json blob decoded) followed by `Counter(e["site_id"] for e in ...)`.
+    On a multi-million-event org that pattern peaked at ~30 GB of decoded
+    Python dicts; this returns a dict of ~hundreds of (site, wlan) tuples
+    using kilobytes.
+    """
+    conn = await get_connection()
+    cutoff = get_detection_cutoff()
+    query = (
+        "SELECT site_id, COALESCE(wlan, '') AS w, COUNT(*) AS cnt "
+        "FROM events WHERE timestamp >= ? "
+        "GROUP BY site_id, w"
+    )
+    rows = await conn.execute_fetchall(query, [cutoff])
+    return {(sid, wlan): int(cnt) for sid, wlan, cnt in rows}
+
+
+async def get_events_category_rollup(
+    site_id: str,
+    wlan: str,
+    macs_filter: Optional[set[str]] = None,
+) -> tuple[dict[str, dict[str, int]], dict[str, set[str]]]:
+    """
+    SQL-side rollup of (device_family, event_category, mac) for one (site, wlan).
+
+    Returns (cat_counts, family_macs):
+      cat_counts:  {device_family: {event_category: count}}
+      family_macs: {device_family: set(mac)}
+
+    Used by build_site_events_summary instead of pulling and json.loads-ing
+    every event row. On a million-event site this drops peak memory from
+    multi-GB to a few hundred KB.
+
+    `macs_filter`, if provided, restricts the rollup to events whose mac is
+    in the set — used by the service-account synthetic-row pass.
+    """
+    conn = await get_connection()
+    cutoff = time.time() - EVENTS_RETENTION_SECONDS
+
+    query = (
+        "SELECT COALESCE(device_family, 'Unknown') AS fam, "
+        "       COALESCE(event_category, 'OTHER') AS cat, "
+        "       mac, "
+        "       COUNT(*) AS cnt "
+        "FROM events "
+        "WHERE timestamp >= ? AND site_id = ? AND wlan = ? "
+        "GROUP BY fam, cat, mac"
+    )
+    rows = await conn.execute_fetchall(query, [cutoff, site_id, wlan])
+
+    # MACs are stored normalized (no colons, lowercase) by event_collector,
+    # so no per-row normalization is required.
+    cat_counts: dict[str, dict[str, int]] = {}
+    family_macs: dict[str, set[str]] = {}
+    for fam, cat, mac, cnt in rows:
+        if macs_filter is not None and mac not in macs_filter:
+            continue
+        if fam not in cat_counts:
+            cat_counts[fam] = {}
+            family_macs[fam] = set()
+        cat_counts[fam][cat] = cat_counts[fam].get(cat, 0) + int(cnt)
+        if mac:
+            family_macs[fam].add(mac)
+    return cat_counts, family_macs
+
+
+async def get_per_mac_category_counts_for_family(
+    site_id: str,
+    wlan: str,
+    family: Optional[str] = None,
+    macs_filter: Optional[set[str]] = None,
+) -> tuple[dict[str, dict[str, int]], dict[str, int]]:
+    """
+    SQL-side per-MAC category breakdown within a (site, wlan), filtered by
+    either device_family or an explicit MAC set (used by service-account
+    families which select members by sa membership rather than by event
+    device_family).
+
+    Returns (mac_counts, mac_total):
+      mac_counts: {mac: {event_category: count}}
+      mac_total:  {mac: total_events}
+
+    Replaces the per-row Python pattern in /sites/{id}/families/{family}/event-counts
+    that pulled and JSON-decoded every event in the (site, wlan) — the full
+    7-day blob — just to filter to one family on the server.
+    """
+    conn = await get_connection()
+    cutoff = time.time() - EVENTS_RETENTION_SECONDS
+    conditions = ["timestamp >= ?", "site_id = ?", "wlan = ?"]
+    params: list = [cutoff, site_id, wlan]
+    if family:
+        conditions.append("device_family = ?")
+        params.append(family)
+    if macs_filter:
+        placeholders = ",".join("?" * len(macs_filter))
+        conditions.append(f"mac IN ({placeholders})")
+        params.extend(sorted(macs_filter))
+    where = " AND ".join(conditions)
+    query = (
+        f"SELECT mac, COALESCE(event_category, 'OTHER') AS cat, COUNT(*) AS cnt "
+        f"FROM events WHERE {where} "
+        f"GROUP BY mac, cat"
+    )
+    rows = await conn.execute_fetchall(query, params)
+    mac_counts: dict[str, dict[str, int]] = {}
+    mac_total: dict[str, int] = {}
+    for mac, cat, cnt in rows:
+        if not mac:
+            continue
+        cnt_i = int(cnt)
+        if mac not in mac_counts:
+            mac_counts[mac] = {}
+            mac_total[mac] = 0
+        mac_counts[mac][cat] = cnt_i
+        mac_total[mac] += cnt_i
+    return mac_counts, mac_total
+
+
+async def get_mac_category_counts(
+    site_id: str,
+    wlan: str,
+    macs: set[str],
+) -> dict[str, int]:
+    """
+    SQL-side per-category event counts for a specific set of MACs at one
+    (site, wlan). Used by the service-account synthetic-row builder to avoid
+    a second full-event scan in build_site_events_summary.
+
+    Returns {event_category: total_count} summed across the supplied macs.
+    """
+    if not macs:
+        return {}
+    conn = await get_connection()
+    cutoff = time.time() - EVENTS_RETENTION_SECONDS
+    # MACs are stored normalized (no colons, lowercase) by event_collector,
+    # so we can match against the column directly without LOWER/REPLACE.
+    placeholders = ",".join("?" * len(macs))
+    query = (
+        f"SELECT COALESCE(event_category, 'OTHER') AS cat, COUNT(*) AS cnt "
+        f"FROM events "
+        f"WHERE timestamp >= ? AND site_id = ? AND wlan = ? "
+        f"AND mac IN ({placeholders}) "
+        f"GROUP BY cat"
+    )
+    params = [cutoff, site_id, wlan, *sorted(macs)]
+    rows = await conn.execute_fetchall(query, params)
+    return {cat: int(cnt) for cat, cnt in rows}
 
 
 async def get_wlans(site_id: Optional[str] = None) -> list[str]:

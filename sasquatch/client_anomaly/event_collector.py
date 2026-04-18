@@ -917,13 +917,15 @@ async def get_events(
     site_id: Optional[str] = None,
     wlan: Optional[str] = None,
     since: Optional[float] = None,
+    mac: Optional[str] = None,
 ) -> list[dict]:
     """
-    Load events from SQLite, optionally filtered by site and/or WLAN.
+    Load events from SQLite, optionally filtered by site and/or WLAN and/or MAC.
     wlan=None returns all events regardless of WLAN.
     since: optional Unix timestamp cutoff (default: 7 days ago).
+    mac: normalized MAC (no colons, lowercase) — filters via idx_events_mac.
     """
-    return await db.get_events(site_id=site_id, wlan=wlan, since=since)
+    return await db.get_events(site_id=site_id, wlan=wlan, since=since, mac=mac)
 
 
 async def get_wlans(site_id: Optional[str] = None) -> list[str]:

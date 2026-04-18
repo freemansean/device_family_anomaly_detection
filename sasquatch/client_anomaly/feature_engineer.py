@@ -345,7 +345,11 @@ async def build_features(site_id: str, wlan: str) -> int:
     """
     redis_client = aioredis.from_url(REDIS_URL, decode_responses=True)
     try:
-        events = await get_events(site_id=site_id, wlan=wlan)
+        # Detection considers the trailing 24h only — see db.DETECTION_WINDOW_SECONDS.
+        # Storage retention is a longer 7-day window for drilldowns / forensics.
+        events = await get_events(
+            site_id=site_id, wlan=wlan, since=_db.get_detection_cutoff(),
+        )
         if not events:
             raise RuntimeError(
                 f"No events found for site {site_id} / wlan={wlan}. "

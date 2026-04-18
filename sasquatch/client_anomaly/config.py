@@ -44,7 +44,7 @@ DEFAULTS = {
         # webhook dispatcher and the OrgAlerts UI feed. Lives under General Config
         # (alongside alarm_min_family_size) because it gates alarm generation at
         # both org and site level, not the anomaly detection pipeline itself.
-        "anomaly_health_score_threshold": {"default": 0.30, "env": "ANOMALY_HEALTH_SCORE_THRESHOLD", "cast": float},
+        "anomaly_health_score_threshold": {"default": 0.20, "env": "ANOMALY_HEALTH_SCORE_THRESHOLD", "cast": float},
         # Service-alarm device-percentage threshold for dual-gate alarm
         # generation. A device family is "service-alarming" when at least this
         # fraction of its MACs have individually tripped a service alarm
@@ -53,7 +53,7 @@ DEFAULTS = {
         # both gate webhook dispatch and the org/site alert feeds. Default 0.50
         # requires at least half of the family's MACs to have tripped a per-MAC
         # service alarm before the service-alarm path fires.
-        "alarm_service_device_pct": {"default": 0.50, "env": "ALARM_SERVICE_DEVICE_PCT", "cast": float},
+        "alarm_service_device_pct": {"default": 0.70, "env": "ALARM_SERVICE_DEVICE_PCT", "cast": float},
         # Combine mode for the two health-side alarm gates
         # (anomaly_health_score_threshold and alarm_service_device_pct).
         # "or"  = fire when either gate trips (preserves prior behavior).

@@ -762,14 +762,16 @@ async def build_org_summary(redis_client, site_map: dict[str, str], wlan: str) -
     Mist API calls, no HTTPException raises. Called by both the route handler
     (cache miss path) and the pipeline writer (post-detection cache fill).
     """
-    # Load all events once, counting per site. Per-site sorted sets are fetched
-    # in a single pipeline inside get_events().
-    all_events = await get_events()
-    events_per_site: Counter = Counter(
-        e["site_id"]
-        for e in all_events
-        if e.get("site_id") and e.get("wlan") == wlan
-    )
+    # Per-site event count for this WLAN, computed via SQL aggregation rather
+    # than pulling and decoding the full org event corpus. The previous
+    # implementation (`get_events()` → `Counter(e["site_id"] for ...)`)
+    # materialized every event in the 7-day retention window in Python and
+    # was the dominant source of Phase 5 OOM kills.
+    event_counts = await db.get_event_counts_by_site_wlan()
+    events_per_site: Counter = Counter()
+    for (sid_k, wlan_k), cnt in event_counts.items():
+        if sid_k and wlan_k == wlan:
+            events_per_site[sid_k] = cnt
 
     sites_sorted = sorted(site_map.items(), key=lambda x: x[1].lower())
     pipe = redis_client.pipeline()
@@ -3016,26 +3018,27 @@ async def build_site_events_summary(site_id: str, wlan: str) -> dict | None:
     Build the /sites/{id}/events/summary response. Pure aggregator. Returns
     None when no events exist for the (site, wlan) pair so the caller can
     translate that to a 404.
+
+    Aggregation is pushed down to SQLite via db.get_events_category_rollup —
+    the previous implementation pulled every event row plus its raw_json blob
+    into Python, which on a million-event site produced multi-GB peaks during
+    the Phase 5 summary cache rebuild loop (~1200 calls in a row, no GC
+    between them, OOM by mid-loop).
     """
-    events = await get_events(
-        site_id=site_id,
-        wlan=wlan,
-    )
-    if not events:
+    cat_counts, family_macs_sets = await db.get_events_category_rollup(site_id, wlan)
+    if not cat_counts:
         return None
 
-    summary: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
-    family_totals: Counter = Counter()
-    family_macs: dict[str, set] = defaultdict(set)
-
-    for event in events:
-        family = event.get("device_family", "Unknown")
-        category = event.get("event_category", "OTHER")
-        summary[family][category] += 1
-        family_totals[family] += 1
-        mac = (event.get("mac") or "").replace(":", "").lower()
-        if mac:
-            family_macs[family].add(mac)
+    summary: dict[str, dict[str, int]] = {
+        fam: dict(counts) for fam, counts in cat_counts.items()
+    }
+    family_totals: Counter = Counter({
+        fam: sum(counts.values()) for fam, counts in cat_counts.items()
+    })
+    family_macs: dict[str, set] = {
+        fam: set(macs) for fam, macs in family_macs_sets.items()
+    }
+    total_events = sum(family_totals.values())
 
     # Aggregate per-family Markov stats from anomaly records. Uses the canonical
     # family rollup rules from markov_analyzer.run_markov_analysis so the Site
@@ -3109,18 +3112,15 @@ async def build_site_events_summary(site_id: str, wlan: str) -> dict | None:
     # family row — by design, dual-family visibility.
     if sa_family_members:
         for sa_family, member_macs in sa_family_members.items():
-            sa_counts: Counter = Counter()
-            sa_total = 0
-            for event in events:
-                mac = (event.get("mac") or "").replace(":", "").lower()
-                if mac and mac in member_macs:
-                    sa_counts[event.get("event_category", "OTHER")] += 1
-                    sa_total += 1
+            norm_members = {(m or "").replace(":", "").lower() for m in member_macs}
+            norm_members.discard("")
+            sa_counts_map = await db.get_mac_category_counts(site_id, wlan, norm_members)
+            sa_total = sum(sa_counts_map.values())
             if sa_total == 0:
                 continue
-            summary[sa_family] = sa_counts
+            summary[sa_family] = dict(sa_counts_map)
             family_totals[sa_family] = sa_total
-            family_macs[sa_family] = set(member_macs)
+            family_macs[sa_family] = norm_members
 
     result = {}
     for family, cat_counts in summary.items():
@@ -3145,7 +3145,7 @@ async def build_site_events_summary(site_id: str, wlan: str) -> dict | None:
     return {
         "site_id": site_id,
         "wlan": wlan,
-        "total_events": len(events),
+        "total_events": total_events,
         "families": result,
         "family_client_counts": {fam: len(macs) for fam, macs in family_macs.items()},
         "family_markov": family_markov,
@@ -3372,13 +3372,6 @@ async def get_family_event_counts(site_id: str, family: str, wlan: str = Query(.
     rather than by event device_family — events are tagged with the underlying
     primary family, not the sa family.
     """
-    events = await get_events(
-        site_id=site_id,
-        wlan=wlan,
-    )
-    if not events:
-        raise HTTPException(status_code=404, detail="No events found for site.")
-
     client_cache = await get_client_cache() or {}
 
     is_sa_family = family.endswith(".service_account")
@@ -3395,25 +3388,19 @@ async def get_family_event_counts(site_id: str, family: str, wlan: str = Query(.
         if not sa_member_macs:
             raise HTTPException(status_code=404, detail=f"No clients found for family '{family}'.")
 
-    mac_counts: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
-    mac_total: dict[str, int] = defaultdict(int)
-    family_macs: set[str] = set()
+    # Pushed down to SQL: previously this pulled every event for the (site, wlan)
+    # over the 7-day retention window and JSON-decoded each one just to filter
+    # to one family — the same anti-pattern that spiked CPU on MAC drilldown.
+    if is_sa_family:
+        mac_counts, mac_total = await db.get_per_mac_category_counts_for_family(
+            site_id, wlan, macs_filter=sa_member_macs,
+        )
+    else:
+        mac_counts, mac_total = await db.get_per_mac_category_counts_for_family(
+            site_id, wlan, family=family,
+        )
 
-    for event in events:
-        mac = (event.get("mac") or "").replace(":", "").lower()
-        if not mac:
-            continue
-        if is_sa_family:
-            if mac not in sa_member_macs:
-                continue
-        else:
-            if event.get("device_family") != family:
-                continue
-        category = event.get("event_category", "OTHER")
-        mac_counts[mac][category] += 1
-        mac_total[mac] += 1
-        family_macs.add(mac)
-
+    family_macs: set[str] = set(mac_counts.keys())
     if not family_macs:
         raise HTTPException(status_code=404, detail=f"No clients found for family '{family}'.")
 
@@ -3467,12 +3454,12 @@ async def get_mac_anomaly(site_id: str, mac: str, wlan: str = Query(..., min_len
     mac_features = features.get(mac_normalized, {})
 
     # Event timeline — always show ALL events for this MAC regardless of WLAN scope
-    # so the admin can see the full picture of this device's behavior
-    all_events = await get_events(site_id=site_id)
-    mac_events = [
-        e for e in all_events
-        if (e.get("mac") or "").replace(":", "").lower() == mac_normalized
-    ]
+    # so the admin can see the full picture of this device's behavior. Pushed
+    # down to SQL via the `mac` filter; idx_events_mac makes this near-instant
+    # vs. the prior pattern of pulling every site event and Python-filtering
+    # (which spiked CPU to 100% on busy sites with hundreds of thousands of
+    # events).
+    mac_events = await get_events(site_id=site_id, mac=mac_normalized)
     mac_events.sort(key=lambda e: e.get("timestamp", 0))
 
     client_cache = await get_client_cache() or {}

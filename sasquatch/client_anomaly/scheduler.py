@@ -13,6 +13,7 @@ operation (collecting or detecting) runs at a time.
 """
 
 import asyncio
+import ctypes
 import gc
 import json
 import logging
@@ -37,6 +38,13 @@ from . import config as _config_mod
 from . import db
 
 log = logging.getLogger(__name__)
+
+try:
+    _LIBC = ctypes.CDLL("libc.so.6")
+    _LIBC.malloc_trim.argtypes = [ctypes.c_size_t]
+    _LIBC.malloc_trim.restype = ctypes.c_int
+except OSError:
+    _LIBC = None
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 MIST_API_TOKEN = os.getenv("MIST_API_TOKEN", "")
@@ -140,10 +148,18 @@ async def _release_phase_memory(phase_label: str) -> None:
     # teardown) complete and their buffers are released before the next
     # phase's heavy allocations.
     await asyncio.sleep(0)
+    # gc.collect() frees Python objects but glibc retains freed arenas in
+    # userspace rather than returning pages to the kernel. After a detection
+    # run that allocates multi-GB numpy/sklearn buffers, the process RSS can
+    # sit at 10+ GB of private-anonymous pages with zero live Python objects,
+    # leaving no headroom for the next phase and causing OOM kills. Ask glibc
+    # to trim freed arenas back to the OS.
+    trimmed = _LIBC.malloc_trim(0) if _LIBC is not None else -1
     log.info(
-        "[gc] %s phase boundary: collected %d objects",
+        "[gc] %s phase boundary: collected %d objects, malloc_trim=%d",
         phase_label,
         collected,
+        trimmed,
     )
 
 
@@ -313,6 +329,19 @@ async def _run_org_pipeline_body(
     site_map: {site_id: site_name} for progress messages.
     """
     started = _time.time()
+    # Per-phase wall-clock timings, logged at each phase boundary and
+    # re-summarized at pipeline exit. Helps tell where to invest next on
+    # the speedup work — Phase 5's per-site loop is the obvious candidate
+    # but worth confirming with numbers before parallelizing anything.
+    phase_timings: dict[str, float] = {}
+    _phase_clock = {"start": _time.monotonic(), "label": "phase1_setup"}
+
+    def _phase_done(label: str) -> None:
+        elapsed = _time.monotonic() - _phase_clock["start"]
+        phase_timings[label] = elapsed
+        log.info("[timing] %s: %.2fs", label, elapsed)
+        _phase_clock["start"] = _time.monotonic()
+        _phase_clock["label"] = label
 
     async def _progress(data: dict) -> None:
         data["started_at"] = started
@@ -337,20 +366,27 @@ async def _run_org_pipeline_body(
         finally:
             await _redis_for_baseline.aclose()
 
-        for i, sid in enumerate(site_ids):
-            site_name = site_map.get(sid, sid[:8])
-            await _progress({
-                "phase": "building_features",
-                "current_site": site_name,
-                "sites_complete": i,
-                "total_sites": total_sites,
-                "org_complete": False,
-            })
+        # Pre-compute (site, wlan) event counts in one SQL GROUP BY so we can
+        # skip every scope with zero events before doing any per-scope work.
+        # On a 197-site org with ~125 sites empty for the current retention
+        # window this drops Phase 2 work by more than half. The per-site
+        # `get_wlans()` call still runs because it's needed to populate
+        # `wlans_by_site` for the downstream phases — but `build_features` and
+        # `score_health` are only invoked for scopes with at least one event.
+        try:
+            scope_event_counts = await db.get_event_counts_by_site_wlan()
+        except Exception:
+            log.exception("[org pipeline] event count pre-scan failed; falling back to no-skip")
+            scope_event_counts = {}
+
+        # Markov baseline build remains a sequential per-site step. It only
+        # fires when a baseline is missing (48hr TTL — usually a no-op on a
+        # warm system) and we don't want N parallel rebuilds hammering a cold
+        # Redis after a flush.
+        for sid in site_ids:
             try:
                 wlans = await get_wlans(site_id=sid)
                 wlans_by_site[sid] = wlans
-
-                # Build Markov baselines if missing (same fallback as _run_wlan_detection)
                 _redis_bl = aioredis.from_url(REDIS_URL, decode_responses=True)
                 try:
                     for wlan in wlans:
@@ -362,17 +398,78 @@ async def _run_org_pipeline_body(
                                 log.exception("[org pipeline] Markov baseline build failed site=%s wlan=%s", sid, wlan)
                 finally:
                     await _redis_bl.aclose()
+            except Exception:
+                log.exception(f"[org pipeline] WLAN/Markov pre-pass failed for site {sid}")
+                wlans_by_site.setdefault(sid, [])
 
-                for wlan in wlans:
+        # Flatten (site, wlan) pairs that actually have events. Same concurrency
+        # pattern as Phase 3: each build_features/score_health pair is independent
+        # (separate Redis client, separate event list), bounded to 4 in-flight to
+        # keep peak memory predictable. Empty scopes are dropped here.
+        phase2_pairs: list[tuple[str, str]] = []
+        phase2_skipped_empty = 0
+        for sid in site_ids:
+            for wlan in wlans_by_site.get(sid, []):
+                if scope_event_counts.get((sid, wlan), 0) > 0:
+                    phase2_pairs.append((sid, wlan))
+                elif scope_event_counts:
+                    # Only count skips when the pre-scan succeeded — falling
+                    # back to no-skip would otherwise inflate this counter.
+                    phase2_skipped_empty += 1
+
+        _PHASE2_CONCURRENCY = 4
+        phase2_sem = asyncio.Semaphore(_PHASE2_CONCURRENCY)
+        phase2_done_count = {"n": 0}
+
+        async def _build_one(sid: str, wlan: str) -> None:
+            async with phase2_sem:
+                try:
                     await build_features(sid, wlan)
                     await score_health(sid, wlan)
-            except Exception:
-                log.exception(f"[org pipeline] Feature build failed for site {sid}")
-                wlans_by_site.setdefault(sid, [])
+                except Exception:
+                    log.exception(
+                        f"[org pipeline] Feature/health build failed for site={sid} wlan={wlan}"
+                    )
+                finally:
+                    phase2_done_count["n"] += 1
+
+        phase2_progress_done = asyncio.Event()
+        phase2_total_pairs = len(phase2_pairs)
+
+        async def _phase2_progress_ticker() -> None:
+            while not phase2_progress_done.is_set():
+                await _progress({
+                    "phase": "building_features",
+                    "current_site": None,
+                    "sites_complete": phase2_done_count["n"],
+                    "total_sites": phase2_total_pairs or total_sites,
+                    "org_complete": False,
+                })
+                try:
+                    await asyncio.wait_for(phase2_progress_done.wait(), timeout=2.0)
+                except asyncio.TimeoutError:
+                    pass
+
+        phase2_ticker = asyncio.create_task(_phase2_progress_ticker())
+        try:
+            await asyncio.gather(*(_build_one(sid, wlan) for sid, wlan in phase2_pairs))
+        finally:
+            phase2_progress_done.set()
+            await phase2_ticker
+
+        log.info(
+            "[org pipeline] Phase 2 complete: built=%d skipped_empty=%d concurrency=%d",
+            phase2_total_pairs, phase2_skipped_empty, _PHASE2_CONCURRENCY,
+        )
 
         all_wlans: set[str] = set()
         for wlans in wlans_by_site.values():
             all_wlans.update(wlans)
+
+        # Release feature/health build fragmentation before per-site scoring.
+        await _release_phase_memory("phase2 features+health")
+
+        _phase_done("phase2_features_health")
 
         # ── Phase 3: Per-site anomaly detection (sequential) ────────────
         # Runs BEFORE org-wide scoring so that per-site Markov results are
@@ -399,18 +496,26 @@ async def _run_org_pipeline_body(
         phase3_wlans_failed = 0
         phase3_sites_with_any_scored: set[str] = set()
 
-        for i, sid in enumerate(site_ids):
-            site_name = site_map.get(sid, sid[:8])
-            await _progress({
-                "phase": "site_scoring",
-                "current_site": site_name,
-                "sites_complete": i,
-                "total_sites": total_sites,
-                "org_complete": False,
-            })
+        # Flatten (site, wlan) pairs and run them concurrently with a bounded
+        # semaphore. Each score() call is independent — separate Redis/SQLite
+        # reads, separate sklearn matrices, separate output keys — so the only
+        # shared state is the counter dict and a per-site "any-scored" set,
+        # both updated under the asyncio single-threaded event loop. Concurrency
+        # of 4 keeps peak memory predictable: each in-flight scope allocates a
+        # category_vector matrix (~few hundred KB) plus an event_vector matrix
+        # (a few MB at most), so 4× is small relative to the org-wide pool that
+        # already lives in Phase 4.
+        scope_pairs: list[tuple[str, str]] = []
+        for sid in site_ids:
+            for wlan in wlans_by_site.get(sid, []):
+                scope_pairs.append((sid, wlan))
 
-            wlans = wlans_by_site.get(sid, [])
-            for wlan in wlans:
+        _PHASE3_CONCURRENCY = 4
+        sem = asyncio.Semaphore(_PHASE3_CONCURRENCY)
+
+        async def _score_one(sid: str, wlan: str) -> None:
+            nonlocal phase3_wlans_scored, phase3_wlans_skipped_empty_features, phase3_wlans_failed
+            async with sem:
                 try:
                     n_scored = await score(sid, wlan)
                     if n_scored > 0:
@@ -420,7 +525,37 @@ async def _run_org_pipeline_body(
                         phase3_wlans_skipped_empty_features += 1
                 except Exception:
                     phase3_wlans_failed += 1
-                    log.exception(f"[org pipeline] Per-site scoring failed for site={sid} wlan={wlan}")
+                    log.exception(
+                        f"[org pipeline] Per-site scoring failed for site={sid} wlan={wlan}"
+                    )
+
+        # Periodic progress updates: a separate coroutine ticks every 2s with
+        # the running sites-complete count so the UI's progress bar advances
+        # smoothly even though work order is non-deterministic under gather.
+        progress_done = asyncio.Event()
+
+        async def _progress_ticker() -> None:
+            while not progress_done.is_set():
+                await _progress({
+                    "phase": "site_scoring",
+                    "current_site": None,
+                    "sites_complete": len(phase3_sites_with_any_scored),
+                    "total_sites": total_sites,
+                    "org_complete": False,
+                })
+                try:
+                    await asyncio.wait_for(progress_done.wait(), timeout=2.0)
+                except asyncio.TimeoutError:
+                    pass
+
+        ticker_task = asyncio.create_task(_progress_ticker())
+        try:
+            await asyncio.gather(*(_score_one(sid, wlan) for sid, wlan in scope_pairs))
+        finally:
+            progress_done.set()
+            await ticker_task
+
+        _phase_done("phase3_per_site_score")
 
         # ── Phase 4: Org-wide anomaly detection ──────────────────────────
         # Runs after per-site scoring so score_org_wide() can read fresh
@@ -450,6 +585,15 @@ async def _run_org_pipeline_body(
                     org_total_macs[sid] = org_total_macs.get(sid, 0) + n
             except Exception:
                 log.exception(f"[org pipeline] score_org_wide failed for wlan={wlan}")
+            finally:
+                # The org-wide feature pool for a busy WLAN (e.g. eduroam across
+                # 197 sites) is the single largest in-memory structure in the
+                # pipeline. Drop the Python references now so the next WLAN's
+                # pool doesn't stack on top of this one, and ask glibc to trim
+                # the freed sklearn/numpy arenas back to the OS. Without this
+                # Phase 4 grows monotonically until OOM.
+                del features_this_wlan
+                await _release_phase_memory(f"phase4 wlan={wlan}")
 
         # Dispatch org-wide webhooks
         for wlan in sorted(all_wlans):
@@ -477,6 +621,12 @@ async def _run_org_pipeline_body(
             phase3_wlans_skipped_empty_features,
             phase3_wlans_failed,
         )
+
+        # Release Phase 3/4 fragmentation before Phase 5's cache builders,
+        # which allocate hundreds of aggregator frames back-to-back.
+        await _release_phase_memory("phase4 scoring+webhooks")
+
+        _phase_done("phase4_org_score_and_webhooks")
 
         # ── Phase 5: Pre-compute dashboard summary cache ─────────────────
         # Builds the aggregates that /org/summary, /org/alerts, /org/findings,
@@ -523,8 +673,16 @@ async def _run_org_pipeline_body(
                 except Exception:
                     log.exception("[org pipeline] summary cache build failed: build_org_alerts_full")
 
-                # Site-level entries are per (site, wlan).
-                for sid in site_ids:
+                _phase_done("phase5a_org_builders")
+
+                # Site-level entries are per (site, wlan). Trim glibc arenas
+                # every N sites so fragmentation from the per-site builders
+                # (each pulls anomaly/health blobs from Redis, JSON-decodes
+                # them, builds aggregates) does not pile up across the full
+                # ~200-site sweep. Without this, RSS grew monotonically into
+                # OOM mid-Phase-5 even after the per-site builders returned.
+                _PHASE5_TRIM_EVERY = 25
+                for site_idx, sid in enumerate(site_ids):
                     for wlan in wlans_by_site.get(sid, []):
                         try:
                             payload = await _routes.build_site_findings(sid, wlan)
@@ -562,6 +720,10 @@ async def _run_org_pipeline_body(
                                 "[org pipeline] site_events_summary cache build failed: "
                                 "site=%s wlan=%s", sid, wlan,
                             )
+                    if (site_idx + 1) % _PHASE5_TRIM_EVERY == 0:
+                        await _release_phase_memory(
+                            f"phase5 sites {site_idx + 1}/{total_sites}"
+                        )
 
                 log.info(
                     "[org pipeline] Phase 5 summary cache: org_entries=%d site_entries=%d "
@@ -572,6 +734,12 @@ async def _run_org_pipeline_body(
                 await cache_redis.aclose()
         except Exception:
             log.exception("[org pipeline] Phase 5 summary cache populate failed (non-fatal)")
+
+        # Release Phase 5 aggregator fragmentation before Phase 5b walks
+        # every (site, wlan) scope in SQLite to rebuild client_summary.
+        await _release_phase_memory("phase5 summary cache")
+
+        _phase_done("phase5_site_builders_loop")
 
         # ── Phase 5b: Rebuild client_summary table for drilldowns ────────
         # Per-(mac, site, wlan) rollup that backs the Device Family Drilldown
@@ -598,6 +766,20 @@ async def _run_org_pipeline_body(
                 await _cache_redis.aclose()
         except Exception:
             log.exception("[org pipeline] Phase 5b client_summary rebuild failed (non-fatal)")
+
+        _phase_done("phase5b_client_summary_table")
+
+        # Final trim so the idle backend returns to baseline RSS rather than
+        # sitting on unreclaimed arenas until the next pipeline run.
+        await _release_phase_memory("pipeline exit")
+
+        total_elapsed = _time.time() - started
+        log.info(
+            "[timing] === Pipeline summary === total=%.1fs (%.1f min) | %s",
+            total_elapsed,
+            total_elapsed / 60.0,
+            " | ".join(f"{k}={v:.1f}s" for k, v in phase_timings.items()),
+        )
 
         # ── Done ─────────────────────────────────────────────────────────
         await _record_last_timestamp(_LAST_DETECTION_KEY)

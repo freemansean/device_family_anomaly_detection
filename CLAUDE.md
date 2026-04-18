@@ -1195,7 +1195,7 @@ still computed and stored in `components` for tooltip display, but does not affe
 health score itself.
 
 **Score ranges:** 1.0 = no failures observed. 0.0 = all outcome-bearing events are failures.
-Default alert threshold: `ANOMALY_HEALTH_SCORE_THRESHOLD = 0.30`.
+Default alert threshold: `ANOMALY_HEALTH_SCORE_THRESHOLD = 0.20`.
 
 **Per-service rollup and device-alarm ratio:** Alongside the aggregate health
 score, `compute_family_health` also computes per-service health and
@@ -1809,7 +1809,7 @@ computed as a mac_count-weighted average of per-site health scores across all si
 
 ### Findings Alert Logic — Health Threshold
 
-The health threshold is **dynamic** — set via the Anomaly Config GUI, persisted to `config_overrides.json`, and read at runtime by all consumers. The env var `ANOMALY_HEALTH_SCORE_THRESHOLD` (default 0.75) is used only as a fallback when no GUI override exists. The single source of truth is `webhook_dispatcher.get_health_score_threshold()`, which reads the config overrides file first. Backend routes (`get_org_alerts`, `get_org_summary`) import this function. Frontend components (`FindingsFeed.jsx`, `OrgFindingsFeed.jsx`) fetch the threshold from `GET /api/v1/anomaly-config` on mount. Changes take effect immediately — no restart required.
+The health threshold is **dynamic** — set via the Anomaly Config GUI, persisted to `config_overrides.json`, and read at runtime by all consumers. The env var `ANOMALY_HEALTH_SCORE_THRESHOLD` (default 0.20) is used only as a fallback when no GUI override exists. The single source of truth is `webhook_dispatcher.get_health_score_threshold()`, which reads the config overrides file first. Backend routes (`get_org_alerts`, `get_org_summary`) import this function. Frontend components (`FindingsFeed.jsx`, `OrgFindingsFeed.jsx`) fetch the threshold from `GET /api/v1/anomaly-config` on mount. Changes take effect immediately — no restart required.
 
 ### Drilldown Navigation
 
@@ -1857,7 +1857,7 @@ MARKOV_STUCK_LOOP_MIN_EVENTS=20        # minimum events before stuck-loop detect
 # Health Score (health_scorer.py)
 # Families with health_score below this value are considered degraded for webhook gating.
 # Range: 0.0 (all failing) to 1.0 (no failures). Tune down if too noisy.
-ANOMALY_HEALTH_SCORE_THRESHOLD=0.30
+ANOMALY_HEALTH_SCORE_THRESHOLD=0.20
 
 # Service-alarm device-percentage gate. A family fires an alarm via the
 # service-alarm path when at least this fraction of its MACs have individually
@@ -1865,8 +1865,8 @@ ANOMALY_HEALTH_SCORE_THRESHOLD=0.30
 # SERVICE_HEALTH_THRESHOLD). Lives under General Config alongside
 # ANOMALY_HEALTH_SCORE_THRESHOLD in the "Health Thresholds for Alarm Generation"
 # panel; both gate the webhook dispatcher and the org/site alert feeds. Default
-# 0.50 requires at least half of the family's MACs to have tripped.
-ALARM_SERVICE_DEVICE_PCT=0.50
+# 0.70 requires at least 70% of the family's MACs to have tripped.
+ALARM_SERVICE_DEVICE_PCT=0.70
 
 # Alarm suppression — skip findings whose total family MAC count is below this floor.
 # Applies to webhook dispatch AND UI alert feeds (/org/alerts, /org/summary).

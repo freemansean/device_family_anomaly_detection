@@ -20,6 +20,12 @@ services:
       - REDIS_URL=redis://redis:6379
       - SASQUATCH_CORS_ORIGINS=*
       - SASQUATCH_SQLITE_PATH=/unsupervised_anomaly/sqlite/sasquatch.db
+      # Cap glibc malloc arenas. Default is 8 × CPU count (~64 on this host),
+      # which fragments badly with numpy/sklearn allocation patterns and left
+      # ~15 GB of unreclaimed arenas resident after a detection run. 2 arenas
+      # keeps peak RSS well under the limit at a negligible throughput cost
+      # for this largely single-threaded pipeline.
+      - MALLOC_ARENA_MAX=2
     volumes:
       - sqlite-data:/unsupervised_anomaly/sqlite
       - logs:/unsupervised_anomaly/logs
