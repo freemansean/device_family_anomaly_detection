@@ -215,7 +215,7 @@ export default function App() {
   const [selectedSite, setSelectedSite] = useState(null); // site ID string
   const [selectedMac, setSelectedMac] = useState(null);
   const [selectedFamily, setSelectedFamily] = useState(null);
-  const [view, setView] = useState("overview"); // "overview" | "findings" | "family" | "mac" | "org-family"
+  const [view, setView] = useState("overview"); // "overview" | "findings" | "family" | "mac" | "org-family" | "org-mac-search"
   const [siteSearch, setSiteSearch] = useState("");
   const [siteDropdownOpen, setSiteDropdownOpen] = useState(false);
   const [discoveryRefreshToken, setDiscoveryRefreshToken] = useState(0);
@@ -225,6 +225,7 @@ export default function App() {
   const [macDropdownOpen, setMacDropdownOpen] = useState(false);
   const [macResults, setMacResults] = useState([]);
   const [macSearchLoading, setMacSearchLoading] = useState(false);
+  const [macSearchQuery, setMacSearchQuery] = useState(null); // non-null = MAC-prefix drilldown mode
 
   // Device family search (org-wide)
   const [familySearch, setFamilySearch] = useState("");
@@ -958,6 +959,7 @@ export default function App() {
     setSelectedSite(targetSite);
     setSelectedMac(result.mac);
     setSelectedFamily(null);
+    setMacSearchQuery(null);
     setView("mac");
     setMacSearch("");
     setMacResults([]);
@@ -972,11 +974,28 @@ export default function App() {
     setSelectedSite(ORG_FOCUS_VALUE);
     setSelectedFamily(result.family);
     setFamilySearchQuery(null);
+    setMacSearchQuery(null);
     setSelectedMac(null);
     setView("org-family");
     setFamilySearch("");
     setFamilyResults([]);
     setFamilyDropdownOpen(false);
+  }
+
+  // Enter on the MAC search input → cross-site/cross-WLAN MAC-prefix drilldown.
+  // Requires >= 6 hex chars (full OUI) to avoid wide-fanout queries.
+  function handleMacSearchSubmit() {
+    const norm = (macSearch || "").toLowerCase().replace(/[^0-9a-f]/g, "").slice(0, 12);
+    if (norm.length < 6) return;
+    setSelectedSite(ORG_FOCUS_VALUE);
+    setSelectedFamily(null);
+    setSelectedMac(null);
+    setFamilySearchQuery(null);
+    setMacSearchQuery(norm);
+    setView("org-mac-search");
+    setMacSearch("");
+    setMacResults([]);
+    setMacDropdownOpen(false);
   }
 
   // Enter on the family search input → multi-family search drilldown
@@ -986,6 +1005,7 @@ export default function App() {
     setSelectedSite(ORG_FOCUS_VALUE);
     setSelectedFamily(null);
     setFamilySearchQuery(q);
+    setMacSearchQuery(null);
     setSelectedMac(null);
     setView("org-family");
     setFamilySearch("");
@@ -1280,22 +1300,52 @@ export default function App() {
                 onFocus={() => setMacDropdownOpen(true)}
                 onChange={(e) => { setMacSearch(e.target.value); setMacDropdownOpen(true); }}
                 onBlur={() => setTimeout(() => setMacDropdownOpen(false), 150)}
+                onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); handleMacSearchSubmit(); } }}
+                title="Type 2+ hex chars to find a single MAC · press Enter with 6+ hex chars (full OUI) for a cross-site drilldown"
                 style={{ background: "#222", color: "#e0e0e0", border: "1px solid #444", padding: "4px 8px", borderRadius: "4px", width: "220px", cursor: "text", fontFamily: "monospace" }}
               />
               {macDropdownOpen && macSearch && (
-                <div style={{ position: "absolute", top: "100%", right: 0, zIndex: 100, background: "#1a1a1a", border: "1px solid #444", borderRadius: "4px", marginTop: "2px", maxHeight: "320px", overflowY: "auto", width: "420px", boxShadow: "0 4px 12px rgba(0,0,0,0.5)" }}>
+                <div style={{ position: "absolute", top: "100%", right: 0, zIndex: 100, background: "#1a1a1a", border: "1px solid #444", borderRadius: "4px", marginTop: "2px", maxHeight: "360px", overflowY: "auto", width: "420px", boxShadow: "0 4px 12px rgba(0,0,0,0.5)" }}>
                   {(() => {
                     const norm = macSearch.toLowerCase().replace(/[^0-9a-f]/g, "");
                     if (norm.length < 2) {
                       return <div style={{ padding: "8px 10px", color: "#555", fontSize: "12px" }}>Type at least 2 hex characters…</div>;
                     }
+                    const canSubmit = norm.length >= 6;
+                    const submitHint = (
+                      <div
+                        onMouseDown={(e) => { e.preventDefault(); if (canSubmit) handleMacSearchSubmit(); }}
+                        style={{
+                          padding: "6px 10px",
+                          borderTop: "1px solid #2a2a2a",
+                          background: canSubmit ? "#0d2535" : "#1a1a1a",
+                          color: canSubmit ? "#7ec8e3" : "#555",
+                          fontSize: "11px",
+                          cursor: canSubmit ? "pointer" : "default",
+                        }}
+                      >
+                        {canSubmit
+                          ? <>↵ Open cross-site drilldown for MACs starting with <span style={{ fontFamily: "monospace", color: "#e0e0e0" }}>{norm}</span></>
+                          : <>Type 6+ hex chars (full OUI) to enable cross-site drilldown</>}
+                      </div>
+                    );
                     if (macSearchLoading) {
-                      return <div style={{ padding: "8px 10px", color: "#555", fontSize: "12px" }}>Searching…</div>;
+                      return (
+                        <>
+                          <div style={{ padding: "8px 10px", color: "#555", fontSize: "12px" }}>Searching…</div>
+                          {submitHint}
+                        </>
+                      );
                     }
                     if (macResults.length === 0) {
-                      return <div style={{ padding: "8px 10px", color: "#555", fontSize: "12px" }}>No MACs match</div>;
+                      return (
+                        <>
+                          <div style={{ padding: "8px 10px", color: "#555", fontSize: "12px" }}>No MACs match</div>
+                          {submitHint}
+                        </>
+                      );
                     }
-                    return macResults.map((r) => {
+                    const rendered = macResults.map((r) => {
                       const siteName = sites.find(s => s.id === (r.last_event_site_id || r.last_site_id))?.name || (r.last_event_site_id || r.last_site_id || "");
                       const lastSeenLabel = r.last_event_ts
                         ? new Date(r.last_event_ts * 1000).toLocaleString()
@@ -1330,6 +1380,7 @@ export default function App() {
                         </div>
                       );
                     });
+                    return (<>{rendered}{submitHint}</>);
                   })()}
                 </div>
               )}
@@ -1391,6 +1442,17 @@ export default function App() {
             wlan={selectedWlan}
             allWlans
             searchQuery={familySearchQuery}
+          />
+        )}
+        {selectedSite === ORG_FOCUS_VALUE && view === "org-mac-search" && macSearchQuery && (
+          <OrgFamilyDrilldown
+            family={macSearchQuery}
+            apiBase={API_BASE}
+            onMacSiteSelect={handleOrgMacSelect}
+            onBack={() => { setMacSearchQuery(null); setView("overview"); }}
+            wlan={selectedWlan}
+            allWlans
+            macSearchQuery={macSearchQuery}
           />
         )}
         {selectedSite && selectedSite !== ORG_FOCUS_VALUE && view === "overview" && selectedWlan && (

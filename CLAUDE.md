@@ -1678,6 +1678,11 @@ POST /api/v1/org/detect                              → re-runs build_features 
                                                        (sasquatch:findings:{site_id}:{wlan}) and org findings
 GET  /api/v1/org/clients/search?mac=                 → prefix search over the clients SQLite PK; returns metadata
                                                        + most-recent (site_id, wlan, timestamp) per hit via events idx
+GET  /api/v1/org/clients/search-drilldown?mac_prefix= → cross-site / cross-WLAN per-MAC drilldown for a MAC prefix
+                                                       (min 6 hex chars / full OUI). Paginated, sortable, scoped site|org;
+                                                       backed by client_summary with a LIKE on idx_summary_mac. Mirrors
+                                                       /org/families/search-drilldown — same response shape, rendered by
+                                                       OrgFamilyDrilldown in macSearchQuery mode
 GET  /api/v1/org/alerts                              → org-wide alerts + per-site alerts in one response;
                                                        org_alerts = org findings with health_score < 0.75;
                                                        site_alerts = per-site findings × per-site health, grouped by site

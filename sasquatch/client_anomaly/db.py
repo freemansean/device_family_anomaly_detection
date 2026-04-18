@@ -960,6 +960,7 @@ def _summary_where(
     site_id: Optional[str] = None,
     service_account_family: Optional[str] = None,
     last_username: Optional[str] = None,
+    mac_prefix: Optional[str] = None,
 ) -> tuple[str, list]:
     """Build a WHERE clause + param list for client_summary queries."""
     conditions: list[str] = []
@@ -982,6 +983,10 @@ def _summary_where(
     if last_username is not None:
         conditions.append("last_username = ?")
         params.append(last_username)
+    if mac_prefix is not None:
+        # Leading-anchored LIKE hits idx_summary_mac as a range scan.
+        conditions.append("mac LIKE ?")
+        params.append(f"{mac_prefix.lower()}%")
     where = (" WHERE " + " AND ".join(conditions)) if conditions else ""
     return where, params
 
@@ -994,6 +999,7 @@ async def query_client_summary(
     site_id: Optional[str] = None,
     service_account_family: Optional[str] = None,
     last_username: Optional[str] = None,
+    mac_prefix: Optional[str] = None,
     limit: Optional[int] = None,
     offset: Optional[int] = None,
     order_by: Optional[str] = None,
@@ -1017,7 +1023,7 @@ async def query_client_summary(
     where, params = _summary_where(
         family_exact=family_exact, family_substring=family_substring,
         wlan=wlan, site_id=site_id, service_account_family=service_account_family,
-        last_username=last_username,
+        last_username=last_username, mac_prefix=mac_prefix,
     )
 
     order_sql = f" ORDER BY {order_by}" if order_by else ""
@@ -1042,6 +1048,7 @@ async def count_client_summary(
     site_id: Optional[str] = None,
     service_account_family: Optional[str] = None,
     last_username: Optional[str] = None,
+    mac_prefix: Optional[str] = None,
 ) -> dict:
     """
     Return aggregate counts for a client_summary query without fetching rows.
@@ -1052,7 +1059,7 @@ async def count_client_summary(
     where, params = _summary_where(
         family_exact=family_exact, family_substring=family_substring,
         wlan=wlan, site_id=site_id, service_account_family=service_account_family,
-        last_username=last_username,
+        last_username=last_username, mac_prefix=mac_prefix,
     )
 
     conn = await get_connection()

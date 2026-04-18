@@ -2475,6 +2475,146 @@ async def search_families_drilldown(
     }
 
 
+@router.get("/org/clients/search-drilldown")
+async def search_clients_drilldown(
+    mac_prefix: str = Query(
+        ...,
+        min_length=1,
+        pattern=r"^[a-fA-F0-9:.\-\s]+$",
+        description="MAC address prefix (min 6 hex chars / full OUI) — separators optional",
+    ),
+    page: int = Query(1, ge=1, description="Page number (1-based)"),
+    page_size: int = Query(500, ge=1, le=2000, description="Rows per page"),
+    sort: str | None = Query(None, description="Column to sort by"),
+    sort_dir: str | None = Query(None, description="Sort direction: asc or desc"),
+    scope: str = Query(
+        "site",
+        pattern="^(site|org)$",
+        description="Anomaly-flag scope for IF/DBSCAN/Centroid. Markov is site-WLAN only regardless.",
+    ),
+):
+    """
+    Cross-site / cross-WLAN per-MAC drilldown for a MAC prefix (paginated).
+
+    Mirrors ``/org/families/search-drilldown`` but filters on the
+    ``client_summary.mac`` column via a leading-anchored ``LIKE`` that uses
+    the ``idx_summary_mac`` index for a range scan. The frontend enforces a
+    6-hex-character minimum (full OUI) so the query is always anchored to a
+    vendor prefix and cannot fan out across the entire table.
+    """
+    if not MIST_ORG_ID or not MIST_API_TOKEN:
+        raise HTTPException(status_code=500, detail="MIST_ORG_ID or MIST_API_TOKEN not configured.")
+
+    import re as _re
+    norm = _re.sub(r"[^0-9a-f]", "", (mac_prefix or "").lower())[:12]
+    if len(norm) < 6:
+        raise HTTPException(
+            status_code=400,
+            detail="MAC prefix must be at least 6 hex characters (full OUI).",
+        )
+
+    redis_client = _get_redis()
+    try:
+        try:
+            site_map = await _get_org_site_map(redis_client)
+        except Exception:
+            raise HTTPException(status_code=502, detail="Could not reach Mist API")
+    finally:
+        await redis_client.aclose()
+
+    counts = await db.count_client_summary(mac_prefix=norm)
+    if counts["total"] == 0:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No events found for MACs matching prefix '{norm}' across any site.",
+        )
+
+    offset = (page - 1) * page_size
+    order = _resolve_drilldown_order(sort, sort_dir)
+    summary_rows = await db.query_client_summary(
+        mac_prefix=norm,
+        order_by=order,
+        limit=page_size,
+        offset=offset,
+    )
+
+    rows: list[dict] = []
+    for sr in summary_rows:
+        r = _summary_row_to_drilldown(sr, site_map, include_wlan=True, include_device_family=True)
+        rows.append(r)
+
+    if_outlier_count = counts["if_outlier"]
+    dbscan_outlier_count = counts["dbscan_outlier"]
+    counts_scope = "total"
+
+    if scope == "org" and rows:
+        scope_pairs = sorted({(r["site_id"], r.get("wlan", "")) for r in rows if r.get("site_id")})
+        org_redis = _get_redis()
+        try:
+            pipe = org_redis.pipeline()
+            for sid, wl in scope_pairs:
+                pipe.get(_org_anomalies_redis_key(sid, wl))
+            raw_results = await pipe.execute()
+        finally:
+            await org_redis.aclose()
+
+        org_anom_by_scope: dict[tuple[str, str], dict] = {}
+        for (sid, wl), raw in zip(scope_pairs, raw_results):
+            if not raw:
+                continue
+            try:
+                org_anom_by_scope[(sid, wl)] = json.loads(raw)
+            except Exception:
+                continue
+
+        for r in rows:
+            scope_key = (r.get("site_id", ""), r.get("wlan", ""))
+            anom_map = org_anom_by_scope.get(scope_key)
+            if not anom_map:
+                r["is_if_outlier"] = False
+                r["is_dbscan_outlier"] = False
+                r["if_score"] = None
+                r["is_family_outlier"] = False
+                continue
+            rec = anom_map.get(r["mac"])
+            if not rec:
+                r["is_if_outlier"] = False
+                r["is_dbscan_outlier"] = False
+                r["if_score"] = None
+                r["is_family_outlier"] = False
+                continue
+            r["is_if_outlier"] = bool(rec.get("is_if_outlier", False))
+            r["is_dbscan_outlier"] = bool(rec.get("is_dbscan_outlier", False))
+            r["if_score"] = rec.get("if_score")
+            r["is_family_outlier"] = bool(rec.get("is_family_outlier", False))
+
+        if_outlier_count = sum(1 for r in rows if r.get("is_if_outlier"))
+        dbscan_outlier_count = sum(1 for r in rows if r.get("is_dbscan_outlier"))
+        counts_scope = "page"
+
+    total_pages = (counts["total"] + page_size - 1) // page_size
+
+    return {
+        "mac_prefix": norm,
+        "family": norm,  # convenience alias so shared frontend can render a title
+        "family_kind": "mac_search",
+        "service_account_label": "",
+        "service_account_member_families": [],
+        "matched_families": counts["families"],
+        "total_count": counts["total"],
+        "if_outlier_count": if_outlier_count,
+        "dbscan_outlier_count": dbscan_outlier_count,
+        "markov_outlier_count": counts["markov_outlier"],
+        "scope": scope,
+        "counts_scope": counts_scope,
+        "page": page,
+        "page_size": page_size,
+        "total_pages": total_pages,
+        "rows": rows,
+        "category_keys": list(EVENT_CATEGORIES.keys()),
+    }
+
+
 @router.get("/org/sites")
 async def list_org_sites():
     """Fetch all sites in the configured org from the Mist API (cached 5 min)."""

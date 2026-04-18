@@ -243,7 +243,7 @@ function healthColor(score) {
 
 const PAGE_SIZE = 500;
 
-export default function OrgFamilyDrilldown({ family, apiBase, onMacSiteSelect, onBack, wlan, allWlans, searchQuery }) {
+export default function OrgFamilyDrilldown({ family, apiBase, onMacSiteSelect, onBack, wlan, allWlans, searchQuery, macSearchQuery }) {
   const [data, setData]       = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError]     = useState(null);
@@ -264,7 +264,9 @@ export default function OrgFamilyDrilldown({ family, apiBase, onMacSiteSelect, o
     setError(null);
     const sortParams = `&sort=${encodeURIComponent(sortCol)}&sort_dir=${encodeURIComponent(sortDir)}`;
     let url;
-    if (searchQuery) {
+    if (macSearchQuery) {
+      url = `${apiBase}/api/v1/org/clients/search-drilldown?mac_prefix=${encodeURIComponent(macSearchQuery)}&page=${page}&page_size=${PAGE_SIZE}${sortParams}&scope=${scope}`;
+    } else if (searchQuery) {
       url = `${apiBase}/api/v1/org/families/search-drilldown?q=${encodeURIComponent(searchQuery)}&page=${page}&page_size=${PAGE_SIZE}${sortParams}&scope=${scope}`;
     } else if (allWlans) {
       url = `${apiBase}/api/v1/org/families/${encodeURIComponent(family)}/drilldown-all-wlans?page=${page}&page_size=${PAGE_SIZE}${sortParams}`;
@@ -278,10 +280,10 @@ export default function OrgFamilyDrilldown({ family, apiBase, onMacSiteSelect, o
       })
       .then(d => { setData(d); setLoading(false); })
       .catch(e => { setError(String(e)); setLoading(false); });
-  }, [family, apiBase, wlan, allWlans, searchQuery, page, sortCol, sortDir, scope]);
+  }, [family, apiBase, wlan, allWlans, searchQuery, macSearchQuery, page, sortCol, sortDir, scope]);
 
   // Reset to page 1 when the query/family/scope changes
-  useEffect(() => { setPage(1); }, [family, wlan, allWlans, searchQuery, scope]);
+  useEffect(() => { setPage(1); }, [family, wlan, allWlans, searchQuery, macSearchQuery, scope]);
 
   const handleExportCsv = async () => {
     if (!data || exporting) return;
@@ -289,7 +291,9 @@ export default function OrgFamilyDrilldown({ family, apiBase, onMacSiteSelect, o
     try {
       // Build the base URL (without pagination) then fetch all pages
       let baseUrl;
-      if (searchQuery) {
+      if (macSearchQuery) {
+        baseUrl = `${apiBase}/api/v1/org/clients/search-drilldown?mac_prefix=${encodeURIComponent(macSearchQuery)}&scope=${scope}`;
+      } else if (searchQuery) {
         baseUrl = `${apiBase}/api/v1/org/families/search-drilldown?q=${encodeURIComponent(searchQuery)}&scope=${scope}`;
       } else if (allWlans) {
         baseUrl = `${apiBase}/api/v1/org/families/${encodeURIComponent(family)}/drilldown-all-wlans?`;
@@ -319,9 +323,10 @@ export default function OrgFamilyDrilldown({ family, apiBase, onMacSiteSelect, o
             return filterTags.every(tag => haystack.includes(tag.toLowerCase()));
           })
         : allRows;
-      downloadDrilldownCsv(filtered, family, {
-        includeWlan: !!allWlans || !!searchQuery,
-        includeDeviceFamily: !!searchQuery,
+      const csvName = macSearchQuery ? `mac_${macSearchQuery}` : family;
+      downloadDrilldownCsv(filtered, csvName, {
+        includeWlan: !!allWlans || !!searchQuery || !!macSearchQuery,
+        includeDeviceFamily: !!searchQuery || !!macSearchQuery,
         includePrimaryFamily: data?.family_kind === "service_account",
       });
     } finally {
@@ -390,13 +395,15 @@ export default function OrgFamilyDrilldown({ family, apiBase, onMacSiteSelect, o
           ← {allWlans ? "Back" : "Org Family Insights"}
         </button>
         <h2 style={{ margin: 0, fontSize: "15px", color: "#aaa" }}>
-          {searchQuery
-            ? <>{`"${searchQuery}"`}</>
-            : data?.family_kind === "service_account" && data?.service_account_label
-              ? data.service_account_label
-              : family}
+          {macSearchQuery
+            ? <>MAC prefix: <span style={{ fontFamily: "monospace", color: "#7ec8e3" }}>{macSearchQuery}</span></>
+            : searchQuery
+              ? <>{`"${searchQuery}"`}</>
+              : data?.family_kind === "service_account" && data?.service_account_label
+                ? data.service_account_label
+                : family}
         </h2>
-        {searchQuery && data?.matched_families && (
+        {(searchQuery || macSearchQuery) && data?.matched_families && (
           <span style={{ color: "#666", fontSize: "12px" }}>
             {data.matched_families.length} {data.matched_families.length === 1 ? "family" : "families"} matched
           </span>
@@ -409,11 +416,11 @@ export default function OrgFamilyDrilldown({ family, apiBase, onMacSiteSelect, o
             SVC ACCT
           </span>
         )}
-        <span style={{ color: "#555", fontSize: "12px" }}>{allWlans || searchQuery ? "org-wide · all WLANs" : "org-wide"}</span>
+        <span style={{ color: "#555", fontSize: "12px" }}>{allWlans || searchQuery || macSearchQuery ? "org-wide · all WLANs" : "org-wide"}</span>
         <div style={{ flex: 1 }} />
         <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: "6px" }}>
           <div style={{ display: "flex", gap: "6px", alignItems: "center" }}>
-            {searchQuery && (
+            {(searchQuery || macSearchQuery) && (
               <div
                 title="Toggle between site-local and org-wide scoring for IF, DBSCAN, and Centroid flags. Markov is always site-WLAN scoped regardless."
                 style={{
@@ -617,7 +624,7 @@ export default function OrgFamilyDrilldown({ family, apiBase, onMacSiteSelect, o
                   <tr>
                     {visibleCols.site && <SortTh col="site_name">Site</SortTh>}
                     {visibleCols.wlan && allWlans && <SortTh col="wlan">WLAN</SortTh>}
-                    {visibleCols.device_family && searchQuery && <SortTh col="device_family">Device Family</SortTh>}
+                    {visibleCols.device_family && (searchQuery || macSearchQuery) && <SortTh col="device_family">Device Family</SortTh>}
                     {visibleCols.mac && <SortTh col="mac">MAC</SortTh>}
                     {visibleCols.primary_family && data.family_kind === "service_account" && (
                       <th style={thStyle}>Primary Family</th>
@@ -660,7 +667,7 @@ export default function OrgFamilyDrilldown({ family, apiBase, onMacSiteSelect, o
                             <span style={{ background: "#1a2a1a", color: "#4caf7d", border: "1px solid #2d4a2d", borderRadius: "3px", padding: "1px 5px", fontSize: "10px" }}>{row.wlan}</span>
                           </td>
                         )}
-                        {visibleCols.device_family && searchQuery && (
+                        {visibleCols.device_family && (searchQuery || macSearchQuery) && (
                           <td style={{ ...tdStyle, color: "#aaa", fontSize: "11px", whiteSpace: "nowrap" }}>
                             {row.device_family || "—"}
                           </td>
@@ -795,8 +802,8 @@ export default function OrgFamilyDrilldown({ family, apiBase, onMacSiteSelect, o
           )}
 
           <div style={{ marginTop: "8px", fontSize: "11px", color: "#444" }}>
-            ▲IF = Isolation Forest outlier {searchQuery ? `(${data.scope || "site"}-scope)` : "within site peer group"}.
-            DBSCAN = {searchQuery ? `flagged ${data.scope === "org" ? "org-wide" : "site-wide"}` : "flagged site-wide"}.
+            ▲IF = Isolation Forest outlier {(searchQuery || macSearchQuery) ? `(${data.scope || "site"}-scope)` : "within site peer group"}.
+            DBSCAN = {(searchQuery || macSearchQuery) ? `flagged ${data.scope === "org" ? "org-wide" : "site-wide"}` : "flagged site-wide"}.
             Markov = anomaly (anomalous connection-chain transitions) or repeated (stuck failure loop) — always site-WLAN scoped; hover for episode counts.
             Click a row to open MAC timeline.
           </div>
