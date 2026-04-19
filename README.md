@@ -4,23 +4,25 @@ Unsupervised anomaly detection for Juniper Mist wireless networks. Detects devic
 
 **Core insight:** an iPhone behaving nothing like other iPhones at the same site is the signal.
 
+> **New to Sasquatch?** Start with the admin guide — [GUIDE_Unsupervised_Anomaly_Detection.pdf](GUIDE_Unsupervised_Anomaly_Detection.pdf). It walks through every view in the dashboard, the alert / finding lifecycle, and the Config panel knobs in plain language. This README is the operator / developer reference for deploying and extending the platform.
+
 ---
 
 ## How It Works
 
 On a configurable interval (default: 60 minutes), Sasquatch:
 
-1. Pulls the last 24 hours of client events from the Mist API (paginated, enriched with device metadata)
-2. Builds a per-MAC behavioral feature vector — normalized event type frequencies, so volume is never the signal
+1. Pulls client events from the Mist org events endpoint — a manual "Collect Events" full pull fetches the trailing 12 hours; the hourly poll tops up the trailing 1 hour. Events are streamed to SQLite and enriched with device metadata at write time.
+2. Builds per-MAC behavioral feature vectors — normalized event-type frequencies, so volume is never the signal.
 3. Runs a four-stage ML pipeline:
-   - **DBSCAN** across all MACs site-wide (finds clients that don't fit any cluster)
-   - **Family Centroid Isolation Forest** across device-family centroids (finds families behaving differently from all other families)
-   - **Per-family Isolation Forest** within each device type (finds individual devices anomalous relative to their peers)
-   - **Markov Chain episode analysis** — scores event-transition sequences within episodes against a 24hr site baseline; flags families where a large fraction of clients show anomalous connection patterns or repeated short (failed) episodes
-4. Computes a **separate** per-family health score from failure ratios — independent of anomaly detection
-5. Fires a webhook only when a family carries **any** anomaly label (centroid IF, DBSCAN noise, or Markov) **and** is unhealthy (health score < 0.75) — dual-gate to prevent single-device noise
+   - **DBSCAN** across all MACs in the WLAN scope (population-wide behavioral outliers)
+   - **Family Centroid cosine distance** across device-family centroids, measured against a healthy-family reference centroid (entire families behaving differently from the healthy baseline)
+   - **Per-family Isolation Forest** within each device type (individual devices anomalous relative to their family peers)
+   - **Markov Chain** episode analysis + stuck-loop detector — scores event-transition sequences against a 24hr site baseline and flags devices caught in a failure loop (e.g. `AUTH_FAILURE → DEAUTHENTICATION`)
+4. Computes a **separate** per-family health score from failure ratios — independent of anomaly detection.
+5. Fires a webhook only when a family passes the composite alarm gate (see [Alert Logic](#alert-logic)).
 
-Results are stored in Redis and served through a React dashboard with org-wide and per-site views.
+Results are stored in SQLite + Redis and served through a React dashboard with org-wide and per-site views.
 
 **No data egresses to third-party AI providers.** Detection is pure ML + rule-based.
 
@@ -30,19 +32,23 @@ Results are stored in Redis and served through a React dashboard with org-wide a
 
 ```
 Mist API
-  ├── client_cache.py (daily)      ─→ Redis: MAC → {family, model, os, manufacturer}
-  └── event_collector.py (15 min)  ─→ Redis: sorted set of enriched events
+  ├── client_cache.py       (daily)       ─→ SQLite clients table
+  └── event_collector.py    (hourly poll) ─→ SQLite events table (enriched)
 
                     feature_engineer.py
                           ↓
-           Redis: per-MAC feature vectors + health scores
+             Redis: per-MAC feature vectors
 
                     anomaly_detector.py
-                    (DBSCAN → Centroid IF → Per-family IF → Markov)
+                (DBSCAN → Family Centroid → Per-family IF → Markov)
                           ↓
               Redis: anomaly scores + findings
+                          ↓
+                   health_scorer.py
+                          ↓
+              Redis: per-family health
 
-          webhook_dispatcher.py (dual gate)
+          webhook_dispatcher.py (composite gate)
           ├── POST webhook (if eligible)
           └── FastAPI routes → React dashboard
 ```
@@ -50,83 +56,68 @@ Mist API
 | Layer | Technology |
 |---|---|
 | Backend | FastAPI + APScheduler (Python) |
-| Frontend | React + Vite |
-| State / Cache | Redis 7+ |
-| ML | scikit-learn — IsolationForest, DBSCAN; numpy Markov Chain |
+| Frontend | React + Vite, served by nginx |
+| System of record | SQLite via aiosqlite (events, clients, client_summary) |
+| Derived cache | Redis 7+ (features, anomalies, findings, summary cache, locks) |
+| ML | scikit-learn — IsolationForest, DBSCAN, PCA, NearestNeighbors |
 | Feature Engineering | pandas, numpy |
 | Mist API Client | httpx (async) |
+| Orchestration | Docker Compose |
 
 ---
 
 ## Prerequisites
 
-- Python 3.10+
-- Node.js 18+
-- Redis 7+
-- Juniper Mist API token + site/org IDs
+- Docker Engine 24+ with Compose v2
+- Juniper Mist API token + org ID
+
+Nothing else is required on the host — Python, Node, and Redis all run inside containers.
 
 ---
 
-## Quick Start (for hackathon evaluators)
+## Quick Start
 
 ```bash
 cd unsupervised_anomaly
 
-# 1. One-time setup — creates .venv, installs Python + npm deps, builds the
-#    frontend, and bootstraps a .env file from .env.example if one does not
-#    already exist.
-./setup.sh
+# 1. Bootstrap .env from the template
+cp .env.example .env
 
-# 2. Fill in your Mist credentials. Without these, the dashboard loads but
+# 2. Fill in Mist credentials. Without these, the dashboard loads but
 #    "Collect Events" will fail — there is no sample-data / demo mode.
 $EDITOR .env        # set MIST_API_TOKEN, MIST_ORG_ID, MIST_CLOUD_HOST
 
-# 3. Start everything (Redis, backend on :8000, frontend on :3000).
-./start.sh
+# 3. Build and start everything (Redis, backend on :8000, frontend on :3000)
+docker compose up -d --build
 ```
 
-Open [http://localhost:3000](http://localhost:3000) and log in with the
-credentials in `.env` (default: `admin` / `changeme`).
+Open [http://localhost:3000](http://localhost:3000).
 
-To stop all services:
+Useful commands:
 
 ```bash
-./stop.sh
+docker compose logs -f backend        # tail backend logs
+docker compose logs -f frontend       # tail nginx / static-serve logs
+docker compose restart backend        # restart backend only
+docker compose up -d --build backend  # rebuild after code changes
+docker compose down                   # stop everything (volumes preserved)
+docker compose down -v                # stop and wipe SQLite + Redis volumes
 ```
 
-**LAN access:** the committed frontend build points at `http://localhost:8000`.
-To build the frontend against a backend reachable on your LAN instead, drop an
-override into the gitignored `sasquatch/frontend/.env.production.local`:
+**LAN access:** the frontend is built inside the Docker image, so its `VITE_API_BASE_URL` is baked in at build time. To point the dashboard at a backend reachable on your LAN, drop an override into the gitignored `sasquatch/frontend/.env.production.local` before building:
 
 ```bash
 echo 'VITE_API_BASE_URL=http://192.0.2.10:8000' > sasquatch/frontend/.env.production.local
-./setup.sh    # rebuild the frontend with the override
+docker compose up -d --build frontend
 ```
 
----
+Persistent state lives in named Docker volumes:
 
-## Manual Install
-
-```bash
-# Backend
-python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt
-
-# Frontend
-cd sasquatch/frontend
-npm install
-npm run build
-cd ../..
-
-# Start backend
-PORT=8000 .venv/bin/uvicorn main:app --app-dir sasquatch --host 0.0.0.0
-
-# Start frontend (separate terminal)
-cd sasquatch/frontend
-npx serve dist --listen 3000
-```
-
-API docs (Swagger): [http://localhost:8000/docs](http://localhost:8000/docs)
+| Volume | Contents |
+|---|---|
+| `unsupervised_anomaly_sqlite-data` | `sasquatch.db` — events, clients, client_summary |
+| `unsupervised_anomaly_redis-data`  | Redis RDB/AOF snapshots |
+| `unsupervised_anomaly_logs`        | Backend log files |
 
 ---
 
@@ -148,7 +139,7 @@ The variables below are those that must be set in `.env` before starting.
 
 | Variable | Default | Description |
 |---|---|---|
-| `VITE_API_BASE_URL` | `http://localhost:8000` | Backend URL used by the React frontend at build time |
+| `VITE_API_BASE_URL` | `http://localhost:8000` | Backend URL used by the React frontend at build time. Set via `sasquatch/frontend/.env.production.local` and rebuild the frontend container. |
 
 ### Advanced ML Constants
 
@@ -156,15 +147,16 @@ These variables have no GUI equivalent. Most deployments will not need to change
 
 | Variable | Default | Description |
 |---|---|---|
-| `ANOMALY_CENTROID_IF_CONTAMINATION` | `0.15` | Fraction of device families expected to be behavioral outliers (inter-family centroid IF). Intentionally higher than intra-family IF contamination — at a site with a real problem, 1 in 6–8 families being anomalous is plausible. |
 | `ANOMALY_IF_N_ESTIMATORS` | `100` | Number of trees in every IsolationForest. More trees = more stable scores at diminishing returns. Increase to 200–500 if scores are noisy across consecutive cycles. |
-| `ANOMALY_RANDOM_STATE` | `42` | Global random seed for all ML components (IsolationForest, PCA). Fixed integer gives reproducible scores across cycles. Set to `-1` to use a random seed each run. |
+| `ANOMALY_RANDOM_STATE` | `42` | Global random seed for all ML components. Fixed integer gives reproducible scores across cycles. Set to `-1` to use a random seed each run. |
 | `ANOMALY_DBSCAN_PCA_VARIANCE` | `0.95` | Fraction of variance PCA must retain when reducing dimensions before DBSCAN. DBSCAN consumes the ~15-dim category vector; PCA typically collapses it to a handful of components at 0.95. Does not affect IsolationForest or the family centroid distance pass — both consume the ~59-dim event vector directly. |
-| `ANOMALY_DBSCAN_FAMILY_NOISE_THRESHOLD` | `0.5` | Fraction of a family's MACs that must be DBSCAN noise before the family is considered a DBSCAN-level outlier. Stored on anomaly records and shown in the UI; does **not** control `is_family_outlier` (that is set by centroid IF). |
-| `ANOMALY_FINDING_MIN_SIZE` | `2` | Minimum local MACs before a site-level finding is generated for families that did **not** use org-level IF pooling. Families that did use org pooling use the GUI-configured Min Peers value as their minimum instead. |
-| `MARKOV_MIN_EPISODE_LENGTH` | `3` | Episodes shorter than this number of events are treated as short-episode states and not scored against the transition matrix. Short episodes represent connection attempts that never completed a full connectivity chain. |
-| `MARKOV_EPISODE_LOG_PROB_THRESHOLD` | `-4.0` | Mean log-probability per transition below which an episode is flagged anomalous. More negative = stricter. Default means geometric-mean per-transition probability below e⁻⁴ ≈ 0.018. |
-| `MARKOV_OUTLIER_EPISODE_RATIO` | `0.5` | Fraction of a MAC's scoreable normal episodes that must be anomalous to flag the MAC as a Markov outlier. |
+| `ANOMALY_CENTROID_DIST_THRESHOLD` | `0.35` | Cosine distance (L2-normalized unit vectors) above which a family centroid is flagged as `is_family_outlier`. |
+| `ANOMALY_CENTROID_HEALTHY_REF_THRESHOLD` | `0.75` | Families below this health score are excluded from the centroid reference pool. |
+| `ANOMALY_RSSI_MIN_THRESHOLD` | `-87` | Drop events with RSSI below this floor (dBm), regardless of type. Set to `-120` to disable. |
+| `MARKOV_STUCK_LOOP_THRESHOLD` | `0.4` | Fraction of transitions dominated by one failure pair to flag stuck-loop. |
+| `MARKOV_STUCK_LOOP_MIN_EVENTS` | `20` | Minimum events before stuck-loop detection runs. |
+
+See `sasquatch/client_anomaly/config.py` for the full DEFAULTS map.
 
 ---
 
@@ -178,6 +170,8 @@ One dimension per known Mist client event type (DHCP, DNS, auth, roam, ARP, disa
 **`category_vector` — ~15-dim semantic-bucket frequency + concentration**
 ~13 dimensions: one per `EVENT_CATEGORIES` bucket (DHCP_SUCCESS, ROAM_FAILURE, etc., excluding COLLABORATION). Plus `top_category_fraction` and `top_failure_category_fraction` to amplify single-category-loop signal. Fed to **DBSCAN** (population-wide clustering, after PCA — semantic distance is the right level for whole-population grouping), the **health scorer** (success/failure ratios are inherently category-level), the **top-contributing-features explainer** (chip labels need readable category names), and the **MacDrilldown chart** (~15 readable bars beat 59 sparse ones).
 
+**Two-tier per-MAC event-count threshold:** `feature_min_mac_events` (default 3) is the floor for entering the feature pool at all — the Health scorer and inter-family Centroid detector consume the full pool. `anomaly_min_mac_events` (default 10) is applied inside the IF and DBSCAN passes at scoring time, since per-MAC vectors below that are too sparse for reliable distance-based scoring. Both thresholds are exposed in the General Config panel.
+
 **Post-hoc explainer features** (computed only after a MAC is flagged, never fed to ML):
 PMKID failure ratio, DHCP XID counts, roam failure types — used to generate human-readable `probable_pattern` labels like `pmkid_stale`, `dhcp_discard_loop`, `auth_failure_terminal`.
 
@@ -185,14 +179,15 @@ PMKID failure ratio, DHCP XID counts, roam failure types — used to generate hu
 
 ## Alert Logic
 
-Webhooks fire only when **both** conditions are met for a device family:
+Webhooks fire only when **all three** gates pass for a device family:
 
-1. Any family-level anomaly label is set — at least one of:
-   - `is_family_outlier` — centroid IF/distance flagged the whole family as behaviorally different from all other device types
-   - `is_family_dbscan_outlier` and `is_family_markov_outlier` — fraction of MACs in the device family are above the administratively configured threshold
-2. `health_score < XYZ` — family is also measurably failing, the XYZ level is controlled in the config by the administrator
+1. **Anomaly gate** — the family qualifies via **either**:
+   - `is_family_outlier` — the inter-family centroid detector flagged the whole family as behaviorally different from the healthy reference. **Independently sufficient** — bypasses the rollup ratio.
+   - **OR** the DBSCAN-or-Markov rollup ratio: the per-MAC union of `is_dbscan_outlier` and `is_markov_outlier` reaches `ALARM_DBSCAN_MARKOV_RATIO` (default 0.70) of `total_mac_count`. A single client flagged by both detectors counts once.
+2. **Health gate** — family `health_score < ANOMALY_HEALTH_SCORE_THRESHOLD` (default 0.20) **OR** the service-alarm device-percentage gate fires (`ALARM_SERVICE_DEVICE_PCT`, default 0.70, of the family's MACs have individually tripped a service alarm).
+3. **Family-size gate** — `total_mac_count >= ALARM_MIN_FAMILY_SIZE` (default 10). Findings below the floor still appear in the UI; only the webhook + org/site alert feeds suppress them.
 
-Finding severity (`minimal` / `moderate` / `significant`) is informational only — it is displayed in the UI but does not gate webhook dispatch. Single-device IF outliers without a family-level flag appear in the UI but never trigger webhooks.
+All four gate knobs live under the **General Config** panel in the GUI and take effect on the next detection cycle. Finding severity (`minimal` / `moderate` / `significant`) is informational only — it is displayed in the UI but does not gate webhook dispatch.
 
 ### Marvis TSHOOT Enrichment
 
@@ -229,36 +224,47 @@ TSHOOT failures for individual MACs return an empty `tshoot_results` list withou
 
 | View | Description |
 |---|---|
-| **Site Overview** | Heatmap of device families × event categories. Separate IF / DB / Markov anomaly columns and a health bar per row. Auto-refreshes every 60s. |
-| **Findings Feed** | Four detector sections: IF CENTROID (centroid/distance outliers), DBSCAN % OF FAMILY, MARKOV % OF FAMILY, and HEALTH (unhealthy families with no anomaly finding). |
-| **Org Overview** | Four-tab shell: Org Alerts, Org Overview, Org Family Insights, Org Findings. |
+| **Site WLAN Family Insights** | Heatmap of device families × event categories. Anomaly badges + health bar per row. Auto-refreshes every 60s. |
+| **Findings Feed** | Three-section layout per site: ALERT → HEALTH → ANOMALOUS. |
+| **Org Overview** | Four-tab shell: Org Alerts (default), Org Overview, Org Family Insights, Findings. |
 | **Org Alerts** | Org-wide alerts grouped by family; site alerts grouped by site. Default org view. |
-| **Org Family Insights** | Heatmap aggregated across all org sites. IF / DB / Markov columns reflect org-wide analysis — Markov % is the org-wide ratio of clients with anomalous chain patterns (not per-site worst); DB severity and site badge count come from the org-wide DBSCAN run. Health is mac_count-weighted across sites so every device gets equal vote. |
+| **Org Family Insights** | Heatmap aggregated across all org sites with mac_count-weighted health. |
+| **Family Drilldown** | Per-MAC breakdown for a device family at a site or across the org, plus MAC-prefix search. |
 | **MAC Drilldown** | 24hr event timeline + feature vector vs family baseline + IF score + DBSCAN label + Markov episode stats. |
-| **Family Drilldown** | Per-MAC breakdown for a device family at a site or across the org. |
 
 ---
 
 ## API Endpoints
 
-All reads come from Redis — no real-time Mist API calls in the request path.
+All reads come from SQLite + Redis — no real-time Mist API calls in the request path.
 
 ```
 GET  /api/v1/sites/{site_id}/findings
 GET  /api/v1/sites/{site_id}/health
 GET  /api/v1/sites/{site_id}/events/summary
 GET  /api/v1/sites/{site_id}/anomalies/{mac}
+GET  /api/v1/sites/{site_id}/families/{family}/if-outliers
 GET  /api/v1/org/sites
 GET  /api/v1/org/summary
 GET  /api/v1/org/alerts
+GET  /api/v1/org/alerts-full
 GET  /api/v1/org/alert-history
 GET  /api/v1/org/findings
 GET  /api/v1/org/family-insights
+GET  /api/v1/org/families/{family}/drilldown
+GET  /api/v1/org/families/search-drilldown
 GET  /api/v1/org/clients/search
-POST /api/v1/org/refresh           # daily client-cache refresh trigger
-POST /api/v1/org/collect-full      # trailing-12hr event collect
-POST /api/v1/org/detect            # re-run the detection pipeline
-POST /api/v1/org/flush             # drop cached aggregates
+GET  /api/v1/org/clients/search-drilldown
+GET  /api/v1/org/clients/export.csv
+POST /api/v1/org/refresh              # trigger daily client-cache refresh
+POST /api/v1/org/collect-full         # trailing-12hr event collect
+POST /api/v1/org/collect-events-only  # events-only collect (reuse existing client cache)
+POST /api/v1/org/detect               # re-run the detection pipeline
+POST /api/v1/org/flush                # drop cached aggregates
+GET  /api/v1/org/polling              # hourly-poll flag
+POST /api/v1/org/polling              # toggle hourly-poll flag
+GET  /api/v1/org/auto-detect          # auto-detect flag
+POST /api/v1/org/auto-detect          # toggle auto-detect flag
 ```
 
 Full route inventory in the auto-generated Swagger UI at `http://localhost:8000/docs`.
@@ -269,7 +275,9 @@ Full route inventory in the auto-generated Swagger UI at `http://localhost:8000/
 
 Events and the org-wide client cache live in **SQLite** (system of record, survives Redis flushes). Derived state lives in **Redis** with TTLs so loss just triggers a recompute.
 
-### SQLite (`sasquatch/client_anomaly/data/sasquatch.db`)
+### SQLite
+
+Inside the backend container: `/unsupervised_anomaly/sqlite/sasquatch.db` (mounted from the `sqlite-data` named volume).
 
 | Table | Retention | Contents |
 |---|---|---|
@@ -313,7 +321,7 @@ unsupervised_anomaly/
 │   │   ├── anomaly_detector.py       # Four-stage ML pipeline + finding rollup
 │   │   ├── markov_analyzer.py        # Markov Chain episode + stuck-loop analysis
 │   │   ├── health_scorer.py          # Per-family failure rate scoring (independent)
-│   │   ├── webhook_dispatcher.py     # Dual-gate alert dispatch + TSHOOT enrichment
+│   │   ├── webhook_dispatcher.py     # Composite-gate alert dispatch + TSHOOT enrichment
 │   │   ├── alert_tracker.py          # Persistent alert-session history
 │   │   ├── client_summary_builder.py # Materialized per-(mac, site, wlan) rollup
 │   │   ├── summary_cache.py          # Pre-computed dashboard aggregates
@@ -340,9 +348,11 @@ unsupervised_anomaly/
 │   │           ├── ColumnSelector.jsx
 │   │           └── familyColors.js
 │   └── main.py
-├── setup.sh
-├── start.sh
-├── stop.sh
+├── Dockerfile                  # Backend image
+├── Dockerfile.frontend         # Frontend image (Vite build → nginx)
+├── docker-compose.yml
+├── nginx.conf
+├── redis.conf
 ├── requirements.txt
 └── .env.example
 ```
@@ -351,13 +361,7 @@ unsupervised_anomaly/
 
 ## Known Issues
 
-See [TODO.md](unsupervised_anomaly/TODO.md) for the tracked backlog. Active items include:
-
-- Cache refresh failures have no retry or operator alerting
-- `device_family` classification uses first event only (should use majority vote)
-- Auth burst → recovery sequences inflate health scores (transient retries before success)
-- "Collecting Events" progress bar no longer updates in the UI
-- Markov baseline requires one full detection cycle to warm up — first run after deployment skips Markov scoring
+See [TODO.md](TODO.md) for the tracked backlog.
 
 ---
 
@@ -366,3 +370,4 @@ See [TODO.md](unsupervised_anomaly/TODO.md) for the tracked backlog. Active item
 - Data never egresses to third-party LLM providers. All ML is local.
 - The API has no built-in authentication. Put it behind a reverse proxy with TLS and access control in production.
 - Redis has no auth by default — bind to localhost or use `requirepass` in production.
+- CORS defaults to `localhost:3000` / `localhost:5173`. Override via `SASQUATCH_CORS_ORIGINS` in `.env` if you expose the dashboard on a LAN IP.
