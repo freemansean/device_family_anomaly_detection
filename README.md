@@ -2,9 +2,7 @@
 
 ![Architecture overview](ARCH_Unsupervised_Anomaly_Detection.png)
 
-Unsupervised anomaly detection for Juniper Mist wireless networks. Detects device behavior that aggregate SLE metrics miss — clients stuck in DHCP loops, stale PMKIDs causing roam failures, entire device families silently failing DNS.
-
-**Core insight:** an iPhone behaving nothing like other iPhones at the same site is the signal.
+Client family anomaly detection for Juniper Mist wireless networks. Detects device misbehavior that aggregate metrics miss — clients stuck in DHCP loops, stale PMKIDs causing roam failures, issues with specific chipsets, device families with poor DNS performance, etc. Leverages multiple ML techniques on client event datalakes that have been enriched with device fingerprinting information.
 
 > **New to Sasquatch?** Start with the admin guide — [GUIDE_Unsupervised_Anomaly_Detection.pdf](GUIDE_Unsupervised_Anomaly_Detection.pdf). It walks through every view in the dashboard, the alert / finding lifecycle, and the Config panel knobs in plain language. This README is the operator / developer reference for deploying and extending the platform.
 
