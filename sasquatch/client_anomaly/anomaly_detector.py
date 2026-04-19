@@ -153,7 +153,7 @@ def _run_isolation_forest(
     the per-MAC vector to be statistically meaningful. MACs filtered out get
     null scores — same shape as the existing MIN_PEERS skip path.
     """
-    min_events = _cfg("anomaly_min_mac_events")
+    min_events = config.get("general", "anomaly_min_mac_events")
     eligible_indices = [
         i for i, r in enumerate(feature_records)
         if r.get("event_count", 0) >= min_events
@@ -273,7 +273,7 @@ def _run_dbscan(macs: list[str], feature_records: list[dict]) -> dict[str, dict]
     if not macs:
         return {}
 
-    min_events = _cfg("anomaly_min_mac_events")
+    min_events = config.get("general", "anomaly_min_mac_events")
     eligible_indices = [
         i for i, r in enumerate(feature_records)
         if r.get("event_count", 0) >= min_events
