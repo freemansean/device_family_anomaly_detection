@@ -54,11 +54,15 @@ from sklearn.preprocessing import StandardScaler
 
 from . import config
 from . import db as _db
+from .client_cache import is_bare_one_token_family
 from .event_collector import get_events, sanitize_wlan_key
 from .feature_engineer import (
+    MFG_ROLLUP_SUFFIX,
     SERVICE_ACCOUNT_SUFFIX,
     build_posthoc_features,
     get_features,
+    is_mfg_record_key,
+    is_mfg_rollup_family,
     is_sa_record_key,
     is_service_account_family,
     underlying_mac,
@@ -88,6 +92,20 @@ def _random_state() -> int | None:
     """Return the ML random seed, or None when set to -1 (random each run)."""
     val = _cfg("anomaly_random_state")
     return None if val == -1 else int(val)
+
+
+def _is_centroid_eligible_family(family: str) -> bool:
+    """Only virtual rollup families participate in Centroid analysis.
+
+    Per-manufacturer <mfg>-MFG rollups and per-username `.service_account`
+    families answer the right granularity question for Centroid — "does this
+    cohort's aggregate event-mix direction differ from the healthy reference?"
+    Per-fingerprint rows (e.g. `Apple | iPhone | iOS 17`) are intentionally
+    excluded — they collapse into their manufacturer rollup and are handled
+    there, so they don't double-count and they don't drown out the rollup
+    signal with per-revision Centroid noise.
+    """
+    return is_mfg_rollup_family(family) or is_service_account_family(family)
 
 
 
@@ -655,15 +673,21 @@ async def score(
             family = record.get("device_family", "Unknown")
             family_groups[family].append(mac)
 
-        # Service-account dual records are exact-vector copies of their primary
-        # MAC and share that MAC's raw event stream. They must be EXCLUDED from
-        # passes that operate on raw events or vector density:
+        # Service-account and MFG-rollup dual records are exact-vector copies
+        # of their primary MAC and share that MAC's raw event stream. They must
+        # be EXCLUDED from passes that operate on raw events or vector density:
         #   - Markov analysis (mac_raw_events is keyed by real MAC, not the composite)
         #   - DBSCAN (duplicate vectors would inflate cluster density and pull in
         #     distant points that wouldn't normally cluster)
-        # They participate normally in centroid detection, per-family IF, and
-        # finding rollup, where each sa family stands as a first-class peer.
-        real_macs_only: set[str] = {k for k in features if not is_sa_record_key(k)}
+        #   - Isolation Forest (duplicates would skew the intra-family contamination)
+        # SA records DO participate in centroid detection, per-family IF, and
+        # finding rollup. MFG records participate in centroid detection ONLY —
+        # they are the sole Centroid candidates by design (per-fingerprint rows
+        # drop out of Centroid entirely). See _is_centroid_eligible_family.
+        real_macs_only: set[str] = {
+            k for k in features
+            if not is_sa_record_key(k) and not is_mfg_record_key(k)
+        }
         real_family_groups: dict[str, list[str]] = defaultdict(list)
         for mac in real_macs_only:
             family = features[mac].get("device_family", "Unknown")
@@ -684,10 +708,12 @@ async def score(
         )
         markov_family_flags: dict[str, dict] = markov_results.pop("__family_markov__", {})
 
-        # Propagate per-MAC Markov results onto sa records so the merge step
-        # below can populate anomaly entries for both keys with consistent flags.
+        # Propagate per-MAC Markov results onto sa and MFG records so the merge
+        # step below can populate anomaly entries for all three keys with
+        # consistent flags. MFG family-level Markov rollup is intentionally
+        # not computed — MFG rows are Centroid-only at the family level.
         for key in features:
-            if is_sa_record_key(key):
+            if is_sa_record_key(key) or is_mfg_record_key(key):
                 markov_results[key] = markov_results.get(underlying_mac(key), {})
 
         # Build per-sa-family Markov rollup from the propagated per-MAC results.
@@ -744,9 +770,11 @@ async def score(
 
         # Copy each primary MAC's DBSCAN result onto its sa record so the merge
         # step has something to read for sa keys. sa records inherit their
-        # device's site-wide cluster membership — they ARE the same physical device.
+        # device's site-wide cluster membership — they ARE the same physical
+        # device. MFG records get the same treatment for merge completeness,
+        # though DBSCAN signal is not surfaced for MFG families (Centroid-only).
         for key in features:
-            if is_sa_record_key(key):
+            if is_sa_record_key(key) or is_mfg_record_key(key):
                 primary = underlying_mac(key)
                 dbscan_results[key] = dict(
                     dbscan_results.get(
@@ -783,15 +811,30 @@ async def score(
             family_dbscan_noise_ratio[family] = ratio
 
         # --- Family centroid detection: determine which families are anomalous ---
+        # Centroid is scoped to VIRTUAL rollup families only — per-manufacturer
+        # <mfg>-MFG rollups and per-username .service_account families. Per-
+        # fingerprint families (e.g. "Apple | iPhone | iOS 17") drop out of
+        # Centroid entirely — every MAC they carry is already folded into its
+        # manufacturer's rollup, so measuring them a second time at finer
+        # granularity double-counts the population and drowns out the rollup
+        # signal with per-revision Centroid noise (historically the Intel
+        # false-positive story).
+        centroid_family_groups = {
+            fam: macs
+            for fam, macs in family_groups.items()
+            if _is_centroid_eligible_family(fam)
+        }
         # Compute per-family mean health so the centroid detection can build a
         # healthy-only reference (families with low health are excluded from the
         # reference population but are still scored against it).
-        family_health = _family_mean_health(family_groups, features, "", wlan)
+        family_health = _family_mean_health(
+            centroid_family_groups, features, "", wlan
+        )
 
         # Cosine distance from the healthy-reference centroid is the sole
         # family-level (is_family_outlier) signal. IF is no longer used here.
         centroid_dist_scores = _run_family_centroid_distance(
-            family_groups, features, wlan, family_health
+            centroid_family_groups, features, wlan, family_health
         )
         flagged_families: set[str] = set()
         dist_threshold = _cfg("anomaly_centroid_dist_threshold")
@@ -801,10 +844,19 @@ async def score(
                 log.info("Centroid distance [%s]: family [%s] flagged (dist=%.4f)", wlan, family, dist)
 
         # --- Stage 2: Isolation Forest per device family ---
+        # MFG-rollup families are skipped: their member records are exact-vector
+        # duplicates of primary MACs that are already being scored under their
+        # per-fingerprint families, so running IF on MFG would double-count
+        # every MAC. MFG rows are Centroid-only.
         min_peers = _cfg("anomaly_min_peers")
         if_results: dict[str, dict] = {}
         families_with_org_if: set[str] = set()
         for family, family_macs in family_groups.items():
+            if is_mfg_rollup_family(family):
+                if_results.update(
+                    {mac: {"if_score": None, "is_if_outlier": False} for mac in family_macs}
+                )
+                continue
             n = len(family_macs)
             family_records = [features[m] for m in family_macs]
 
@@ -877,26 +929,41 @@ async def score(
                 anomalies[mac]["is_service_account_record"] = True
                 anomalies[mac]["primary_mac"] = features[mac].get("primary_mac", underlying_mac(mac))
                 anomalies[mac]["primary_device_family"] = features[mac].get("primary_device_family", "")
+            if is_mfg_record_key(mac):
+                anomalies[mac]["is_mfg_rollup_record"] = True
+                anomalies[mac]["primary_mac"] = features[mac].get("primary_mac", underlying_mac(mac))
+                anomalies[mac]["primary_device_family"] = features[mac].get("primary_device_family", "")
+                anomalies[mac]["resolved_manufacturer"] = features[mac].get("resolved_manufacturer", "")
 
-        # Surface a compact service-account summary on each PRIMARY anomaly entry
+        # Surface compact virtual-family summaries on each PRIMARY anomaly entry
         # so the per-MAC drilldown endpoint (which queries by real MAC) can show
-        # "this MAC also belongs to {label}.service_account, scored as
-        # {is_family_outlier}" without an extra Redis lookup.
+        # "this MAC also belongs to {family}, scored as {is_family_outlier}"
+        # without an extra Redis lookup. SA: same-username cohort view. MFG:
+        # same-manufacturer aggregate view (the only Centroid candidate under
+        # the current rules).
         for mac in list(anomalies):
-            if is_sa_record_key(mac):
+            if is_sa_record_key(mac) or is_mfg_record_key(mac):
                 continue
             sa_key = f"{mac}#sa"
             sa_entry = anomalies.get(sa_key)
-            if not sa_entry:
-                continue
-            anomalies[mac]["service_account"] = {
-                "family": features[mac].get("service_account_family", ""),
-                "last_username": features[mac].get("last_username", ""),
-                "is_family_outlier": sa_entry["is_family_outlier"],
-                "is_if_outlier": sa_entry["is_if_outlier"],
-                "if_score": sa_entry["if_score"],
-                "centroid_dist_score": sa_entry.get("family_centroid_dist_score"),
-            }
+            if sa_entry:
+                anomalies[mac]["service_account"] = {
+                    "family": features[mac].get("service_account_family", ""),
+                    "last_username": features[mac].get("last_username", ""),
+                    "is_family_outlier": sa_entry["is_family_outlier"],
+                    "is_if_outlier": sa_entry["is_if_outlier"],
+                    "if_score": sa_entry["if_score"],
+                    "centroid_dist_score": sa_entry.get("family_centroid_dist_score"),
+                }
+            mfg_key = f"{mac}#mfg"
+            mfg_entry = anomalies.get(mfg_key)
+            if mfg_entry:
+                anomalies[mac]["mfg_rollup"] = {
+                    "family": features[mfg_key].get("device_family", ""),
+                    "resolved_manufacturer": features[mac].get("resolved_manufacturer", ""),
+                    "is_family_outlier": mfg_entry["is_family_outlier"],
+                    "centroid_dist_score": mfg_entry.get("family_centroid_dist_score"),
+                }
 
         key_anomalies = _anomalies_redis_key(site_id, wlan)
         await redis_client.set(key_anomalies, json.dumps(anomalies), ex=ANOMALIES_TTL)
@@ -906,6 +973,15 @@ async def score(
         findings: list[dict] = []
         for family, family_macs in family_groups.items():
             if family in HIDDEN_FAMILIES:
+                continue
+            # Bare-1-token primary families are coverage artifacts — the
+            # "family" exists only because Mist could resolve the manufacturer
+            # (or an OS/device token) but nothing else for those MACs.
+            # Their MACs already live in the manufacturer's -MFG rollup, which
+            # carries the actionable family-level signal. Suppressing the
+            # family rollup keeps the "Intel Corporate family is anomalous"
+            # noise out of the Findings feed while preserving per-MAC drilldown.
+            if family != "" and is_bare_one_token_family(family):
                 continue
             total = len(family_macs)
 
@@ -976,7 +1052,12 @@ async def score(
             # For sa families, mac_raw_events is keyed by REAL MAC, so strip
             # the sa suffix from each composite outlier key before looking up events.
             is_family_level_outlier = family in flagged_families
-            family_kind = "service_account" if is_service_account_family(family) else "device_family"
+            if is_mfg_rollup_family(family):
+                family_kind = "mfg_rollup"
+            elif is_service_account_family(family):
+                family_kind = "service_account"
+            else:
+                family_kind = "device_family"
             if is_family_level_outlier:
                 probable_pattern = "family_behavioral_outlier"
             else:
@@ -1049,11 +1130,26 @@ async def score(
                     for m in family_macs
                 })
 
+            # Mirror for MFG rollup findings: strip the "-MFG" suffix for a
+            # human-readable manufacturer label and list the per-fingerprint
+            # families this rollup aggregates (e.g. "Apple-MFG (iPhone iOS 17,
+            # MacBook macOS 14, bare Apple)").
+            mfg_label = ""
+            mfg_member_families: list[str] = []
+            if family_kind == "mfg_rollup":
+                mfg_label = family[: -len(MFG_ROLLUP_SUFFIX)]
+                mfg_member_families = sorted({
+                    features[m].get("primary_device_family", "Unknown")
+                    for m in family_macs
+                })
+
             finding = {
                 "device_family": family,
                 "family_kind": family_kind,
                 "service_account_label": sa_label,
                 "service_account_member_families": sa_member_families,
+                "mfg_rollup_label": mfg_label,
+                "mfg_rollup_member_families": mfg_member_families,
                 "wlan": wlan,
                 "severity": _severity(outlier_ratio),
                 "outlier_ratio": round(outlier_ratio, 4),
@@ -1165,7 +1261,14 @@ async def score_org_wide(
         family = composite_features[key].get("device_family", "Unknown")
         org_family_groups[family].append(key)
 
-    real_composite_macs: set[str] = {k for k in composite_macs if not is_sa_record_key(k)}
+    # Exclude SA and MFG dual records from DBSCAN/IF (exact-vector duplicates
+    # of primary MACs — would inflate cluster density / double-count intra-
+    # family IF). Both participate normally in per-MAC result merging via
+    # their primary's result further below.
+    real_composite_macs: set[str] = {
+        k for k in composite_macs
+        if not is_sa_record_key(k) and not is_mfg_record_key(k)
+    }
     real_org_family_groups: dict[str, list[str]] = defaultdict(list)
     for key in real_composite_macs:
         family = composite_features[key].get("device_family", "Unknown")
@@ -1185,14 +1288,18 @@ async def score_org_wide(
 
     dbscan_results: dict[str, dict] = {**dbscan_results_eligible}
 
-    # Copy each primary composite MAC's DBSCAN result onto its sa composite
-    # key so the merge step has a consistent value to read for sa entries.
-    # The sa record represents the same physical device — it inherits its
-    # primary's site-wide cluster membership.
+    # Copy each primary composite MAC's DBSCAN result onto its virtual-family
+    # composite keys so the merge step has a consistent value to read. Both
+    # SA and MFG records represent the same physical device — they inherit
+    # the primary's site-wide cluster membership. (MFG family-level DBSCAN
+    # flags are not surfaced downstream since MFG is Centroid-only.)
     for key in composite_macs:
-        if not is_sa_record_key(key):
+        if is_sa_record_key(key):
+            primary_ck = key[: -len("#sa")]
+        elif is_mfg_record_key(key):
+            primary_ck = key[: -len("#mfg")]
+        else:
             continue
-        primary_ck = key[: -len("#sa")]
         dbscan_results[key] = dict(
             dbscan_results.get(
                 primary_ck,
@@ -1227,14 +1334,24 @@ async def score_org_wide(
         family_dbscan_noise_ratio[family] = noise_count / len(eligible)
 
     # --- Family centroid detection across all org families ---
+    # Scoped to virtual rollup families only — <mfg>-MFG and .service_account.
+    # Per-fingerprint families drop out entirely; every MAC they contain is
+    # already folded into its manufacturer rollup, so measuring per-fingerprint
+    # against the healthy reference double-counts the population and drowns
+    # rollup signal (historically the Intel false-positive story).
+    centroid_org_family_groups = {
+        fam: macs
+        for fam, macs in org_family_groups.items()
+        if _is_centroid_eligible_family(fam)
+    }
     # Compute per-family mean health from feature vectors so the centroid detection
     # can build a healthy-only reference. Unhealthy families are still scored against it.
     org_family_health = _family_mean_health(
-        org_family_groups, composite_features, "[org] ", wlan
+        centroid_org_family_groups, composite_features, "[org] ", wlan
     )
 
     centroid_dist_scores = _run_family_centroid_distance(
-        org_family_groups, composite_features, f"org/{wlan}", org_family_health
+        centroid_org_family_groups, composite_features, f"org/{wlan}", org_family_health
     )
     flagged_families: set[str] = set()
     org_dist_threshold = _cfg("anomaly_centroid_dist_threshold")
@@ -1247,8 +1364,16 @@ async def score_org_wide(
             )
 
     # --- Stage 2: Isolation Forest per family (org-wide population) ---
+    # MFG families skipped (exact-vector duplicates already scored under
+    # per-fingerprint). Primary MACs keep their per-fingerprint IF scores;
+    # MFG composite keys get null IF entries populated in the merge below.
     if_results: dict[str, dict] = {}
     for family, family_keys in org_family_groups.items():
+        if is_mfg_rollup_family(family):
+            if_results.update(
+                {k: {"if_score": None, "is_if_outlier": False} for k in family_keys}
+            )
+            continue
         n = len(family_keys)
         results = _run_isolation_forest(family_keys, [composite_features[k] for k in family_keys])
         outliers = sum(1 for r in results.values() if r["is_if_outlier"])
@@ -1292,6 +1417,17 @@ async def score_org_wide(
             )
             org_anomalies_flat[key]["primary_device_family"] = composite_features[key].get(
                 "primary_device_family", ""
+            )
+        if is_mfg_record_key(key):
+            org_anomalies_flat[key]["is_mfg_rollup_record"] = True
+            org_anomalies_flat[key]["primary_mac"] = composite_features[key].get(
+                "primary_mac", underlying_mac(composite_to_mac[key])
+            )
+            org_anomalies_flat[key]["primary_device_family"] = composite_features[key].get(
+                "primary_device_family", ""
+            )
+            org_anomalies_flat[key]["resolved_manufacturer"] = composite_features[key].get(
+                "resolved_manufacturer", ""
             )
 
     # --- Merge per-site Markov anomaly data into org_anomalies_flat ---
@@ -1440,6 +1576,12 @@ async def score_org_wide(
         for family, family_cks in org_family_groups.items():
             if family in HIDDEN_FAMILIES:
                 continue
+            # Suppress bare-1-token primary families org-wide for the same
+            # reason we suppress them at the site level — their MACs are
+            # already folded into the <mfg>-MFG rollup, which carries the
+            # actionable family-level signal.
+            if is_bare_one_token_family(family):
+                continue
             total = len(family_cks)
             org_min_for_finding = _cfg("anomaly_min_peers")
             if total < org_min_for_finding:
@@ -1541,7 +1683,12 @@ async def score_org_wide(
             # all sites. mac_raw events are keyed by REAL MAC, so strip the "#sa"
             # suffix from sa composite mac strings before lookup.
             is_family_level_outlier = family in flagged_families
-            family_kind = "service_account" if is_service_account_family(family) else "device_family"
+            if is_mfg_rollup_family(family):
+                family_kind = "mfg_rollup"
+            elif is_service_account_family(family):
+                family_kind = "service_account"
+            else:
+                family_kind = "device_family"
             combined_events: list[dict] = []
             if is_family_level_outlier:
                 probable_pattern = "family_behavioral_outlier"
@@ -1571,6 +1718,16 @@ async def score_org_wide(
             if family_kind == "service_account":
                 sa_label = family[: -len(SERVICE_ACCOUNT_SUFFIX)]
                 sa_member_families = sorted({
+                    composite_features[k].get("primary_device_family", "Unknown")
+                    for k in family_cks
+                })
+
+            # Mirror for MFG findings.
+            mfg_label = ""
+            mfg_member_families: list[str] = []
+            if family_kind == "mfg_rollup":
+                mfg_label = family[: -len(MFG_ROLLUP_SUFFIX)]
+                mfg_member_families = sorted({
                     composite_features[k].get("primary_device_family", "Unknown")
                     for k in family_cks
                 })
@@ -1606,6 +1763,8 @@ async def score_org_wide(
                 "family_kind": family_kind,
                 "service_account_label": sa_label,
                 "service_account_member_families": sa_member_families,
+                "mfg_rollup_label": mfg_label,
+                "mfg_rollup_member_families": mfg_member_families,
                 "wlan": wlan,
                 "severity": _severity(outlier_ratio),
                 "outlier_ratio": round(outlier_ratio, 4),
