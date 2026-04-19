@@ -2386,8 +2386,15 @@ async def get_org_family_drilldown(
         raise HTTPException(status_code=500, detail="MIST_ORG_ID or MIST_API_TOKEN not configured.")
 
     is_sa_family = family.endswith(".service_account")
-    family_kind = "service_account" if is_sa_family else "device_family"
+    is_mfg_family = family.endswith("-MFG")
+    if is_sa_family:
+        family_kind = "service_account"
+    elif is_mfg_family:
+        family_kind = "mfg_rollup"
+    else:
+        family_kind = "device_family"
     sa_label = family[: -len(".service_account")] if is_sa_family else ""
+    mfg_label = family[: -len("-MFG")] if is_mfg_family else ""
 
     redis_client = _get_redis()
     try:
@@ -2398,11 +2405,16 @@ async def get_org_family_drilldown(
     finally:
         await redis_client.aclose()
 
-    filter_kw = (
-        {"service_account_family": family, "wlan": wlan}
-        if is_sa_family
-        else {"family_exact": family, "wlan": wlan}
-    )
+    if is_sa_family:
+        filter_kw = {"service_account_family": family, "wlan": wlan}
+    elif is_mfg_family:
+        # MFG families aggregate every MAC of a given manufacturer across all
+        # primary per-fingerprint families. client_summary stores the
+        # normalized manufacturer on each row, so filter on that directly —
+        # no new table or column needed.
+        filter_kw = {"manufacturer_exact": mfg_label, "wlan": wlan}
+    else:
+        filter_kw = {"family_exact": family, "wlan": wlan}
     resolved_tags = _resolve_filter_tags(filter_tag, site_map)
 
     counts = await db.count_client_summary(**filter_kw, filter_tags=resolved_tags)
@@ -2423,6 +2435,7 @@ async def get_org_family_drilldown(
     )
 
     sa_member_families: set[str] = set()
+    mfg_member_families: set[str] = set()
     rows: list[dict] = []
     for sr in summary_rows:
         r = _summary_row_to_drilldown(sr, site_map)
@@ -2432,6 +2445,11 @@ async def get_org_family_drilldown(
             r["is_service_account_record"] = True
             if sr.get("device_family"):
                 sa_member_families.add(sr["device_family"])
+        elif is_mfg_family:
+            r["primary_device_family"] = sr.get("device_family", "Unknown")
+            r["is_mfg_rollup_record"] = True
+            if sr.get("device_family"):
+                mfg_member_families.add(sr["device_family"])
         rows.append(r)
 
     total_pages = (counts["total"] + page_size - 1) // page_size
@@ -2441,6 +2459,8 @@ async def get_org_family_drilldown(
         "family_kind": family_kind,
         "service_account_label": sa_label,
         "service_account_member_families": sorted(sa_member_families),
+        "mfg_rollup_label": mfg_label,
+        "mfg_rollup_member_families": sorted(mfg_member_families),
         "total_count": counts["total"],
         "if_outlier_count": counts["if_outlier"],
         "dbscan_outlier_count": counts["dbscan_outlier"],
@@ -2476,8 +2496,15 @@ async def get_org_family_drilldown_all_wlans(
         raise HTTPException(status_code=500, detail="MIST_ORG_ID or MIST_API_TOKEN not configured.")
 
     is_sa_family = family.endswith(".service_account")
-    family_kind = "service_account" if is_sa_family else "device_family"
+    is_mfg_family = family.endswith("-MFG")
+    if is_sa_family:
+        family_kind = "service_account"
+    elif is_mfg_family:
+        family_kind = "mfg_rollup"
+    else:
+        family_kind = "device_family"
     sa_label = family[: -len(".service_account")] if is_sa_family else ""
+    mfg_label = family[: -len("-MFG")] if is_mfg_family else ""
 
     redis_client = _get_redis()
     try:
@@ -2488,11 +2515,12 @@ async def get_org_family_drilldown_all_wlans(
     finally:
         await redis_client.aclose()
 
-    filter_kw = (
-        {"service_account_family": family}
-        if is_sa_family
-        else {"family_exact": family}
-    )
+    if is_sa_family:
+        filter_kw = {"service_account_family": family}
+    elif is_mfg_family:
+        filter_kw = {"manufacturer_exact": mfg_label}
+    else:
+        filter_kw = {"family_exact": family}
     resolved_tags = _resolve_filter_tags(filter_tag, site_map)
 
     counts = await db.count_client_summary(**filter_kw, filter_tags=resolved_tags)
@@ -2510,6 +2538,7 @@ async def get_org_family_drilldown_all_wlans(
     )
 
     sa_member_families: set[str] = set()
+    mfg_member_families: set[str] = set()
     rows: list[dict] = []
     for sr in summary_rows:
         r = _summary_row_to_drilldown(sr, site_map, include_wlan=True)
@@ -2519,6 +2548,11 @@ async def get_org_family_drilldown_all_wlans(
             r["is_service_account_record"] = True
             if sr.get("device_family"):
                 sa_member_families.add(sr["device_family"])
+        elif is_mfg_family:
+            r["primary_device_family"] = sr.get("device_family", "Unknown")
+            r["is_mfg_rollup_record"] = True
+            if sr.get("device_family"):
+                mfg_member_families.add(sr["device_family"])
         rows.append(r)
 
     total_pages = (counts["total"] + page_size - 1) // page_size
@@ -2528,6 +2562,8 @@ async def get_org_family_drilldown_all_wlans(
         "family_kind": family_kind,
         "service_account_label": sa_label,
         "service_account_member_families": sorted(sa_member_families),
+        "mfg_rollup_label": mfg_label,
+        "mfg_rollup_member_families": sorted(mfg_member_families),
         "total_count": counts["total"],
         "if_outlier_count": counts["if_outlier"],
         "dbscan_outlier_count": counts["dbscan_outlier"],

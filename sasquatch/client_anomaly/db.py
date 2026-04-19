@@ -1240,6 +1240,7 @@ def _summary_where(
     wlan: Optional[str] = None,
     site_id: Optional[str] = None,
     service_account_family: Optional[str] = None,
+    manufacturer_exact: Optional[str] = None,
     last_username: Optional[str] = None,
     mac_prefix: Optional[str] = None,
     filter_tags: Optional[list[dict]] = None,
@@ -1269,6 +1270,9 @@ def _summary_where(
     if service_account_family is not None:
         conditions.append("service_account_family = ?")
         params.append(service_account_family)
+    if manufacturer_exact is not None:
+        conditions.append("device_manufacturer = ?")
+        params.append(manufacturer_exact)
     if last_username is not None:
         conditions.append("last_username = ?")
         params.append(last_username)
@@ -1291,6 +1295,7 @@ async def query_client_summary(
     wlan: Optional[str] = None,
     site_id: Optional[str] = None,
     service_account_family: Optional[str] = None,
+    manufacturer_exact: Optional[str] = None,
     last_username: Optional[str] = None,
     mac_prefix: Optional[str] = None,
     filter_tags: Optional[list[dict]] = None,
@@ -1319,6 +1324,7 @@ async def query_client_summary(
     where, params = _summary_where(
         family_exact=family_exact, family_substring=family_substring,
         wlan=wlan, site_id=site_id, service_account_family=service_account_family,
+        manufacturer_exact=manufacturer_exact,
         last_username=last_username, mac_prefix=mac_prefix,
         filter_tags=filter_tags,
     )
@@ -1344,6 +1350,7 @@ async def count_client_summary(
     wlan: Optional[str] = None,
     site_id: Optional[str] = None,
     service_account_family: Optional[str] = None,
+    manufacturer_exact: Optional[str] = None,
     last_username: Optional[str] = None,
     mac_prefix: Optional[str] = None,
     filter_tags: Optional[list[dict]] = None,
@@ -1357,6 +1364,7 @@ async def count_client_summary(
     where, params = _summary_where(
         family_exact=family_exact, family_substring=family_substring,
         wlan=wlan, site_id=site_id, service_account_family=service_account_family,
+        manufacturer_exact=manufacturer_exact,
         last_username=last_username, mac_prefix=mac_prefix,
         filter_tags=filter_tags,
     )
