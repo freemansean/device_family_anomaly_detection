@@ -134,8 +134,10 @@ export default function MacDrilldown({ siteId, mac, apiBase, onBack, wlan }) {
   const [error, setError] = useState(null);
 
   useEffect(() => {
+    if (!siteId || !mac) return;
     setLoading(true);
-    apiFetch(`${apiBase}/api/v1/sites/${siteId}/anomalies/${mac}?wlan=${encodeURIComponent(wlan)}`)
+    const qs = wlan ? `?wlan=${encodeURIComponent(wlan)}` : "";
+    apiFetch(`${apiBase}/api/v1/sites/${siteId}/anomalies/${mac}${qs}`)
       .then((r) => {
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
         return r.json();

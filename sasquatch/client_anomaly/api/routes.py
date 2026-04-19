@@ -3592,12 +3592,28 @@ async def get_family_event_counts(site_id: str, family: str, wlan: str = Query(.
 
 
 @router.get("/sites/{site_id}/anomalies/{mac}")
-async def get_mac_anomaly(site_id: str, mac: str, wlan: str = Query(..., min_length=1, description="WLAN (SSID) name to scope results to. Required.")):
+async def get_mac_anomaly(
+    site_id: str,
+    mac: str,
+    wlan: Optional[str] = Query(None, min_length=1, description="WLAN (SSID) name to scope results to. Optional — when omitted, the MAC's most-recent wlan at this site is auto-resolved from client_summary."),
+):
     """
     Full event timeline + anomaly scores for one MAC.
-    Used by MAC Drill-down view. Optionally scoped to a WLAN.
+    Used by MAC Drill-down view. Optionally scoped to a WLAN; if omitted,
+    we auto-resolve the MAC's most recent wlan at this site so cross-site
+    navigation (PCA click, MAC search) works during the brief window after
+    a site change when the frontend's wlan selection is still resolving.
     """
     mac_normalized = mac.replace(":", "").lower()
+
+    if not wlan:
+        rows = await db.query_client_summary(site_id=site_id, mac_prefix=mac_normalized)
+        rows = [r for r in rows if (r.get("mac") or "").lower() == mac_normalized]
+        if rows:
+            rows.sort(key=lambda r: r.get("last_seen") or 0, reverse=True)
+            wlan = rows[0].get("wlan") or None
+    if not wlan:
+        raise HTTPException(status_code=404, detail=f"No data for MAC {mac}")
 
     # Fallback chain for per-MAC anomaly scores:
     #   1. Per-site anomalies (written by score() in Phase 3 of the org pipeline)
