@@ -211,6 +211,45 @@ def _strip_version_suffix(token: str) -> str:
     return re.sub(r"\s+\d+(?:[._]\d+)*\s*$", "", token.strip())
 
 
+def resolve_manufacturer_from_family(device_family: str, device_manufacturer: str = "") -> str:
+    """Back-resolve manufacturer from an enriched-event row.
+
+    Events carry ``device_manufacturer`` (populated from the client cache at
+    enrichment time) and ``device_family`` (the composite fingerprint label).
+    This helper prefers the explicit manufacturer when present, and falls back
+    to tokenizing ``device_family`` through the same strict back-resolve map
+    used by ``resolve_manufacturer`` — so a bare ``"iPhone"`` family resolves
+    to ``"Apple"`` even when the event row has no mfg field.
+
+    Returns '' if nothing resolves.
+    """
+    mfg = _clean_token(device_manufacturer or "")
+    if mfg:
+        return mfg
+    if not device_family:
+        return ""
+    # Ignore HIDDEN families — they have no manufacturer signal to speak of.
+    if device_family == "Unknown" or device_family.startswith("Unknown/"):
+        return ""
+    parts = [p.strip() for p in device_family.split(" | ") if p.strip()]
+    if not parts:
+        return ""
+    # Multi-token family: the first token IS the manufacturer by construction
+    # (classify_family builds "mfg | model | os").
+    if len(parts) > 1:
+        return _clean_token(parts[0])
+    # Bare one-token family. First check if the token is a known OS / device
+    # label that back-resolves to a vendor (iOS → Apple, Android → Google).
+    # If not, the token itself is the manufacturer — that's how a bare-1-token
+    # family is built in the first place.
+    token = parts[0]
+    pseudo = {"mfg": "", "last_os": token, "last_model": token, "last_device": token}
+    vendor = resolve_manufacturer(pseudo)
+    if vendor:
+        return vendor
+    return _clean_token(token)
+
+
 def resolve_manufacturer(client: dict) -> str:
     """Return the normalized manufacturer string to use for -MFG bucketing,
     or '' when nothing resolves.

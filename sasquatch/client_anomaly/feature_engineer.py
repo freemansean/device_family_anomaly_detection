@@ -46,6 +46,10 @@ from .event_collector import (
 
 from . import config
 from . import db as _db
+from .client_cache import (
+    is_bare_one_token_family,
+    resolve_manufacturer_from_family,
+)
 
 log = logging.getLogger(__name__)
 
@@ -67,6 +71,22 @@ log = logging.getLogger(__name__)
 SERVICE_ACCOUNT_SUFFIX = ".service_account"
 _SA_KEY_SUFFIX = "#sa"
 
+# ─────────────────────────────────────────────────────────────────────
+# Manufacturer-rollup dual-family identifiers.
+#
+# Every MAC whose resolved manufacturer meets the mfg_rollup_min_macs
+# threshold is emitted into the feature dict an ADDITIONAL time under a
+# composite key built by `mfg_record_key`, with device_family set to
+# "{mfg}-MFG". The -MFG family is the sole candidate for Centroid
+# analysis (per the Phase-3 detector gates); per-fingerprint families
+# drop out of Centroid entirely and stay with DBSCAN/IF/Markov.
+#
+# Shape mirrors the service-account plumbing: composite features-dict
+# key suffix `#mfg`, virtual family-name suffix `-MFG`.
+# ─────────────────────────────────────────────────────────────────────
+MFG_ROLLUP_SUFFIX = "-MFG"
+_MFG_KEY_SUFFIX = "#mfg"
+
 
 def sa_record_key(mac: str) -> str:
     """Composite features-dict key for a MAC's service-account record."""
@@ -78,16 +98,38 @@ def is_sa_record_key(key: str) -> bool:
     return key.endswith(_SA_KEY_SUFFIX)
 
 
+def mfg_record_key(mac: str) -> str:
+    """Composite features-dict key for a MAC's manufacturer-rollup record."""
+    return f"{mac}{_MFG_KEY_SUFFIX}"
+
+
+def is_mfg_record_key(key: str) -> bool:
+    """True if a features-dict key is the MFG-rollup variant of a MAC."""
+    return key.endswith(_MFG_KEY_SUFFIX)
+
+
 def underlying_mac(key: str) -> str:
-    """Strip the sa suffix from a composite key to recover the real MAC."""
+    """Strip any virtual-family suffix from a composite key to recover the real MAC."""
     if is_sa_record_key(key):
         return key[: -len(_SA_KEY_SUFFIX)]
+    if is_mfg_record_key(key):
+        return key[: -len(_MFG_KEY_SUFFIX)]
     return key
 
 
 def is_service_account_family(name: str | None) -> bool:
     """True if a device-family name is a virtual service-account family."""
     return bool(name) and name.endswith(SERVICE_ACCOUNT_SUFFIX)
+
+
+def is_mfg_rollup_family(name: str | None) -> bool:
+    """True if a device-family name is a virtual <mfg>-MFG rollup family."""
+    return bool(name) and name.endswith(MFG_ROLLUP_SUFFIX)
+
+
+def mfg_rollup_family_name(mfg: str) -> str:
+    """Build the virtual-family name for a manufacturer."""
+    return f"{mfg}{MFG_ROLLUP_SUFFIX}"
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 FEATURES_TTL = 24 * 3600
@@ -409,6 +451,30 @@ async def build_features(site_id: str, wlan: str) -> int:
             if sa_entry:
                 mac_to_sa_family[mac] = f"{sa_entry['label']}{SERVICE_ACCOUNT_SUFFIX}"
 
+        # ── Manufacturer-rollup family resolution (per MAC, threshold-gated) ──
+        # Resolve each MAC's manufacturer via majority vote over its enriched
+        # events. Then count MACs per manufacturer and keep only those meeting
+        # the mfg_rollup_min_macs floor. Bare-1-token families back-resolve
+        # through the family name (iOS 17 → Apple, iPhone → Apple, …) via the
+        # strict whitelist in client_cache.resolve_manufacturer — anything we
+        # can't attribute with confidence stays unresolved and emits no -MFG.
+        mfg_rollup_min = config.get("general", "mfg_rollup_min_macs")
+        mac_to_mfg: dict[str, str] = {}
+        for mac, evts in mac_events.items():
+            mfg_votes: dict[str, int] = {}
+            for e in evts:
+                fam = e.get("device_family") or ""
+                mfg_raw = e.get("device_manufacturer") or ""
+                resolved = resolve_manufacturer_from_family(fam, mfg_raw)
+                if resolved:
+                    mfg_votes[resolved] = mfg_votes.get(resolved, 0) + 1
+            if mfg_votes:
+                mac_to_mfg[mac] = max(mfg_votes, key=mfg_votes.__getitem__)
+        mfg_mac_counts: Counter[str] = Counter(mac_to_mfg.values())
+        qualifying_mfgs: set[str] = {
+            m for m, cnt in mfg_mac_counts.items() if cnt >= int(mfg_rollup_min)
+        }
+
         # Pre-compute per-family event category counts for the org/family-insights
         # endpoint so it can aggregate across sites without loading raw events per
         # request. Each event contributes to its primary device family and — when
@@ -427,6 +493,11 @@ async def build_features(site_id: str, wlan: str) -> int:
                 if _sa_fam:
                     _fam_cat[_sa_fam][_cat] += 1
                     _fam_macs[_sa_fam].add(_mac)
+                _mfg = mac_to_mfg.get(_mac)
+                if _mfg and _mfg in qualifying_mfgs:
+                    _mfg_fam = mfg_rollup_family_name(_mfg)
+                    _fam_cat[_mfg_fam][_cat] += 1
+                    _fam_macs[_mfg_fam].add(_mac)
         family_counts = {
             fam: {
                 "total_events": sum(cats.values()),
@@ -447,6 +518,7 @@ async def build_features(site_id: str, wlan: str) -> int:
         features: dict[str, dict] = {}
         skipped = 0
         sa_emitted = 0
+        mfg_emitted = 0
         # Use the lower feature-pool threshold here (default 3). The Health
         # scorer and inter-family Centroid detector both consume the full
         # pool; IF and DBSCAN apply their higher anomaly_min_mac_events
@@ -475,6 +547,8 @@ async def build_features(site_id: str, wlan: str) -> int:
 
             last_username = mac_to_username.get(mac, "")
             sa_family_name = mac_to_sa_family.get(mac, "")
+            resolved_mfg = mac_to_mfg.get(mac, "")
+            bare_one_token = is_bare_one_token_family(device_family)
 
             volume_concentration_weight = math.log1p(len(evts)) * cat_vec["top_category_fraction"]
             features[mac] = {
@@ -491,6 +565,19 @@ async def build_features(site_id: str, wlan: str) -> int:
                 "volume_concentration_weight": volume_concentration_weight,
                 "last_username": last_username,
                 "service_account_family": sa_family_name,
+                # True when device_family is a single-token coverage artifact
+                # (e.g. bare "Intel Corporate" for MACs Mist never fully
+                # fingerprinted). Consumed by the family-level rollup in
+                # anomaly_detector.score / score_org_wide to drop these MACs
+                # from family outlier-ratio calculations — the MAC still
+                # participates in DBSCAN/IF/Markov as a data point and keeps
+                # its per-MAC flags, but the "family" (which is a junk drawer)
+                # does not earn a detector badge of its own.
+                "is_bare_one_token": bare_one_token,
+                # Resolved manufacturer for this MAC. Blank when nothing
+                # resolves (Mist placeholder mfg + no OS/device token match).
+                # Used downstream for -MFG rollup membership.
+                "resolved_manufacturer": resolved_mfg,
             }
 
             # ── Dual-family emission ──
@@ -516,11 +603,40 @@ async def build_features(site_id: str, wlan: str) -> int:
                 }
                 sa_emitted += 1
 
+            # ── Manufacturer-rollup emission ──
+            # Every MAC whose resolved manufacturer meets the threshold is
+            # emitted into the features dict an additional time under a
+            # composite `#mfg` key with device_family = "{mfg}-MFG". The MFG
+            # record is the sole Centroid candidate for that manufacturer
+            # (Phase 3 gate in anomaly_detector); bare-1-token and per-
+            # fingerprint primary records drop out of Centroid. The MFG record
+            # itself does NOT participate in DBSCAN/IF/Markov — those still
+            # run on primary per-fingerprint records only.
+            if resolved_mfg and resolved_mfg in qualifying_mfgs:
+                mfg_family_name = mfg_rollup_family_name(resolved_mfg)
+                features[mfg_record_key(mac)] = {
+                    "vector": dict(cat_vec),
+                    "category_vector": dict(cat_vec),
+                    "event_vector": dict(event_vec),
+                    "device_family": mfg_family_name,
+                    "event_count": len(evts),
+                    "random_mac": evts[0].get("random_mac", False) if evts else False,
+                    "volume_concentration_weight": volume_concentration_weight,
+                    "last_username": last_username,
+                    "primary_device_family": device_family,
+                    "primary_mac": mac,
+                    "is_mfg_rollup_record": True,
+                    "resolved_manufacturer": resolved_mfg,
+                }
+                mfg_emitted += 1
+
         key = _features_redis_key(site_id, wlan)
         await redis_client.set(key, json.dumps(features), ex=FEATURES_TTL)
         log.info(
             f"Built features for {len(features)} records "
-            f"({sa_emitted} service-account dual records) → {key} "
+            f"({sa_emitted} service-account dual records, "
+            f"{mfg_emitted} mfg-rollup dual records, "
+            f"{len(qualifying_mfgs)} qualifying mfgs ≥ {mfg_rollup_min}) → {key} "
             f"(category_vector={len(CATEGORY_FEATURE_KEYS)}d, "
             f"event_vector={len(event_type_index)}d) "
             f"({skipped} skipped with < {min_mac_events} events) [wlan={wlan}]"
