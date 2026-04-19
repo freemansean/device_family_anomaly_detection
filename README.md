@@ -1,5 +1,7 @@
 # Project Sasquatch — Client Anomaly Detection
 
+![Architecture overview](ARCH_Unsupervised_Anomaly_Detection.png)
+
 Unsupervised anomaly detection for Juniper Mist wireless networks. Detects device behavior that aggregate SLE metrics miss — clients stuck in DHCP loops, stale PMKIDs causing roam failures, entire device families silently failing DNS.
 
 **Core insight:** an iPhone behaving nothing like other iPhones at the same site is the signal.
