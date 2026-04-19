@@ -263,9 +263,9 @@ export default function OrgFamilyInsights({ apiBase, refreshToken, onMacSiteSele
     } else if (sortKey === "sites") {
       va = families[a].site_count ?? 0; vb = families[b].site_count ?? 0;
     } else {
-      // category column — sort by ratio (matches cell color coding)
-      va = families[a].categories?.[sortKey]?.ratio ?? 0;
-      vb = families[b].categories?.[sortKey]?.ratio ?? 0;
+      // category column — sort by raw event count
+      va = families[a].categories?.[sortKey]?.count ?? 0;
+      vb = families[b].categories?.[sortKey]?.count ?? 0;
     }
     if (va < vb) return sortDir === "asc" ? -1 : 1;
     if (va > vb) return sortDir === "asc" ? 1 : -1;

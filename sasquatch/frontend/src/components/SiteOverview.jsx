@@ -284,9 +284,9 @@ export default function SiteOverview({ siteId, apiBase, onMacSelect, onFamilySel
       va = summary.family_client_counts?.[a] ?? 0;
       vb = summary.family_client_counts?.[b] ?? 0;
     } else {
-      // category column — sort by ratio (matches cell color coding)
-      va = summary.families[a]?.[sortKey]?.ratio ?? 0;
-      vb = summary.families[b]?.[sortKey]?.ratio ?? 0;
+      // category column — sort by raw event count
+      va = summary.families[a]?.[sortKey]?.count ?? 0;
+      vb = summary.families[b]?.[sortKey]?.count ?? 0;
     }
     if (va < vb) return sortDir === "asc" ? -1 : 1;
     if (va > vb) return sortDir === "asc" ? 1 : -1;
