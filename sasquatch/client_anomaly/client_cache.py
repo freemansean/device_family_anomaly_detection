@@ -155,6 +155,99 @@ def classify_family(client: dict) -> str:
     )
 
 
+def is_bare_one_token_family(name: str | None) -> bool:
+    """True if `name` is a single-token family (no ' | ' separator) that is
+    neither a truly-empty ``Unknown``/``Unknown/<mfg>`` bucket nor a virtual
+    family (service account, MFG rollup).
+
+    Bare-1-token families are coverage artifacts: Mist only resolved the
+    manufacturer (or the OS/device token) for these MACs, typically because
+    the device never fully connected. They are suppressed from family-level
+    detector rollups — the MAC still participates in the detector passes
+    and carries its own per-MAC flags, but the "family" doesn't earn a
+    DBSCAN / IF / Markov badge of its own.
+    """
+    if not name:
+        return False
+    if " | " in name:
+        return False
+    if name == "Unknown" or name.startswith("Unknown/"):
+        return False
+    # Virtual families carry their own suffixes — never treat them as bare.
+    if name.endswith(".service_account") or name.endswith("-MFG"):
+        return False
+    return True
+
+
+# Single-token OS / device labels that unambiguously imply a manufacturer when
+# Mist omits the mfg field. Kept strict on purpose — only resolve families
+# where the back-assignment is obvious. Anything ambiguous stays unresolved
+# and that MAC contributes no MFG rollup record.
+_OS_DEVICE_TO_MFG: dict[str, str] = {
+    # Apple ecosystem
+    "iOS": "Apple",
+    "iPadOS": "Apple",
+    "macOS": "Apple",
+    "tvOS": "Apple",
+    "watchOS": "Apple",
+    "iPhone": "Apple",
+    "iPad": "Apple",
+    "Mac": "Apple",
+    "MacBook": "Apple",
+    "MacBook Pro": "Apple",
+    "MacBook Air": "Apple",
+    "Apple TV": "Apple",
+    "Apple OS": "Apple",
+    # Google / Android
+    "Android": "Google",
+}
+
+
+def _strip_version_suffix(token: str) -> str:
+    """Collapse 'iOS 17', 'Android 10', 'macOS 14' to their bare labels for
+    manufacturer back-resolution lookup."""
+    if not token:
+        return ""
+    return re.sub(r"\s+\d+(?:[._]\d+)*\s*$", "", token.strip())
+
+
+def resolve_manufacturer(client: dict) -> str:
+    """Return the normalized manufacturer string to use for -MFG bucketing,
+    or '' when nothing resolves.
+
+    Priority:
+      1. Cleaned ``mfg`` field (already the normal fingerprint path).
+      2. OUI-derived manufacturer when Mist omitted the mfg (the enricher
+         path in ``_build_client_record`` injects this back as ``mfg``, but
+         callers holding a raw event row use ``device_manufacturer``).
+      3. Back-resolve from a known OS/device token (``iOS 17`` → Apple,
+         ``Android 10`` → Google). Strict whitelist — see ``_OS_DEVICE_TO_MFG``.
+
+    Kept deliberately conservative. Any OS we can't attribute with confidence
+    stays unresolved, and the MAC gets no -MFG record that cycle.
+    """
+    mfg = _clean_token(client.get("mfg") or client.get("device_manufacturer") or "")
+    if mfg:
+        return mfg
+
+    # Back-resolve from the OS string or the device token. Try the raw label
+    # first (handles "iPadOS"), then strip trailing version numbers ("iOS 17"
+    # → "iOS").
+    for raw in (client.get("last_os"), client.get("last_model"), client.get("last_device")):
+        if not raw:
+            continue
+        token = _clean_token(str(raw))
+        if not token:
+            continue
+        if token in _OS_DEVICE_TO_MFG:
+            return _OS_DEVICE_TO_MFG[token]
+        stripped = _strip_version_suffix(token)
+        if stripped in _OS_DEVICE_TO_MFG:
+            return _OS_DEVICE_TO_MFG[stripped]
+
+    return ""
+
+
 async def _check_rate_limit(resp: httpx.Response, page: int, label: str) -> None:
     """Sleep if the Mist rate limit budget is running low.
 
