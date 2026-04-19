@@ -17,6 +17,9 @@ const HEALTH_BG    = "#2a2015";
 // Service-account virtual family
 const SA_COLOR = "#d4a06a";
 const SA_BG    = "#2a1f15";
+// Manufacturer-rollup virtual family
+const MFG_COLOR = "#5ab5c8";
+const MFG_BG    = "#13272a";
 
 // Default — overridden at runtime by general-config endpoint
 const HEALTH_THRESHOLD_DEFAULT = 0.80;
@@ -111,6 +114,8 @@ function SiteAlertCard({ finding, healthData, onMacSelect, onFamilyClick }) {
           >
             {finding.family_kind === "service_account" && finding.service_account_label
               ? finding.service_account_label
+              : finding.family_kind === "mfg_rollup" && finding.mfg_rollup_label
+              ? finding.mfg_rollup_label
               : finding.device_family}
           </button>
           {finding.family_kind === "service_account" && (
@@ -123,6 +128,18 @@ function SiteAlertCard({ finding, healthData, onMacSelect, onFamilyClick }) {
               }
             >
               SVC ACCT{finding.service_account_member_families?.length ? ` · ${finding.service_account_member_families.length} families` : ""}
+            </span>
+          )}
+          {finding.family_kind === "mfg_rollup" && (
+            <span
+              style={{ background: MFG_BG, color: MFG_COLOR, border: `1px solid ${MFG_COLOR}55`, borderRadius: "3px", padding: "2px 7px", fontSize: "10px", fontWeight: "bold", letterSpacing: "0.05em" }}
+              title={
+                finding.mfg_rollup_member_families?.length
+                  ? `Manufacturer rollup — aggregates ${finding.mfg_rollup_member_families.length} per-fingerprint families: ${finding.mfg_rollup_member_families.join(", ")}`
+                  : "Manufacturer rollup (aggregates every MAC of this manufacturer regardless of fingerprint depth)"
+              }
+            >
+              MFG ROLLUP{finding.mfg_rollup_member_families?.length ? ` · ${finding.mfg_rollup_member_families.length} families` : ""}
             </span>
           )}
           <span style={{ color: "#666", fontSize: "12px" }}>
@@ -267,6 +284,8 @@ function AnomalyFindingCard({ finding, healthData, onFamilyClick, healthThreshol
           >
             {finding.family_kind === "service_account" && finding.service_account_label
               ? finding.service_account_label
+              : finding.family_kind === "mfg_rollup" && finding.mfg_rollup_label
+              ? finding.mfg_rollup_label
               : finding.device_family}
           </button>
           {finding.family_kind === "service_account" && (
@@ -279,6 +298,18 @@ function AnomalyFindingCard({ finding, healthData, onFamilyClick, healthThreshol
               }
             >
               SVC ACCT{finding.service_account_member_families?.length ? ` · ${finding.service_account_member_families.length} families` : ""}
+            </span>
+          )}
+          {finding.family_kind === "mfg_rollup" && (
+            <span
+              style={{ background: MFG_BG, color: MFG_COLOR, border: `1px solid ${MFG_COLOR}55`, borderRadius: "3px", padding: "2px 7px", fontSize: "10px", fontWeight: "bold", letterSpacing: "0.05em" }}
+              title={
+                finding.mfg_rollup_member_families?.length
+                  ? `Manufacturer rollup — aggregates ${finding.mfg_rollup_member_families.length} per-fingerprint families: ${finding.mfg_rollup_member_families.join(", ")}`
+                  : "Manufacturer rollup (aggregates every MAC of this manufacturer regardless of fingerprint depth)"
+              }
+            >
+              MFG ROLLUP{finding.mfg_rollup_member_families?.length ? ` · ${finding.mfg_rollup_member_families.length} families` : ""}
             </span>
           )}
           <span style={{ color: "#666", fontSize: "12px" }}>

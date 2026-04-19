@@ -1,5 +1,15 @@
 // Deterministic color assignment per device family.
 // Fixed colors for well-known families; hash-derived hues for dynamic ones.
+
+// Virtual-family color conventions. Shared across every view that renders
+// family rows so heatmap, findings feed, alerts, and drilldowns agree.
+// Service-account families ("*.service_account") — tan.
+// MFG-rollup families  ("*-MFG")                  — cyan-teal.
+export const SA_COLOR  = "#d4a06a";
+export const SA_BG     = "#2a1f15";
+export const MFG_COLOR = "#5ab5c8";
+export const MFG_BG    = "#13272a";
+
 const FIXED = {
   "iPhone":         "#7ec8e3",
   "iPad":           "#5b9fd4",

@@ -5,6 +5,8 @@ import ColumnSelector, { loadVisibleFromStorage } from "./ColumnSelector";
 const SEVERITY_COLOR = { significant: "#e05555", moderate: "#e0a835", minimal: "#4ea8c4" };
 const SA_COLOR = "#d4a06a";
 const SA_BG    = "#2a1f15";
+const MFG_COLOR = "#5ab5c8";
+const MFG_BG    = "#13272a";
 
 const CATEGORY_LABELS = {
   DHCP_SUCCESS:   "DHCP ✓",
@@ -324,7 +326,7 @@ export default function OrgFamilyDrilldown({ family, apiBase, onMacSiteSelect, o
       downloadDrilldownCsv(allRows, csvName, {
         includeWlan: !!allWlans || !!searchQuery || !!macSearchQuery,
         includeDeviceFamily: !!searchQuery || !!macSearchQuery,
-        includePrimaryFamily: data?.family_kind === "service_account",
+        includePrimaryFamily: data?.family_kind === "service_account" || data?.family_kind === "mfg_rollup",
       });
     } finally {
       setExporting(false);
@@ -384,6 +386,8 @@ export default function OrgFamilyDrilldown({ family, apiBase, onMacSiteSelect, o
               ? <>{`"${searchQuery}"`}</>
               : data?.family_kind === "service_account" && data?.service_account_label
                 ? data.service_account_label
+                : data?.family_kind === "mfg_rollup" && data?.mfg_rollup_label
+                ? data.mfg_rollup_label
                 : family}
         </h2>
         {(searchQuery || macSearchQuery) && data?.matched_families && (
@@ -397,6 +401,14 @@ export default function OrgFamilyDrilldown({ family, apiBase, onMacSiteSelect, o
             title="Service account: same username shared across multiple devices"
           >
             SVC ACCT
+          </span>
+        )}
+        {data?.family_kind === "mfg_rollup" && (
+          <span
+            style={{ background: MFG_BG, color: MFG_COLOR, border: `1px solid ${MFG_COLOR}55`, borderRadius: "3px", padding: "2px 7px", fontSize: "10px", fontWeight: "bold", letterSpacing: "0.05em" }}
+            title="Manufacturer rollup: aggregates every MAC of this manufacturer regardless of fingerprint depth"
+          >
+            MFG ROLLUP
           </span>
         )}
         <span style={{ color: "#555", fontSize: "12px" }}>{allWlans || searchQuery || macSearchQuery ? "org-wide · all WLANs" : "org-wide"}</span>
@@ -532,6 +544,29 @@ export default function OrgFamilyDrilldown({ family, apiBase, onMacSiteSelect, o
         </div>
       )}
 
+      {data?.family_kind === "mfg_rollup" && data?.mfg_rollup_member_families?.length > 0 && (
+        <div
+          style={{
+            background: MFG_BG,
+            border: `1px solid ${MFG_COLOR}44`,
+            borderLeft: `3px solid ${MFG_COLOR}`,
+            borderRadius: "4px",
+            padding: "10px 12px",
+            marginBottom: "14px",
+            fontSize: "12px",
+            color: "#bbb",
+          }}
+        >
+          <div style={{ color: MFG_COLOR, fontSize: "11px", fontWeight: "bold", letterSpacing: "0.06em", textTransform: "uppercase", marginBottom: "4px" }}>
+            Manufacturer rollup · {data.mfg_rollup_member_families.length} per-fingerprint {data.mfg_rollup_member_families.length === 1 ? "family" : "families"}
+          </div>
+          <div style={{ color: "#999" }}>
+            <span style={{ color: MFG_COLOR, fontFamily: "monospace" }}>{data.mfg_rollup_label}</span>{" "}
+            aggregates: {data.mfg_rollup_member_families.join(", ")}
+          </div>
+        </div>
+      )}
+
       {loading && <div style={{ color: "#888", fontSize: "13px" }}>Loading…</div>}
       {error && <div style={{ color: "#e05555", fontSize: "13px" }}>Error: {error}</div>}
 
@@ -608,7 +643,7 @@ export default function OrgFamilyDrilldown({ family, apiBase, onMacSiteSelect, o
                     {visibleCols.wlan && allWlans && <SortTh col="wlan">WLAN</SortTh>}
                     {visibleCols.device_family && (searchQuery || macSearchQuery) && <SortTh col="device_family">Device Family</SortTh>}
                     {visibleCols.mac && <SortTh col="mac">MAC</SortTh>}
-                    {visibleCols.primary_family && data.family_kind === "service_account" && (
+                    {visibleCols.primary_family && (data.family_kind === "service_account" || data.family_kind === "mfg_rollup") && (
                       <th style={thStyle}>Primary Family</th>
                     )}
                     {visibleCols.health && <SortTh col="health" style={{ minWidth: "90px" }}>Health</SortTh>}
@@ -668,7 +703,7 @@ export default function OrgFamilyDrilldown({ family, apiBase, onMacSiteSelect, o
                             )}
                           </td>
                         )}
-                        {visibleCols.primary_family && data.family_kind === "service_account" && (
+                        {visibleCols.primary_family && (data.family_kind === "service_account" || data.family_kind === "mfg_rollup") && (
                           <td style={{ ...tdStyle, color: "#888", fontSize: "11px", whiteSpace: "nowrap" }}>
                             {row.primary_device_family || "—"}
                           </td>

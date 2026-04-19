@@ -43,6 +43,8 @@ const SEVERITY_COLOR = { significant: "#e05555", moderate: "#e0a835", minimal: "
 const SEVERITY_RANK  = { significant: 3, moderate: 2, minimal: 1 };
 const SA_COLOR = "#d4a06a";
 const SA_BG    = "#2a1f15";
+const MFG_COLOR = "#5ab5c8";
+const MFG_BG    = "#13272a";
 
 function healthScoreColor(score) {
   if (score == null) return "#444";
@@ -453,9 +455,18 @@ export default function OrgFamilyInsights({ apiBase, refreshToken, onMacSiteSele
                 : isFamOut ? "Flagged as family outlier at one or more sites" : "";
 
               const isSaFamily = fdata.family_kind === "service_account";
-              const displayName = isSaFamily ? fdata.service_account_label : family;
+              const isMfgFamily = fdata.family_kind === "mfg_rollup";
+              const isVirtualFamily = isSaFamily || isMfgFamily;
+              const virtualColor = isSaFamily ? SA_COLOR : isMfgFamily ? MFG_COLOR : null;
+              const virtualBg = isSaFamily ? SA_BG : isMfgFamily ? MFG_BG : undefined;
+              const displayName = isSaFamily
+                ? fdata.service_account_label
+                : isMfgFamily
+                ? fdata.mfg_rollup_label
+                : family;
               const saMembers = fdata.service_account_member_families || [];
-              const rowBg = isSaFamily ? SA_BG : undefined;
+              const mfgMembers = fdata.mfg_rollup_member_families || [];
+              const rowBg = virtualBg;
               return (
                 <tr key={family} style={rowBg ? { background: rowBg } : undefined}>
                   {/* Family name — clickable to drill down */}
@@ -466,16 +477,24 @@ export default function OrgFamilyInsights({ apiBase, refreshToken, onMacSiteSele
                     >
                       <span style={{
                         display: "inline-block", width: 8, height: 8,
-                        borderRadius: "50%", background: isSaFamily ? SA_COLOR : color,
+                        borderRadius: "50%", background: isVirtualFamily ? virtualColor : color,
                         marginRight: "6px", verticalAlign: "middle",
                       }} />
-                      <span style={{ color: isSaFamily ? SA_COLOR : ((fdata.worst_dbscan_severity || isFamOut || fdata.is_family_markov_outlier_any_site) ? "#e0e0e0" : "#ccc"), textDecoration: "underline", textDecorationColor: isSaFamily ? `${SA_COLOR}55` : "#444" }}>{displayName}</span>
+                      <span style={{ color: isVirtualFamily ? virtualColor : ((fdata.worst_dbscan_severity || isFamOut || fdata.is_family_markov_outlier_any_site) ? "#e0e0e0" : "#ccc"), textDecoration: "underline", textDecorationColor: isVirtualFamily ? `${virtualColor}55` : "#444" }}>{displayName}</span>
                       {isSaFamily && (
                         <span
                           style={{ background: "transparent", color: SA_COLOR, border: `1px solid ${SA_COLOR}55`, borderRadius: "3px", padding: "0 4px", fontSize: "9px", fontWeight: "bold", letterSpacing: "0.05em", marginLeft: "6px", verticalAlign: "middle" }}
                           title={saMembers.length ? `Spans ${saMembers.length} device families: ${saMembers.join(", ")}` : "Service account"}
                         >
                           SVC ACCT
+                        </span>
+                      )}
+                      {isMfgFamily && (
+                        <span
+                          style={{ background: "transparent", color: MFG_COLOR, border: `1px solid ${MFG_COLOR}55`, borderRadius: "3px", padding: "0 4px", fontSize: "9px", fontWeight: "bold", letterSpacing: "0.05em", marginLeft: "6px", verticalAlign: "middle" }}
+                          title={mfgMembers.length ? `Manufacturer rollup — spans ${mfgMembers.length} per-fingerprint families: ${mfgMembers.join(", ")}` : "Manufacturer rollup"}
+                        >
+                          MFG ROLLUP
                         </span>
                       )}
                     </td>
@@ -758,7 +777,7 @@ export default function OrgFamilyInsights({ apiBase, refreshToken, onMacSiteSele
 
       <div style={{ marginTop: "8px", fontSize: "11px", color: "#444" }}>
         Cell ratios are % of that family's org-wide event pool.
-        {" "}<span style={{ color: "#b06ad4" }}>Cosine: family</span> = device class flagged as a centroid outlier org-wide (cosine distance from the healthy-family median centroid, cross-site population).
+        {" "}<span style={{ color: "#b06ad4" }}>Cosine: family</span> = device class flagged as a centroid outlier org-wide (cosine distance from the healthy-family median centroid, cross-site population). Runs on <span style={{ color: MFG_COLOR }}>MFG ROLLUP</span> and <span style={{ color: SA_COLOR }}>SVC ACCT</span> rows only; per-fingerprint rows show <code>—</code> by design since every MAC is already folded into its manufacturer rollup.
         {" "}<span style={{ fontWeight: "bold", color: "#666" }}>DB:</span> <span style={{ color: "#e0a835" }}>moderate</span> / <span style={{ color: "#e05555" }}>significant</span> = org-wide DBSCAN severity (badge = sites with outlier MACs).
         {" "}<span style={{ color: "#4ab0e8" }}>Markov</span> = anomaly (anomalous connection-chain transitions) or repeated (failed loops). Hover for ratio.
         {" "}Health = volume-weighted failure rate org-wide (hover for per-category breakdown).

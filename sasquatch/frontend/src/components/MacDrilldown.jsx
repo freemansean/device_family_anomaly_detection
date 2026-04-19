@@ -3,6 +3,8 @@ import { apiFetch } from "../api";
 
 const SA_COLOR = "#d4a06a";
 const SA_BG = "#2a1f15";
+const MFG_COLOR = "#5ab5c8";
+const MFG_BG = "#13272a";
 
 const EVENT_COLOR = {
   DHCP_SUCCESS: "#2d7a4f",
@@ -359,6 +361,55 @@ export default function MacDrilldown({ siteId, mac, apiBase, onBack, wlan }) {
               <div key={label} style={{ display: "flex", justifyContent: "space-between", borderBottom: "1px solid #1e1e1e", padding: "3px 0" }}>
                 <span style={{ color: "#666" }}>{label}</span>
                 <span style={{ color: String(value) === "Yes" ? "#e05555" : "#ccc", fontFamily: label === "Username" ? "monospace" : undefined }}>
+                  {String(value)}
+                </span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Manufacturer-rollup family membership — shown when this MAC is part of a <mfg>-MFG virtual family */}
+      {scores.mfg_rollup && scores.mfg_rollup.family && (
+        <div style={{
+          background: MFG_BG,
+          border: `1px solid ${MFG_COLOR}44`,
+          borderLeft: `3px solid ${MFG_COLOR}`,
+          borderRadius: "4px",
+          padding: "12px 14px",
+          marginBottom: "20px",
+        }}>
+          <div style={{ display: "flex", alignItems: "center", gap: "10px", marginBottom: "8px" }}>
+            <span style={{
+              fontSize: "10px",
+              color: MFG_COLOR,
+              textTransform: "uppercase",
+              letterSpacing: "0.08em",
+              fontWeight: 600,
+              background: `${MFG_COLOR}22`,
+              border: `1px solid ${MFG_COLOR}44`,
+              padding: "2px 7px",
+              borderRadius: "3px",
+            }}>MFG ROLLUP</span>
+            <span style={{ fontSize: "13px", color: "#ccc" }}>
+              Also part of manufacturer rollup{" "}
+              <span style={{ color: MFG_COLOR, fontFamily: "monospace", fontWeight: 600 }}>
+                {scores.mfg_rollup.family.replace(/-MFG$/, "")}
+              </span>
+            </span>
+          </div>
+          <div style={{ fontSize: "11px", color: "#777", marginBottom: "10px" }}>
+            This device is folded into its manufacturer's rollup family — the cohort Centroid analysis measures against the healthy-family reference. Per-fingerprint families like <code style={{ color: MFG_COLOR }}>{meta.family || "—"}</code> drop out of Centroid entirely; the rollup carries the family-level signal instead.
+          </div>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "6px 16px", fontSize: "12px" }}>
+            {[
+              ["Manufacturer", scores.mfg_rollup.resolved_manufacturer || "—"],
+              ["Rollup family is anomalous", scores.mfg_rollup.is_family_outlier ? "Yes" : "No"],
+              ["Rollup centroid distance", scores.mfg_rollup.centroid_dist_score != null ? scores.mfg_rollup.centroid_dist_score.toFixed(4) : "—"],
+            ].map(([label, value]) => (
+              <div key={label} style={{ display: "flex", justifyContent: "space-between", borderBottom: "1px solid #1e1e1e", padding: "3px 0" }}>
+                <span style={{ color: "#666" }}>{label}</span>
+                <span style={{ color: String(value) === "Yes" ? "#e05555" : "#ccc", fontFamily: label === "Manufacturer" ? "monospace" : undefined }}>
                   {String(value)}
                 </span>
               </div>

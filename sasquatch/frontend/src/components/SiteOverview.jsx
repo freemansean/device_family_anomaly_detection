@@ -13,6 +13,8 @@ const SEVERITY_COLOR = { significant: "#e05555", moderate: "#e0a835", minimal: "
 const SEVERITY_RANK  = { significant: 3, moderate: 2, minimal: 1 };
 const SA_COLOR = "#d4a06a";
 const SA_BG    = "#2a1f15";
+const MFG_COLOR = "#5ab5c8";
+const MFG_BG    = "#13272a";
 
 function SortIndicator({ active, dir }) {
   if (!active) return <span style={{ color: "#333", marginLeft: "3px", fontSize: "9px" }}>⇅</span>;
@@ -432,27 +434,38 @@ export default function SiteOverview({ siteId, apiBase, onMacSelect, onFamilySel
                 : "Health score not yet computed";
               const familyMeta = summary.family_metadata?.[family] || {};
               const isSaFamily = familyMeta.family_kind === "service_account";
-              const displayName = isSaFamily ? familyMeta.service_account_label : family;
+              const isMfgFamily = familyMeta.family_kind === "mfg_rollup";
+              const isVirtualFamily = isSaFamily || isMfgFamily;
+              const virtualColor = isSaFamily ? SA_COLOR : isMfgFamily ? MFG_COLOR : null;
+              const virtualBg = isSaFamily ? SA_BG : isMfgFamily ? MFG_BG : undefined;
+              const displayName = isSaFamily
+                ? familyMeta.service_account_label
+                : isMfgFamily
+                ? familyMeta.mfg_rollup_label
+                : family;
               const saMembers = familyMeta.service_account_member_families || [];
-              const rowBg = isSaFamily ? SA_BG : undefined;
+              const mfgMembers = familyMeta.mfg_rollup_member_families || [];
+              const rowBg = virtualBg;
               return (
                 <tr key={family} style={rowBg ? { background: rowBg } : undefined}>
                   <td style={{ ...tdStyle, whiteSpace: "nowrap" }}>
                     <span style={{
                       display: "inline-block", width: 8, height: 8,
-                      borderRadius: "50%", background: isSaFamily ? SA_COLOR : color,
+                      borderRadius: "50%", background: isVirtualFamily ? virtualColor : color,
                       marginRight: "6px", verticalAlign: "middle", flexShrink: 0,
                     }} />
                     <span
                       onClick={() => onFamilySelect(family)}
                       style={{
-                        color: isSaFamily ? SA_COLOR : (hasIfOutliers ? "#7ec8e3" : "#ccc"),
+                        color: isVirtualFamily ? virtualColor : (hasIfOutliers ? "#7ec8e3" : "#ccc"),
                         cursor: "pointer",
-                        textDecoration: hasIfOutliers || isSaFamily ? "underline" : "none",
+                        textDecoration: hasIfOutliers || isVirtualFamily ? "underline" : "none",
                         textUnderlineOffset: "2px",
                       }}
                       title={isSaFamily
                         ? `Service account spanning: ${saMembers.join(", ") || "(unknown)"}`
+                        : isMfgFamily
+                        ? `Manufacturer rollup — spans ${mfgMembers.length} per-fingerprint families: ${mfgMembers.join(", ") || "(none)"}`
                         : (hasIfOutliers ? `View ${finding.if_outlier_count} Isolation Forest deviation(s) in ${family}` : family)}
                     >
                       {displayName}
@@ -463,6 +476,14 @@ export default function SiteOverview({ siteId, apiBase, onMacSelect, onFamilySel
                         title={saMembers.length ? `Spans ${saMembers.length} device families: ${saMembers.join(", ")}` : "Service account"}
                       >
                         SVC ACCT
+                      </span>
+                    )}
+                    {isMfgFamily && (
+                      <span
+                        style={{ background: "transparent", color: MFG_COLOR, border: `1px solid ${MFG_COLOR}55`, borderRadius: "3px", padding: "0 4px", fontSize: "9px", fontWeight: "bold", letterSpacing: "0.05em", marginLeft: "6px", verticalAlign: "middle" }}
+                        title={mfgMembers.length ? `Manufacturer rollup — spans ${mfgMembers.length} per-fingerprint families: ${mfgMembers.join(", ")}` : "Manufacturer rollup"}
+                      >
+                        MFG ROLLUP
                       </span>
                     )}
                   </td>
@@ -686,7 +707,7 @@ export default function SiteOverview({ siteId, apiBase, onMacSelect, onFamilySel
       </div>
 
       <div style={{ marginTop: "8px", fontSize: "11px", color: "#444" }}>
-        <span style={{ color: "#b06ad4" }}>Cosine: family</span> = whole device class behaves differently from other families at this site (cosine distance from the healthy-family median centroid).
+        <span style={{ color: "#b06ad4" }}>Cosine: family</span> = whole device class behaves differently from other families at this site (cosine distance from the healthy-family median centroid). Runs on <span style={{ color: MFG_COLOR }}>MFG ROLLUP</span> and <span style={{ color: SA_COLOR }}>SVC ACCT</span> rows only; per-fingerprint rows show <code>—</code> by design since every MAC is already folded into its manufacturer rollup.
         {" "}<span style={{ fontWeight: "bold", color: "#666" }}>DB:</span> <span style={{ color: "#e0a835" }}>moderate</span> / <span style={{ color: "#e05555" }}>significant</span> = fraction of individual MACs in that family flagged by DBSCAN.
         {" "}Health = weighted failure rate across AUTH · ROAM · DHCP · DNS · ARP (hover for breakdown).
         {" "}Click a family name to see per-device Isolation Forest deviations.
