@@ -29,7 +29,23 @@ DEFAULTS = {
     "general": {
         # How often (hours) to run org-wide cross-site detection
         "org_detection_interval_hours": {"default": 1, "env": "ORG_DETECTION_INTERVAL_HOURS", "cast": int},
-        # Minimum events per MAC to be included in ML feature matrix
+        # Minimum events for a MAC to enter the per-MAC feature pool at all
+        # (feature_engineer skip threshold). Sets the floor for what the
+        # inter-family Centroid Detector and per-family Health Score can see —
+        # both consume every record in the pool. The IF and DBSCAN detectors
+        # apply their own higher threshold below (anomaly_min_mac_events).
+        # Lowering this surfaces more low-volume cohorts in Health and
+        # Centroid; raising it reduces noise. Default 3 keeps the per-MAC
+        # vector statistically meaningful (zero/one-event MACs collapse to
+        # extreme corners of the category space).
+        "feature_min_mac_events": {"default": 3, "env": "FEATURE_MIN_MAC_EVENTS", "cast": int},
+        # Minimum events for a MAC to be evaluated by the per-family
+        # Isolation Forest and site-wide DBSCAN passes. Below this floor,
+        # per-MAC vectors are too sparse for distance-based scoring to be
+        # reliable. Does NOT affect the inter-family Cosine Distance
+        # (centroid) detector or the per-family Health Score, which use the
+        # broader pool defined by feature_min_mac_events above. Markov has
+        # its own internal threshold (markov_stuck_loop_min_events).
         "anomaly_min_mac_events": {"default": 10, "env": "ANOMALY_MIN_MAC_EVENTS", "cast": int},
         # Suppress alarms for device families whose total MAC count is below this
         # threshold. Small families can trip the detector on a single quirky device

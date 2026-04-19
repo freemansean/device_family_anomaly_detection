@@ -1845,6 +1845,14 @@ ANOMALY_IF_CONTAMINATION=0.05
 # eps         = k-distance elbow per run (no env var)
 ANOMALY_DBSCAN_MIN_SAMPLES_PCT=3
 ANOMALY_MIN_PEERS=5
+# Two-tier per-MAC event-count threshold:
+#   FEATURE_MIN_MAC_EVENTS — floor for entering the feature pool at all
+#     (consumed by Health and inter-family Centroid). Default 3.
+#   ANOMALY_MIN_MAC_EVENTS — consumer-side filter applied by IF and DBSCAN
+#     before per-MAC scoring. MACs in the pool but below this threshold
+#     get null IF/DBSCAN scores. Default 10.
+# Markov has its own internal threshold (markov_stuck_loop_min_events=20).
+FEATURE_MIN_MAC_EVENTS=3
 ANOMALY_MIN_MAC_EVENTS=10
 ANOMALY_CENTROID_DIST_THRESHOLD=0.35   # cosine distance (L2-normalized unit vectors) above which a family centroid is flagged as is_family_outlier
 ANOMALY_CENTROID_HEALTHY_REF_THRESHOLD=0.75  # families below this health are excluded from the centroid reference pool

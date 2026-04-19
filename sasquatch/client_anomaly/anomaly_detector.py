@@ -145,8 +145,24 @@ def _run_isolation_forest(
     auth failure) score as different rather than collapsing into the
     same ROAM_FAILURE bucket the category vector would merge them into.
     Returns per-MAC dict with if_score and is_if_outlier.
+
+    Per-MAC event-count filter: only MACs with event_count >=
+    anomaly_min_mac_events (default 10) are scored. The feature pool itself
+    runs at the lower feature_min_mac_events threshold (default 3) so that
+    Health and Centroid see broader coverage; IF needs the higher floor for
+    the per-MAC vector to be statistically meaningful. MACs filtered out get
+    null scores — same shape as the existing MIN_PEERS skip path.
     """
-    X = _extract_vector_array(feature_records, "event_vector")
+    min_events = _cfg("anomaly_min_mac_events")
+    eligible_indices = [
+        i for i, r in enumerate(feature_records)
+        if r.get("event_count", 0) >= min_events
+    ]
+    eligible_set = set(eligible_indices)
+    eligible_macs = [macs[i] for i in eligible_indices]
+    eligible_records = [feature_records[i] for i in eligible_indices]
+
+    X = _extract_vector_array(eligible_records, "event_vector")
     if X.shape[0] < _cfg("anomaly_min_peers"):
         return {
             mac: {"if_score": None, "is_if_outlier": False}
@@ -164,12 +180,17 @@ def _run_isolation_forest(
     labels = clf.fit_predict(X_scaled)
     raw_scores = clf.decision_function(X_scaled)
 
-    results = {}
-    for i, mac in enumerate(macs):
+    # Emit scores for the eligible MACs and null entries for the filtered-out
+    # MACs so the caller's downstream merge sees a record for every input.
+    results: dict[str, dict] = {}
+    for i, mac in enumerate(eligible_macs):
         results[mac] = {
             "if_score": float(raw_scores[i]),
             "is_if_outlier": bool(labels[i] == -1),
         }
+    for mac in macs:
+        if mac not in results:
+            results[mac] = {"if_score": None, "is_if_outlier": False}
     return results
 
 
@@ -240,16 +261,41 @@ def _run_dbscan(macs: list[str], feature_records: list[dict]) -> dict[str, dict]
     large sites get looser ones.
 
     Returns per-MAC dict with dbscan_label and is_dbscan_outlier.
+
+    Per-MAC event-count filter: only MACs with event_count >=
+    anomaly_min_mac_events (default 10) participate. The feature pool runs
+    at the lower feature_min_mac_events threshold (default 3) to give
+    Health and Centroid broader coverage; DBSCAN needs the higher floor
+    for category-vector density to be cluster-meaningful. Filtered-out
+    MACs get dbscan_label=None, is_dbscan_outlier=False so the consumer
+    side doesn't conflate "not eligible" with "noise outlier".
     """
-    n_clients = len(macs)
-    if n_clients == 0:
+    if not macs:
         return {}
+
+    min_events = _cfg("anomaly_min_mac_events")
+    eligible_indices = [
+        i for i, r in enumerate(feature_records)
+        if r.get("event_count", 0) >= min_events
+    ]
+    eligible_macs = [macs[i] for i in eligible_indices]
+    eligible_records = [feature_records[i] for i in eligible_indices]
+
+    n_clients = len(eligible_macs)
+    if n_clients == 0:
+        return {mac: {"dbscan_label": None, "is_dbscan_outlier": False} for mac in macs}
 
     min_samples = _auto_min_samples(n_clients)
     if n_clients < min_samples:
-        return {mac: {"dbscan_label": -1, "is_dbscan_outlier": True} for mac in macs}
+        results: dict[str, dict] = {
+            mac: {"dbscan_label": -1, "is_dbscan_outlier": True} for mac in eligible_macs
+        }
+        for mac in macs:
+            if mac not in results:
+                results[mac] = {"dbscan_label": None, "is_dbscan_outlier": False}
+        return results
 
-    X = _extract_vector_array(feature_records, "category_vector")
+    X = _extract_vector_array(eligible_records, "category_vector")
 
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X)
@@ -279,13 +325,16 @@ def _run_dbscan(macs: list[str], feature_records: list[dict]) -> dict[str, dict]
     db = DBSCAN(eps=eps, min_samples=min_samples, algorithm="ball_tree")
     labels = db.fit_predict(X_reduced)
 
-    return {
-        mac: {
+    results: dict[str, dict] = {}
+    for i, mac in enumerate(eligible_macs):
+        results[mac] = {
             "dbscan_label": int(labels[i]),
             "is_dbscan_outlier": bool(labels[i] == -1),
         }
-        for i, mac in enumerate(macs)
-    }
+    for mac in macs:
+        if mac not in results:
+            results[mac] = {"dbscan_label": None, "is_dbscan_outlier": False}
+    return results
 
 
 def _top_contributing_features(

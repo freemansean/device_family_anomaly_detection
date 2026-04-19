@@ -873,10 +873,11 @@ export default function App() {
   function handleOpenGeneralConfig() {
     setGeneralConfigDraft(generalConfig ? { ...generalConfig } : {
       org_detection_interval_hours: 1,
+      feature_min_mac_events: 3,
       anomaly_min_mac_events: 10,
       alarm_min_family_size: 10,
-      anomaly_health_score_threshold: 0.30,
-      alarm_service_device_pct: 0.50,
+      anomaly_health_score_threshold: 0.20,
+      alarm_service_device_pct: 0.70,
       alarm_health_combine: "or",
       alarm_dbscan_markov_ratio: 0.70,
     });
@@ -1573,24 +1574,33 @@ export default function App() {
 
               <div style={{ marginBottom: "18px" }}>
                 <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: "5px" }}>
-                  <div style={{ color: "#888", fontSize: "11px" }}>MIN MAC EVENTS FOR ML SCORING</div>
-                  <div style={{ color: "#7ec8e3", fontSize: "13px", fontWeight: "bold" }}>{generalConfigDraft.anomaly_min_mac_events} events</div>
+                  <div style={{ color: "#888", fontSize: "11px" }}>MIN EVENTS TO BUILD MAC FEATURES</div>
+                  <div style={{ color: "#7ec8e3", fontSize: "13px", fontWeight: "bold" }}>{generalConfigDraft.feature_min_mac_events ?? 3} events</div>
                 </div>
-                <input type="range" min={1} max={50} value={generalConfigDraft.anomaly_min_mac_events} onChange={(e) => setGeneralConfigDraft(d => ({ ...d, anomaly_min_mac_events: Number(e.target.value) }))} style={{ width: "100%", accentColor: "#7ec8e3", cursor: "pointer" }} />
-                <div style={{ color: "#555", fontSize: "11px", marginTop: "4px" }}>Minimum events a MAC must have in the rolling 24hr window to be included in anomaly scoring. Lower for IoT/device WLANs; raise for high-traffic WLANs.</div>
+                <input type="range" min={1} max={50} value={generalConfigDraft.feature_min_mac_events ?? 3} onChange={(e) => setGeneralConfigDraft(d => ({ ...d, feature_min_mac_events: Number(e.target.value) }))} style={{ width: "100%", accentColor: "#7ec8e3", cursor: "pointer" }} />
+                <div style={{ color: "#555", fontSize: "11px", marginTop: "4px" }}>Minimum events for a MAC to enter the feature pool at all. Sets the floor for what the inter-family Cosine Distance (centroid) detector and per-family Health Score can see — both consume the full pool. Lower this to surface more low-volume cohorts; raise it to reduce noise. The IF/DBSCAN detectors apply their own higher threshold below.</div>
               </div>
 
               <div style={{ marginBottom: "18px" }}>
                 <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: "5px" }}>
-                  <div style={{ color: "#888", fontSize: "11px" }}>MIN FAMILY SIZE FOR ALERT GENERATION</div>
-                  <div style={{ color: "#7ec8e3", fontSize: "13px", fontWeight: "bold" }}>{generalConfigDraft.alarm_min_family_size ?? 10} MAC{(generalConfigDraft.alarm_min_family_size ?? 10) === 1 ? "" : "s"}</div>
+                  <div style={{ color: "#888", fontSize: "11px" }}>MIN MAC EVENTS FOR IF/DBSCAN SCORING</div>
+                  <div style={{ color: "#7ec8e3", fontSize: "13px", fontWeight: "bold" }}>{generalConfigDraft.anomaly_min_mac_events} events</div>
                 </div>
-                <input type="range" min={1} max={50} value={generalConfigDraft.alarm_min_family_size ?? 10} onChange={(e) => setGeneralConfigDraft(d => ({ ...d, alarm_min_family_size: Number(e.target.value) }))} style={{ width: "100%", accentColor: "#7ec8e3", cursor: "pointer" }} />
-                <div style={{ color: "#555", fontSize: "11px", marginTop: "4px" }}>Suppress alerts for device families whose total MAC count is below this threshold. Findings still appear in the UI, but the OrgAlerts feed and webhook dispatch skip them. Set to 1 to disable (every family eligible).</div>
+                <input type="range" min={1} max={50} value={generalConfigDraft.anomaly_min_mac_events} onChange={(e) => setGeneralConfigDraft(d => ({ ...d, anomaly_min_mac_events: Number(e.target.value) }))} style={{ width: "100%", accentColor: "#7ec8e3", cursor: "pointer" }} />
+                <div style={{ color: "#555", fontSize: "11px", marginTop: "4px" }}>Minimum events a MAC must have to be evaluated by the per-family Isolation Forest and site-wide DBSCAN passes. Below this floor, per-MAC vectors are too sparse for distance-based scoring to be reliable. Does not affect the inter-family Cosine Distance (centroid) detector or the per-family Health Score, which use the broader pool defined above. Markov has its own internal threshold.</div>
               </div>
 
               <div style={{ marginBottom: "24px", paddingBottom: "20px", borderBottom: "1px solid #222" }}>
-                <div style={{ color: "#7ec8e3", fontSize: "11px", fontWeight: "bold", letterSpacing: "0.5px", marginBottom: "12px", textTransform: "uppercase" }}>Health Thresholds for Alert Generation</div>
+                <div style={{ color: "#7ec8e3", fontSize: "11px", fontWeight: "bold", letterSpacing: "0.5px", marginBottom: "12px", textTransform: "uppercase" }}>Thresholds for Alert Generation</div>
+
+                <div style={{ marginBottom: "18px" }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: "5px" }}>
+                    <div style={{ color: "#888", fontSize: "11px" }}>MIN FAMILY SIZE FOR ALERT GENERATION</div>
+                    <div style={{ color: "#7ec8e3", fontSize: "13px", fontWeight: "bold" }}>{generalConfigDraft.alarm_min_family_size ?? 10} MAC{(generalConfigDraft.alarm_min_family_size ?? 10) === 1 ? "" : "s"}</div>
+                  </div>
+                  <input type="range" min={1} max={50} value={generalConfigDraft.alarm_min_family_size ?? 10} onChange={(e) => setGeneralConfigDraft(d => ({ ...d, alarm_min_family_size: Number(e.target.value) }))} style={{ width: "100%", accentColor: "#7ec8e3", cursor: "pointer" }} />
+                  <div style={{ color: "#555", fontSize: "11px", marginTop: "4px" }}>Suppress alerts for device families whose total MAC count is below this threshold. Findings still appear in the UI, but the OrgAlerts feed and webhook dispatch skip them. Set to 1 to disable (every family eligible).</div>
+                </div>
 
                 <div style={{ marginBottom: "18px" }}>
                   <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: "5px" }}>

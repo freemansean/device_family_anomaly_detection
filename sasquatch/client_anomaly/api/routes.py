@@ -631,6 +631,10 @@ async def set_general_config(body: dict):
 
     int_bounds = {
         "org_detection_interval_hours": (1, 168),
+        # Floor for entering the per-MAC feature pool. Health and Centroid
+        # consume the full pool; IF/DBSCAN apply the higher
+        # anomaly_min_mac_events filter at consumption time.
+        "feature_min_mac_events": (1, 100),
         "anomaly_min_mac_events": (1, 10000),
         "alarm_min_family_size": (1, 1000),
         # Negative dBm. -120 is effectively "off" (below noise floor).

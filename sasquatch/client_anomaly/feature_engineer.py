@@ -447,7 +447,13 @@ async def build_features(site_id: str, wlan: str) -> int:
         features: dict[str, dict] = {}
         skipped = 0
         sa_emitted = 0
-        min_mac_events = config.get("general", "anomaly_min_mac_events")
+        # Use the lower feature-pool threshold here (default 3). The Health
+        # scorer and inter-family Centroid detector both consume the full
+        # pool; IF and DBSCAN apply their higher anomaly_min_mac_events
+        # filter at consumption time inside _run_isolation_forest /
+        # _run_dbscan. The event_count field on each emitted record carries
+        # the raw count so consumers can filter without re-counting.
+        min_mac_events = config.get("general", "feature_min_mac_events")
         for mac, evts in mac_events.items():
             if len(evts) < min_mac_events:
                 skipped += 1
