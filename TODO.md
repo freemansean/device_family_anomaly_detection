@@ -11,10 +11,10 @@
 
 Two structural noise sources identified during pre-submission review. Both create alerts that compete with real device-family anomalies for operator attention. Not shipping before presentations; capture for the next iteration.
 
-1. **Manufacturer-only families inflate false positives.** Device family classification in `client_cache._build_client_record` / `classify_family` composes `manufacturer | model | os_major`. Clients that fail authentication early never get DHCP/DNS/ARP traffic, so Mist never fingerprints them beyond the OUI-derived manufacturer. They collapse to single-token families (`"Apple"`, `"Samsung"`) that become catch-alls for exactly the failing devices the detector is meant to find — so the centroid legitimately looks bad, but the "family" is a coverage artifact, not a real device group.
-   - **Option A — hidden catch-all:** extend `anomaly_detector.HIDDEN_FAMILIES` (and its duplicate in `health_scorer._HIDDEN_FAMILIES`) to suppress any 1-token family at site / org finding rollup and health scoring. Simple. Risk: hides a legitimate "all Awair devices are broken" signal where the vendor genuinely has no model/OS data.
-   - **Option B — alarm-gate suppression (leaning):** let findings surface in the UI for browsing, but skip manufacturer-only families at the webhook + OrgAlerts feed. Mirrors the existing `ALARM_MIN_FAMILY_SIZE` pattern. Implement next to `webhook_dispatcher.family_passes_dbscan_markov_gate` so `get_org_alerts` / `get_org_summary` / `get_org_alerts_full` all apply the same rule.
-   - **Option C — composite-depth weighting:** penalize 1-field families in the healthy-reference pool and distance calc inside `_run_family_centroid_distance`. More nuanced; adds a knob; obscures the signal. Probably not worth the complexity.
+1. ~~**Manufacturer-only families inflate false positives.**~~ **Resolved 2026-04-19** by the `-MFG` manufacturer rollup virtual families (see shipped section below). Bare 1-token families are now suppressed from the finding rollup (they still appear in per-MAC drilldowns), and Centroid runs on `<mfg>-MFG` aggregates that use fingerprinted siblings as statistical ballast — resolving the Intel-noise story. Options A/B/C below are now obsolete and should NOT be implemented.
+   - ~~**Option A — hidden catch-all:** extend `anomaly_detector.HIDDEN_FAMILIES`~~ (superseded)
+   - ~~**Option B — alarm-gate suppression:** skip manufacturer-only families at the webhook + OrgAlerts feed~~ (superseded)
+   - ~~**Option C — composite-depth weighting:** penalize 1-field families in centroid distance~~ (superseded)
 
 2. **Markov stuck-loop detector will amplify site-wide outages.** Design goal is "don't create 500 device-family alerts on top of the one real RADIUS-down alert." The `detect_stuck_loop()` path in `markov_analyzer.py` fires whenever the dominant transition pair involves a failure/disassoc event and crosses `MARKOV_STUCK_LOOP_THRESHOLD`. During a site-wide auth outage, every family trips `AUTH_FAILURE → DEAUTH` simultaneously and every family's Markov rollup fires — one root cause, N alerts.
    - **Option A — site-level storm suppressor:** when ≥ X% of families at a site trip stuck-loop in the same cycle with the same dominant pair, suppress the per-family Markov flag and emit a single "site-wide failure mode detected" finding instead. Best long-term shape; adds a new finding type.
@@ -58,65 +58,24 @@ Phase 3 (per-site scoring) was parallelized with `asyncio.Semaphore(4)` on `scor
 
 **Schedule for after Tuesday's cut.** Quiet day, dedicated branch, validate the full collect+detect cycle end-to-end before merging.
 
-### Centroid at manufacturer granularity — `<mfg>.catch_all` virtual families (2026-04-19)
+### ✅ Shipped 2026-04-19 — Centroid at manufacturer granularity (`-MFG` virtual families)
 
-Cross-references the "Manufacturer-only families inflate false positives" item (#1) above — this is the structural fix that replaces it. Capturing full design conversation so work can resume cold.
+Structural fix for manufacturer-only false positives (item #1 of the 2026-04-18 section above) and its sharper sibling "per-fingerprint Centroid noise."
 
-**Problem, sharpened.** Centroid currently runs per-fingerprint: `Apple | MacBook Pro | macOS 14`, `Apple | iPhone | iOS 17`, and bare `Apple` are three independent Centroid candidates. Two failure modes result:
+**Shipped as `<mfg>-MFG` (not `.catch_all` as proposed)** — the `-MFG` suffix reads more naturally next to the display label (e.g. `Intel Corporate (MFG ROLLUP)` vs the awkward `Intel Corporate (catch_all)`). Internally identical to the SA dual-family plumbing: composite feature key `{mac}#mfg`, suffix-based family_kind detection, parallel emission at `feature_engineer.build_features` time.
 
-1. **False positives on bare 1-token manufacturer families.** A device labelled only `Intel Corporate` is almost always a fingerprint-resolution failure (device never fully connected, Mist never got past OUI). Its event mix is dominated by connection failures because that's why it's unfingerprinted in the first place. Centroid faithfully reports this as "anomalous" — technically true, operationally noise.
-2. **Asymmetric signal quality by manufacturer.** Live cache audit (2026-04-19):
+**Changes landed in commits acadfc4 → 42fcc60 (Phases 1–6):**
+- `client_cache.resolve_manufacturer_from_family()` + strict OS/device → vendor whitelist (iOS/iPadOS/macOS/iPhone/iPad/Mac → Apple, Android → Google).
+- `mfg_rollup_min_macs` config knob (default 5) — evaluated **org-wide per WLAN** via a scheduler pre-pass (`db.get_mfg_inputs_by_wlan()`), threaded into each `build_features(site, wlan, qualifying_mfgs=…)` call. Per-site evaluation was tried first and silenced manufacturers like Amazon whose population was spread thin across sites.
+- `_is_centroid_eligible_family(name)` gate in `anomaly_detector.py` — Centroid now runs on `-MFG` + `.service_account` only. Per-fingerprint families drop out.
+- `is_bare_one_token` flag on primary records drops bare 1-token families from the finding rollup without removing per-MAC drilldown access.
+- `client_summary.resolved_manufacturer` column (migration + new index) — fixes the MS-Corporation-vs-Microsoft drilldown mismatch by giving the filter a key that matches the MFG family membership.
+- Anomaly-side cosine threshold default lowered from 0.35 → 0.25 to match the compressed distance distribution of manufacturer-wide cohorts.
+- Frontend: MFG color scheme (cyan-teal `#5ab5c8`), `MFG ROLLUP` badge, drilldown banners, "Primary Family" column extension, MAC drilldown "also in MFG X" card, legend updates explaining the `—` on per-fingerprint rows.
+- API: `family_metadata` and `/org/family-insights` expose `mfg_rollup_label` + `mfg_rollup_member_families` so the frontend renders correctly without re-deriving suffix logic.
 
-   | Manufacturer | 1-token MACs | Fingerprinted MACs | Fingerprinted families | 1-token share |
-   |---|---:|---:|---:|---:|
-   | Intel Corporate | 1,538 | 3,959 | 38 | 28.0% |
-   | Apple | 3,924 | 26,579 | 700 | 12.9% |
-   | **Amazon** | **109** | **58** | **22** | **65.3%** |
-   | Samsung | 89 | 265 | 85 | 25.1% |
+**Live validation on EmoryUnplugged (2026-04-19):** Intel Corporate-MFG with 757 MACs (1538 bare + ~3959 fingerprinted siblings across 38 families) correctly does NOT trigger Centroid. Amazon-MFG with ~170 MACs (mostly failing) does. Microsoft-MFG, Galaxy S23-MFG, and similar narrow manufacturer rollups that genuinely behave differently from the healthy reference do fire. Zero `wlans_failed` in the first post-ship detection cycle.
 
-   Intel noise is loud (1,538 bare stragglers, 38 healthy fingerprinted siblings to bury them in). Amazon is inverted — the 1-token row is the real signal because there are barely any fingerprinted Amazons. Today's per-fingerprint Centroid can't tell these cases apart.
+**Replaces (not layers onto) item #1** of the 2026-04-18 section above — the structural fix is in place, no alarm-gate or composite-depth-weighting workaround needed.
 
-**Design.** Per manufacturer `mfg`, build one virtual family `<mfg>.catch_all` that aggregates **every MAC whose manufacturer == mfg, regardless of fingerprint depth**. That catch-all is the **only** Centroid candidate for that manufacturer. Per-fingerprint rows (`Apple | iPhone | iOS 17`, bare `Apple`, etc.) stay in the system for DBSCAN, Markov, Health, Family Insights display, and drilldowns — they just drop out of the Centroid pass entirely. Modeled on the existing `.service_account` plumbing (composite key `{mac}#ca`, parallel feature record, emitted at `feature_engineer.build_features` time).
-
-**Why this resolves both failure modes.** The fingerprinted-sibling population acts as statistical ballast:
-- **Intel.** Bare `Intel Corporate` (1,538 stragglers) + fingerprinted siblings (3,959 healthy) merge into `Intel Corporate.catch_all` (~5,500 MACs). Healthy siblings outnumber stragglers 3:1, aggregate direction sits inside the healthy reference, **Centroid stops flagging Intel.**
-- **Amazon.** Bare `Amazon` (109 mostly-failing) + fingerprinted siblings (58, also mostly-failing) merge into `Amazon.catch_all` (~167 MACs). Aggregate still points at failure, **Centroid still flags Amazon.** Signal preserved.
-
-**Division of labor after this change.**
-- **Centroid = per-manufacturer direction-of-aggregate-behavior.** Replaces today's per-fingerprint pass. Answers "is this whole manufacturer's population pointing at failure?"
-- **DBSCAN = per-site within-population behavioral outliers.** Runs on fingerprinted families where the peer cohort is homogeneous. Unchanged.
-- **Markov = per-MAC connection-chain pathology.** Runs on fingerprinted families. Unchanged.
-- **Health = per-MAC failure rate.** Runs on everything. Unchanged.
-
-**Evidence against (weighed, not dealbreakers):**
-- **Loss of per-fingerprint Centroid signal.** If `Apple | iPhone | iOS 17` is broken but `Apple | iPhone | iOS 18` is fine, today's Centroid catches the iOS-17 pattern; new rule dilutes it 4:1+ under `Apple.catch_all`. DBSCAN + Markov should still catch the site-level anomaly, but validate before committing.
-- **UI needs clear labelling.** Fingerprinted rows will show `—` in the Cosine column. Will need a `PER-MFG` badge or tooltip explaining Centroid runs per-manufacturer, DBSCAN/Markov run per-fingerprint.
-- **Manufacturer normalization becomes load-bearing.** Any drift in `_clean_token()` output (`Apple Inc.` vs `Apple`) splits a catch-all. Pre-flight audit of distinct mfg values in the live cache before rollout.
-- **Naming:** `Apple.catch_all` reads awkwardly next to `srv_Apple_EP.service_account`. Proposed internal suffix `.catch_all` for plumbing parity; display label something like `Apple (all)` or a `CATCH ALL` badge.
-
-**Implementation plan (~1 day + 0.5 day UI):**
-1. `feature_engineer.build_features`:
-   - Build a `mfg → list[MAC]` map from the client cache (`client.manufacturer` after `_clean_token` normalization).
-   - For each manufacturer with ≥ `catch_all_min_macs` (propose 10) MACs, emit a parallel feature record under composite key `{mac}#ca`, family name `<mfg>.catch_all`, with `is_catch_all_record=True` on the record.
-   - Primary per-fingerprint records get a new `centroid_eligible=False` flag when family is 1-token OR when mfg has a catch-all (since the catch-all is the new Centroid candidate).
-2. `anomaly_detector._run_family_centroid_distance` + `_family_mean_health`: filter to `centroid_eligible=True` families only. The `.catch_all` passes; per-fingerprint and bare-1-token rows don't.
-3. `anomaly_detector.score` / `score_org_wide`: skip DBSCAN/Markov rollup for `.catch_all` rows (they're Centroid-only, matching the rule).
-4. Rollup + findings: catch-all families generate findings exactly like service-account families. Dual-gate applies.
-5. `summary_cache.py` + `api/routes.py`: `family_kind` field extended to include `catch_all`. Webhook payload adds `catch_all_member_families` (list of per-fingerprint family names folded into this catch-all).
-6. Frontend: new `CATCH ALL` badge (distinct color from SA's tan), legend copy update, Family Insights catch-all row display.
-
-**Config knobs to add (general section):**
-- `catch_all_min_macs` (default 10) — minimum MACs to build a catch-all.
-- `centroid_mode` (`per_manufacturer` | `per_fingerprint`, default `per_manufacturer` after rollout, `per_fingerprint` during validation) — kill switch.
-
-**Validation plan before default-on:**
-1. Ship with `centroid_mode=per_fingerprint` default so behavior matches today.
-2. Toggle to `per_manufacturer` on the EmoryUnplugged WLAN. Compare the Intel alert rate and the Amazon alert rate before/after across 24hr of cycles.
-3. Expected: Intel alerts go to zero; Amazon alerts persist. If DBSCAN independently catches per-fingerprint anomalies we care about, promote to default.
-
-**Open questions (from conversation, for the implementer):**
-- Does `Unknown/<mfg>` fold into `<mfg>.catch_all`? Lean: yes (same unfingerprinted population).
-- Do service-account families still get their own Centroid pass? Lean: yes (different cohort axis — username vs manufacturer).
-- Exact `catch_all_min_macs` threshold? Starting proposal 10; may raise.
-
-**Scheduling:** post-hackathon. Replaces (not layers onto) item #1 at the top of this section. Do not ship before presentations.
+**Follow-up documentation:** CLAUDE.md got a new "Manufacturer-Rollup Virtual Families" section (mirror of the SA section). GUIDE_Unsupervised_Anomaly_Detection.pdf will need a revision on the next rev so the Centroid methodology pages reflect manufacturer granularity.

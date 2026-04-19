@@ -27,10 +27,14 @@ Detects anomalous client behavior across every site in a Juniper Mist org by:
      peer group. `min_samples` and `eps` are auto-tuned per run from the population
      size — `min_samples = max(3, n_clients * pct)` and `eps` is the k-distance
      elbow. Only one operator knob (`anomaly_dbscan_min_samples_pct`).
-   - **Stage 2 — Family Centroid Distance**: flags entire device families whose
-     L2-normalized centroid sits far (cosine distance) from a healthy-family
-     reference centroid built from families with mean health ≥
-     `ANOMALY_CENTROID_HEALTHY_REF_THRESHOLD`.
+   - **Stage 2 — Family Centroid Distance**: scopes to manufacturer rollups
+     (`<mfg>-MFG`) and service-account families (`*.service_account`) ONLY.
+     Per-fingerprint families are aggregated into their manufacturer rollup
+     and drop out of Centroid entirely. For each eligible family, the
+     L2-normalized centroid is compared (cosine distance) against a
+     healthy-family reference built from families with mean health ≥
+     `ANOMALY_CENTROID_HEALTHY_REF_THRESHOLD`. See "Manufacturer-Rollup
+     Virtual Families" below for the full design.
    - **Stage 3 — Isolation Forest** (per device family): flags individual MACs
      anomalous within their family. Families below `MIN_PEERS` borrow MACs from
      other org sites for the same family.
@@ -1304,6 +1308,151 @@ fires the webhook when `is_family_outlier == True` AND `health_score < threshold
 `family_metadata` map keyed by family name with `family_kind`,
 `service_account_label`, and `service_account_member_families` so the frontend can
 render each row correctly without re-deriving the suffix logic.
+
+---
+
+### Manufacturer-Rollup Virtual Families
+
+**Why this exists:** Per-fingerprint Centroid analysis created two classes of
+noise. (a) Bare 1-token families like `Intel Corporate` or bare `Apple` —
+populations of MACs Mist never fully fingerprinted (the device never cleanly
+completed an association) — have event mixes dominated by connection failures
+*because they never connected*. Treating them as their own cohort produced
+confident but operationally useless "Intel is anomalous" flags. (b) Per-
+fingerprint families at the other extreme (`Apple | iPhone | iOS 17.2.1`) are so
+narrow that the healthy-reference centroid can't reliably distinguish a genuine
+firmware regression from sample noise.
+
+The manufacturer rollup resolves both: aggregate every MAC of a given
+manufacturer into one virtual family regardless of fingerprint depth, and run
+Centroid against that single aggregate. When the population is mostly healthy
+(Apple, Intel), the bulk washes out the strugglers and Centroid does not fire.
+When the population is mostly failing (Amazon), the aggregate still points at
+failure and Centroid fires correctly.
+
+**Source field:** the normalized manufacturer produced by
+`client_cache.resolve_manufacturer_from_family(device_family, device_manufacturer)`.
+This helper:
+1. prefers the cleaned `device_manufacturer` field (already populated at event
+   enrichment time via `_clean_token`),
+2. falls back to tokenizing the first segment of a multi-token `device_family`
+   ("Apple | MacBook | macOS 14" → "Apple"),
+3. for bare 1-token families, checks a strict whitelist mapping OS/device
+   tokens to vendors (`iOS` / `iPadOS` / `macOS` / `iPhone` / `iPad` / `Mac`
+   → Apple; `Android` → Google) — anything not in the whitelist stays
+   unresolved and contributes no MFG row.
+
+`Unknown/<mfg>` rows (OUI-derived manufacturer, no Mist fingerprint at all)
+also fold into `<mfg>-MFG`. Truly-empty `Unknown` rows stay in
+`HIDDEN_FAMILIES` unchanged.
+
+**Family naming convention:** Manufacturer-rollup family names use the suffix
+`-MFG`. Manufacturer `Apple` produces the family `Apple-MFG`. The suffix is the
+only flag downstream code uses to distinguish MFG families from hardware
+families — mirrors the `.service_account` convention.
+
+**Org-wide per-WLAN threshold:** A manufacturer becomes an `-MFG` rollup only
+when it has ≥ `mfg_rollup_min_macs` (default 5, General Config tunable) MACs
+**across the entire org** on the WLAN being scored. Per-site thresholding was
+tried first and produced the wrong signal: Amazon with 3 MACs × 30 sites never
+crossed 5 at any single site and stayed silent. The pre-pass in
+`scheduler._run_org_pipeline_body` walks `db.get_mfg_inputs_by_wlan()` once per
+cycle, computes `qualifying_mfgs_by_wlan = {wlan → {mfg : org_mac_count ≥
+threshold}}`, and threads the per-WLAN set into every `build_features(site,
+wlan, qualifying_mfgs=…)` call. `build_features` also accepts `qualifying_mfgs
+= None` for standalone invocations (manual API trigger, tests) and falls back
+to per-site counting in that case — backwards-compatible.
+
+**Dual-family model — composite keys:** Feature records for MFG-rollup
+families use composite keys `{mac}#mfg`. A single MAC carrying a qualifying
+manufacturer now emits up to three parallel feature rows:
+
+| Key | family_field | is_service_account_record | is_mfg_rollup_record |
+|---|---|---|---|
+| `aabbccddee01` | `Apple \| iPhone \| iOS 17` | False | False |
+| `aabbccddee01#sa` | `srv_Apple_EP.service_account` | True | False |
+| `aabbccddee01#mfg` | `Apple-MFG` | False | True |
+
+`underlying_mac(key)` strips either suffix to recover the real MAC.
+
+**Detector eligibility — the key rule:** unlike SA families, MFG families
+participate in **Centroid only**. Concretely:
+
+| Detector | `device_family` | `<mfg>-MFG` | `.service_account` | bare 1-token `device_family` |
+|---|---|---|---|---|
+| DBSCAN (site-wide, per-MAC) | yes | no (exact-vector duplicate) | yes | yes — MAC participates as data point, but family-level rollup is suppressed |
+| IF (per-family intra-family outliers) | yes | no | yes | yes — same; family rollup suppressed |
+| Markov (per-MAC chain + stuck-loop) | yes | no | yes | yes — same; family rollup suppressed |
+| **Centroid (cosine distance from healthy-family median)** | **no** | **yes** | **yes** | **no** |
+
+The gate `_is_centroid_eligible_family(name)` in `anomaly_detector.py`
+implements this: `is_mfg_rollup_family(name) or is_service_account_family(name)`.
+Per-fingerprint rows drop out of Centroid entirely — every MAC they carry is
+already folded into its manufacturer rollup, so measuring them a second time
+at finer granularity double-counts the population and compresses the
+healthy-reference centroid until nothing fires.
+
+**Bare 1-token family-level rollup suppression:** primary records whose
+`device_family` is a single token (no ` | ` separator, not `Unknown`, not a
+virtual suffix) get `is_bare_one_token = True` in Phase 3. The finding rollup
+in `anomaly_detector.score()` / `score_org_wide()` then drops these families
+from the findings list entirely — their actionable family-level signal lives
+on the `-MFG` row now. The per-MAC anomaly records for those MACs still carry
+their individual DBSCAN / Markov / IF flags, so MAC drilldowns remain
+complete.
+
+**Centroid distance threshold:** default lowered from `0.35` → `0.25` when
+Centroid moved to the MFG cohort. Per-manufacturer aggregates are coarser than
+per-fingerprint, which compresses distances. The legacy 0.35 default stranded
+unhealthy-but-moderately-distant rollups (e.g. Amazon-MFG at ~0.31 with 20%
+health) below the threshold; 0.25 restores the intended signal. Operators can
+still override via the Centroid Config GUI or the
+`ANOMALY_CENTROID_DIST_THRESHOLD` env var.
+
+**Roll-up behavior:** MFG-rollup families are scored as first-class Centroid
+candidates. They generate findings, contribute to `org_findings`, and pass
+through the dual alert gate like hardware families. The `mfg_rollup` summary
+block on each primary anomaly record (set in `score()`) carries `family`,
+`resolved_manufacturer`, `is_family_outlier`, and `centroid_dist_score` so the
+per-MAC drilldown can show "this device is also part of `Apple-MFG`, which
+scored X".
+
+**Webhook gating:** Same composite gate as hardware families. Additionally,
+webhook payloads carry `family_kind == "mfg_rollup"`, `mfg_rollup_label` (bare
+mfg, suffix stripped), and `mfg_rollup_member_families` (sorted list of
+underlying per-fingerprint families this rollup aggregates) so downstream
+consumers can route alerts by manufacturer without string-parsing the family
+name.
+
+**Frontend surfacing:** MFG-rollup families are visible in:
+- **SiteOverview / OrgFamilyInsights heatmap rows** — rendered with the MFG
+  color scheme (`MFG_COLOR = "#5ab5c8"`, `MFG_BG = "#13272a"`), labelled with
+  the bare manufacturer (suffix stripped), and tagged with a `MFG ROLLUP`
+  badge listing the underlying per-fingerprint families on hover.
+- **OrgAlerts / FindingsFeed / OrgFindingsFeed cards** — `family_kind ===
+  "mfg_rollup"` triggers the MFG ROLLUP pill and replaces `device_family` with
+  `mfg_rollup_label`.
+- **FamilyDrilldown / OrgFamilyDrilldown** — header shows the MFG badge, a
+  banner lists the underlying per-fingerprint families, and the "Primary
+  Family" column (already present for SA drilldowns) shows each member MAC's
+  hardware fingerprint.
+- **MacDrilldown** — when `scores.mfg_rollup` is present, an MFG info card
+  appears after the SA card (if any) and before the Domain Health Axes.
+- **Cosine column legend** — the Cosine column renders `—` on per-fingerprint
+  rows by design. Legend text in both heatmaps explains the rule.
+
+**API metadata:** `get_events_summary` extends `family_metadata` with
+`mfg_rollup_label` and `mfg_rollup_member_families` alongside the existing SA
+fields.
+
+**Drilldown endpoints:** `/sites/{id}/families/{family}/if-outliers`,
+`/sites/{id}/families/{family}/event-counts`,
+`/org/families/{family}/drilldown`, and
+`/org/families/{family}/drilldown-all-wlans` all recognize the `-MFG` suffix
+and route to a `manufacturer_exact` filter on `client_summary.resolved_manufacturer`
+(a column populated by `client_summary_builder.py` via the same
+`resolve_manufacturer_from_family` helper feature_engineer uses, so the filter
+key always matches the virtual-family membership).
 
 ---
 
