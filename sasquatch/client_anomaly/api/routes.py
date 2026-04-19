@@ -3626,11 +3626,20 @@ async def get_mac_anomaly(
     # a useful payload — events + metadata with empty scores — rather than 404'ing.
     anomalies = await get_anomalies(site_id, wlan)
     mac_scores = anomalies.get(mac_normalized)
+    raw_org_anomalies = await _redis_get(_org_anomalies_redis_key(site_id, wlan))
+    org_anomalies = json.loads(raw_org_anomalies) if raw_org_anomalies else {}
+    org_mac_scores = org_anomalies.get(mac_normalized)
     if mac_scores is None:
-        raw_org_anomalies = await _redis_get(_org_anomalies_redis_key(site_id, wlan))
-        if raw_org_anomalies:
-            org_anomalies = json.loads(raw_org_anomalies)
-            mac_scores = org_anomalies.get(mac_normalized)
+        mac_scores = org_mac_scores
+    elif org_mac_scores:
+        # MFG-rollup centroid is only meaningful over the combined org population;
+        # site-local score() usually leaves centroid_dist_score None because too
+        # few MFG families qualify at a single site. Prefer the org record's
+        # mfg_rollup block when site-local is absent or blank.
+        org_mfg = org_mac_scores.get("mfg_rollup")
+        site_mfg = mac_scores.get("mfg_rollup")
+        if org_mfg and (not site_mfg or site_mfg.get("centroid_dist_score") is None):
+            mac_scores["mfg_rollup"] = org_mfg
 
     raw_features = await _redis_get(_features_redis_key(site_id, wlan))
     features = json.loads(raw_features) if raw_features else {}

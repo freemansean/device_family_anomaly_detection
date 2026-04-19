@@ -1514,20 +1514,28 @@ async def score_org_wide(
     # a given site) can show "this MAC also belongs to {label}.service_account,
     # scored as {is_family_outlier}" without an extra Redis lookup.
     for ck in list(org_anomalies_flat):
-        if is_sa_record_key(ck):
+        if is_sa_record_key(ck) or is_mfg_record_key(ck):
             continue
         sa_ck = f"{ck}#sa"
         sa_entry = org_anomalies_flat.get(sa_ck)
-        if not sa_entry:
-            continue
-        org_anomalies_flat[ck]["service_account"] = {
-            "family": composite_features[ck].get("service_account_family", ""),
-            "last_username": composite_features[ck].get("last_username", ""),
-            "is_family_outlier": sa_entry["is_family_outlier"],
-            "is_if_outlier": sa_entry["is_if_outlier"],
-            "if_score": sa_entry["if_score"],
-            "centroid_dist_score": sa_entry.get("family_centroid_dist_score"),
-        }
+        if sa_entry:
+            org_anomalies_flat[ck]["service_account"] = {
+                "family": composite_features[ck].get("service_account_family", ""),
+                "last_username": composite_features[ck].get("last_username", ""),
+                "is_family_outlier": sa_entry["is_family_outlier"],
+                "is_if_outlier": sa_entry["is_if_outlier"],
+                "if_score": sa_entry["if_score"],
+                "centroid_dist_score": sa_entry.get("family_centroid_dist_score"),
+            }
+        mfg_ck = f"{ck}#mfg"
+        mfg_entry = org_anomalies_flat.get(mfg_ck)
+        if mfg_entry:
+            org_anomalies_flat[ck]["mfg_rollup"] = {
+                "family": composite_features[mfg_ck].get("device_family", ""),
+                "resolved_manufacturer": composite_features[ck].get("resolved_manufacturer", ""),
+                "is_family_outlier": mfg_entry["is_family_outlier"],
+                "centroid_dist_score": mfg_entry.get("family_centroid_dist_score"),
+            }
 
     # Raw events cache for post-hoc explainer — loaded once per site on demand
     raw_events_cache: dict[str, dict[str, list[dict]]] = {}
