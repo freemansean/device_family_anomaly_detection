@@ -2114,9 +2114,17 @@ async def build_org_family_insights(redis_client, site_map: dict[str, str], wlan
             else:
                 service_health_out[svc] = None
         is_sa = family.endswith(".service_account")
+        is_mfg = family.endswith("-MFG")
+        if is_sa:
+            fk = "service_account"
+        elif is_mfg:
+            fk = "mfg_rollup"
+        else:
+            fk = "device_family"
         families_out[family] = {
-            "family_kind": "service_account" if is_sa else "device_family",
+            "family_kind": fk,
             "service_account_label": family[: -len(".service_account")] if is_sa else "",
+            "mfg_rollup_label": family[: -len("-MFG")] if is_mfg else "",
             "total_events": total,
             "client_count": family_mac_count[family],
             "site_count": family_site_count[family],
@@ -3095,6 +3103,8 @@ async def build_site_events_summary(site_id: str, wlan: str) -> dict | None:
     family_markov: dict[str, dict] = {}
     sa_family_members: dict[str, set[str]] = defaultdict(set)
     sa_member_families_map: dict[str, set[str]] = defaultdict(set)
+    mfg_family_members: dict[str, set[str]] = defaultdict(set)
+    mfg_member_families_map: dict[str, set[str]] = defaultdict(set)
     try:
         anomalies_raw = await get_anomalies(site_id, wlan)
         if anomalies_raw:
@@ -3125,6 +3135,14 @@ async def build_site_events_summary(site_id: str, wlan: str) -> dict | None:
                     primary_family = mac_data.get("primary_device_family", "")
                     if primary_family:
                         sa_member_families_map[fam].add(primary_family)
+                # Mirror for MFG rollup virtual families.
+                if mac_data.get("is_mfg_rollup_record"):
+                    primary_mac = mac_data.get("primary_mac")
+                    if primary_mac:
+                        mfg_family_members[fam].add(primary_mac)
+                    primary_family = mac_data.get("primary_device_family", "")
+                    if primary_family:
+                        mfg_member_families_map[fam].add(primary_family)
             for fam, total in fam_total.items():
                 anomalous = fam_anomalous.get(fam, 0)
                 evaluatable = fam_evaluatable.get(fam, 0)
@@ -3165,6 +3183,19 @@ async def build_site_events_summary(site_id: str, wlan: str) -> dict | None:
             family_totals[sa_family] = sa_total
             family_macs[sa_family] = norm_members
 
+    # Mirror for MFG rollup virtual families.
+    if mfg_family_members:
+        for mfg_family, member_macs in mfg_family_members.items():
+            norm_members = {(m or "").replace(":", "").lower() for m in member_macs}
+            norm_members.discard("")
+            mfg_counts_map = await db.get_mac_category_counts(site_id, wlan, norm_members)
+            mfg_total = sum(mfg_counts_map.values())
+            if mfg_total == 0:
+                continue
+            summary[mfg_family] = dict(mfg_counts_map)
+            family_totals[mfg_family] = mfg_total
+            family_macs[mfg_family] = norm_members
+
     result = {}
     for family, cat_counts in summary.items():
         total = family_totals[family]
@@ -3176,11 +3207,20 @@ async def build_site_events_summary(site_id: str, wlan: str) -> dict | None:
             for cat, count in cat_counts.items()
         }
 
+    def _family_kind(name: str) -> str:
+        if name.endswith(".service_account"):
+            return "service_account"
+        if name.endswith("-MFG"):
+            return "mfg_rollup"
+        return "device_family"
+
     family_metadata = {
         fam: {
-            "family_kind": "service_account" if fam.endswith(".service_account") else "device_family",
+            "family_kind": _family_kind(fam),
             "service_account_label": fam[: -len(".service_account")] if fam.endswith(".service_account") else "",
             "service_account_member_families": sorted(sa_member_families_map.get(fam, set())),
+            "mfg_rollup_label": fam[: -len("-MFG")] if fam.endswith("-MFG") else "",
+            "mfg_rollup_member_families": sorted(mfg_member_families_map.get(fam, set())),
         }
         for fam in result.keys()
     }
