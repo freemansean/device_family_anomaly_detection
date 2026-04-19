@@ -17,7 +17,7 @@ const COLUMN_DEFS = [
   { key: "count",         label: "Count" },
   { key: "events",        label: "Events" },
   { key: "sites",         label: "Sites" },
-  { key: "if",            label: "IF" },
+  { key: "if",            label: "Cosine" },
   { key: "db",            label: "DB" },
   { key: "markov",        label: "Markov" },
   { key: "health",        label: "Health" },
@@ -374,10 +374,10 @@ export default function OrgFamilyInsights({ apiBase, refreshToken, onMacSiteSele
               {visibleCols.if && (
                 <th
                   style={{ ...thStyle, whiteSpace: "nowrap", cursor: "pointer", userSelect: "none" }}
-                  title="Isolation Forest centroid detection — flags the whole family as behaving differently from all other families (any site)."
+                  title="Cosine distance from the healthy-family median centroid — flags the whole family as behaving differently from all other families (any site)."
                   onClick={() => handleSort("anomaly")}
                 >
-                  IF<SortIndicator active={sortKey === "anomaly"} dir={sortDir} />
+                  Cosine<SortIndicator active={sortKey === "anomaly"} dir={sortDir} />
                 </th>
               )}
               {visibleCols.db && (
@@ -758,7 +758,7 @@ export default function OrgFamilyInsights({ apiBase, refreshToken, onMacSiteSele
 
       <div style={{ marginTop: "8px", fontSize: "11px", color: "#444" }}>
         Cell ratios are % of that family's org-wide event pool.
-        {" "}<span style={{ color: "#b06ad4" }}>IF: family</span> = device class flagged as a centroid outlier org-wide (cross-site population).
+        {" "}<span style={{ color: "#b06ad4" }}>Cosine: family</span> = device class flagged as a centroid outlier org-wide (cosine distance from the healthy-family median centroid, cross-site population).
         {" "}<span style={{ fontWeight: "bold", color: "#666" }}>DB:</span> <span style={{ color: "#e0a835" }}>moderate</span> / <span style={{ color: "#e05555" }}>significant</span> = org-wide DBSCAN severity (badge = sites with outlier MACs).
         {" "}<span style={{ color: "#4ab0e8" }}>Markov</span> = anomaly (anomalous connection-chain transitions) or repeated (failed loops). Hover for ratio.
         {" "}Health = volume-weighted failure rate org-wide (hover for per-category breakdown).

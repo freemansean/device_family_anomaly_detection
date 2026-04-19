@@ -348,10 +348,10 @@ export default function SiteOverview({ siteId, apiBase, onMacSelect, onFamilySel
               </th>
               <th
                 style={{ ...thStyle, whiteSpace: "nowrap", cursor: "pointer", userSelect: "none" }}
-                title="Isolation Forest centroid detection — flags the whole family as behaving differently from all other families at this site."
+                title="Cosine distance from the healthy-family median centroid — flags the whole family as behaving differently from all other families at this site."
                 onClick={() => handleSort("anomaly")}
               >
-                IF<SortIndicator active={sortKey === "anomaly"} dir={sortDir} />
+                Cosine<SortIndicator active={sortKey === "anomaly"} dir={sortDir} />
               </th>
               <th
                 style={{ ...thStyle, whiteSpace: "nowrap", cursor: "pointer", userSelect: "none" }}
@@ -686,7 +686,7 @@ export default function SiteOverview({ siteId, apiBase, onMacSelect, onFamilySel
       </div>
 
       <div style={{ marginTop: "8px", fontSize: "11px", color: "#444" }}>
-        <span style={{ color: "#b06ad4" }}>IF: family</span> = whole device class behaves differently from other families at this site (centroid IF).
+        <span style={{ color: "#b06ad4" }}>Cosine: family</span> = whole device class behaves differently from other families at this site (cosine distance from the healthy-family median centroid).
         {" "}<span style={{ fontWeight: "bold", color: "#666" }}>DB:</span> <span style={{ color: "#e0a835" }}>moderate</span> / <span style={{ color: "#e05555" }}>significant</span> = fraction of individual MACs in that family flagged by DBSCAN.
         {" "}Health = weighted failure rate across AUTH · ROAM · DHCP · DNS · ARP (hover for breakdown).
         {" "}Click a family name to see per-device Isolation Forest deviations.
