@@ -875,6 +875,7 @@ export default function App() {
       org_detection_interval_hours: 1,
       feature_min_mac_events: 3,
       anomaly_min_mac_events: 10,
+      mfg_rollup_min_macs: 5,
       alarm_min_family_size: 10,
       anomaly_health_score_threshold: 0.20,
       alarm_service_device_pct: 0.70,
@@ -1588,6 +1589,15 @@ export default function App() {
                 </div>
                 <input type="range" min={1} max={50} value={generalConfigDraft.anomaly_min_mac_events} onChange={(e) => setGeneralConfigDraft(d => ({ ...d, anomaly_min_mac_events: Number(e.target.value) }))} style={{ width: "100%", accentColor: "#7ec8e3", cursor: "pointer" }} />
                 <div style={{ color: "#555", fontSize: "11px", marginTop: "4px" }}>Minimum events a MAC must have to be evaluated by the per-family Isolation Forest and site-wide DBSCAN passes. Below this floor, per-MAC vectors are too sparse for distance-based scoring to be reliable. Does not affect the inter-family Cosine Distance (centroid) detector or the per-family Health Score, which use the broader pool defined above. Markov has its own internal threshold.</div>
+              </div>
+
+              <div style={{ marginBottom: "18px" }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: "5px" }}>
+                  <div style={{ color: "#888", fontSize: "11px" }}>MIN MACS PER MANUFACTURER FOR -MFG ROLLUP</div>
+                  <div style={{ color: "#7ec8e3", fontSize: "13px", fontWeight: "bold" }}>{generalConfigDraft.mfg_rollup_min_macs ?? 5} MAC{(generalConfigDraft.mfg_rollup_min_macs ?? 5) === 1 ? "" : "s"}</div>
+                </div>
+                <input type="range" min={1} max={50} value={generalConfigDraft.mfg_rollup_min_macs ?? 5} onChange={(e) => setGeneralConfigDraft(d => ({ ...d, mfg_rollup_min_macs: Number(e.target.value) }))} style={{ width: "100%", accentColor: "#7ec8e3", cursor: "pointer" }} />
+                <div style={{ color: "#555", fontSize: "11px", marginTop: "4px" }}>Minimum MACs a manufacturer must have before a <code>&lt;mfg&gt;-MFG</code> rollup family is emitted. Each rollup aggregates every MAC of that manufacturer regardless of fingerprint depth and is the only candidate for Cosine (centroid) analysis. Below this floor no rollup family is built and no centroid pass runs for that manufacturer. Lower to surface minority manufacturers; raise to reduce heatmap noise.</div>
               </div>
 
               <div style={{ marginBottom: "24px", paddingBottom: "20px", borderBottom: "1px solid #222" }}>

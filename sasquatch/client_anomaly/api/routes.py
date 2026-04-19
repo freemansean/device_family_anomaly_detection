@@ -639,6 +639,9 @@ async def set_general_config(body: dict):
         "alarm_min_family_size": (1, 1000),
         # Negative dBm. -120 is effectively "off" (below noise floor).
         "anomaly_rssi_min_threshold": (-120, 0),
+        # Minimum MACs per manufacturer before a -MFG rollup virtual family
+        # is emitted. Below the floor, no Centroid pass runs for that mfg.
+        "mfg_rollup_min_macs": (1, 1000),
     }
     float_bounds = {
         # Health score threshold for dual-gate alarm generation. Lives under

@@ -94,6 +94,18 @@ DEFAULTS = {
         # through regardless of signal strength. Set to a very negative value
         # (e.g. -120) to effectively disable the filter.
         "anomaly_rssi_min_threshold": {"default": -87, "env": "ANOMALY_RSSI_MIN_THRESHOLD", "cast": int},
+        # Minimum MACs a manufacturer must have in the WLAN scope before a
+        # <mfg>-MFG rollup virtual family is emitted. Each -MFG family
+        # aggregates every MAC of that manufacturer regardless of fingerprint
+        # depth (bare 1-token rows + all per-fingerprint siblings) and is the
+        # only candidate for Centroid analysis. Below this floor no -MFG
+        # family is built for that manufacturer and no Centroid pass runs for
+        # it that cycle — mirrors the small-cohort skip path used elsewhere
+        # in the pipeline. Default 5 aligns with the service-account
+        # threshold philosophy: small enough to surface real minority
+        # manufacturers, large enough to keep 2-or-3 MAC noise out of the
+        # heatmap.
+        "mfg_rollup_min_macs": {"default": 5, "env": "MFG_ROLLUP_MIN_MACS", "cast": int},
     },
 
     # ── Anomaly Config ──────────────────────────────────────────────
