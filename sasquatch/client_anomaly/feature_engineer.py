@@ -378,12 +378,26 @@ def build_posthoc_features(mac_events: list[dict]) -> dict:
     }
 
 
-async def build_features(site_id: str, wlan: str) -> int:
+async def build_features(
+    site_id: str,
+    wlan: str,
+    *,
+    qualifying_mfgs: set[str] | None = None,
+) -> int:
     """
     Read events from the global Redis sorted set (filtered by site and WLAN),
     build per-MAC feature vectors, store in Redis.
 
     Returns count of MACs processed.
+
+    ``qualifying_mfgs``: optional pre-computed set of manufacturers that met
+    the mfg_rollup_min_macs threshold org-wide on this WLAN. When provided,
+    the -MFG rollup emission uses this set instead of computing per-site
+    counts — a manufacturer spread thin across many sites (e.g. Amazon,
+    3 MACs × 30 sites) will then still emit <mfg>-MFG records at every site
+    that sees the mfg, and the org-wide Centroid pass sees the full cohort.
+    When None (manual API trigger, test, one-off), the function falls back
+    to per-site counting for backwards compatibility.
     """
     redis_client = aioredis.from_url(REDIS_URL, decode_responses=True)
     try:
@@ -470,10 +484,16 @@ async def build_features(site_id: str, wlan: str) -> int:
                     mfg_votes[resolved] = mfg_votes.get(resolved, 0) + 1
             if mfg_votes:
                 mac_to_mfg[mac] = max(mfg_votes, key=mfg_votes.__getitem__)
-        mfg_mac_counts: Counter[str] = Counter(mac_to_mfg.values())
-        qualifying_mfgs: set[str] = {
-            m for m, cnt in mfg_mac_counts.items() if cnt >= int(mfg_rollup_min)
-        }
+        # Threshold source: caller-supplied org-wide qualifying set (Phase 2
+        # pre-pass in scheduler) OR, when absent, per-site count from this
+        # call's own MAC population.
+        if qualifying_mfgs is None:
+            mfg_mac_counts: Counter[str] = Counter(mac_to_mfg.values())
+            qualifying_mfgs_set: set[str] = {
+                m for m, cnt in mfg_mac_counts.items() if cnt >= int(mfg_rollup_min)
+            }
+        else:
+            qualifying_mfgs_set = set(qualifying_mfgs)
 
         # Pre-compute per-family event category counts for the org/family-insights
         # endpoint so it can aggregate across sites without loading raw events per
@@ -494,7 +514,7 @@ async def build_features(site_id: str, wlan: str) -> int:
                     _fam_cat[_sa_fam][_cat] += 1
                     _fam_macs[_sa_fam].add(_mac)
                 _mfg = mac_to_mfg.get(_mac)
-                if _mfg and _mfg in qualifying_mfgs:
+                if _mfg and _mfg in qualifying_mfgs_set:
                     _mfg_fam = mfg_rollup_family_name(_mfg)
                     _fam_cat[_mfg_fam][_cat] += 1
                     _fam_macs[_mfg_fam].add(_mac)
@@ -612,7 +632,7 @@ async def build_features(site_id: str, wlan: str) -> int:
             # fingerprint primary records drop out of Centroid. The MFG record
             # itself does NOT participate in DBSCAN/IF/Markov — those still
             # run on primary per-fingerprint records only.
-            if resolved_mfg and resolved_mfg in qualifying_mfgs:
+            if resolved_mfg and resolved_mfg in qualifying_mfgs_set:
                 mfg_family_name = mfg_rollup_family_name(resolved_mfg)
                 features[mfg_record_key(mac)] = {
                     "vector": dict(cat_vec),
@@ -636,7 +656,7 @@ async def build_features(site_id: str, wlan: str) -> int:
             f"Built features for {len(features)} records "
             f"({sa_emitted} service-account dual records, "
             f"{mfg_emitted} mfg-rollup dual records, "
-            f"{len(qualifying_mfgs)} qualifying mfgs ≥ {mfg_rollup_min}) → {key} "
+            f"{len(qualifying_mfgs_set)} qualifying mfgs ≥ {mfg_rollup_min}) → {key} "
             f"(category_vector={len(CATEGORY_FEATURE_KEYS)}d, "
             f"event_vector={len(event_type_index)}d) "
             f"({skipped} skipped with < {min_mac_events} events) [wlan={wlan}]"

@@ -151,6 +151,13 @@ CREATE TABLE IF NOT EXISTS client_summary (
     device_model TEXT,
     device_manufacturer TEXT,
     device_os TEXT,
+    -- Normalized manufacturer via client_cache.resolve_manufacturer_from_family.
+    -- Collapses "Apple, Inc." / "Apple Inc" / bare "iPhone" / "iOS 17" all to
+    -- "Apple". Used as the filter key for the <mfg>-MFG drilldown — the
+    -- device_manufacturer column above carries the raw Mist value for display,
+    -- this one carries the detection-normalized form that the -MFG rollup
+    -- aggregates against.
+    resolved_manufacturer TEXT,
     last_username TEXT,
     service_account_family TEXT,
     random_mac BOOLEAN DEFAULT FALSE,
@@ -197,6 +204,11 @@ CREATE INDEX IF NOT EXISTS idx_summary_site_wlan ON client_summary(site_id, wlan
 CREATE INDEX IF NOT EXISTS idx_summary_health ON client_summary(health_score);
 CREATE INDEX IF NOT EXISTS idx_summary_username ON client_summary(last_username);
 CREATE INDEX IF NOT EXISTS idx_summary_sa_family ON client_summary(service_account_family);
+-- idx_summary_resolved_mfg is created by
+-- _migrate_client_summary_add_resolved_manufacturer (runs AFTER this script,
+-- so a fresh DB with the column also needs the migration helper to create
+-- the index). Keeping it out of the schema script here avoids an index
+-- creation against the column before the ALTER TABLE migration has run.
 CREATE INDEX IF NOT EXISTS idx_summary_mac ON client_summary(mac);
 """
 
@@ -290,6 +302,28 @@ async def _migrate_client_summary_add_device_os(conn: aiosqlite.Connection) -> N
     await conn.commit()
 
 
+async def _migrate_client_summary_add_resolved_manufacturer(conn: aiosqlite.Connection) -> None:
+    """
+    Add `resolved_manufacturer` to `client_summary`. The next detection cycle
+    rebuilds every (site, wlan) scope, so the column populates on rebuild.
+    No backfill — stale rows without resolved_manufacturer will be
+    refreshed on the next scope rebuild.
+    """
+    cursor = await conn.execute("PRAGMA table_info(client_summary)")
+    cols = await cursor.fetchall()
+    if not cols:
+        return
+    col_names = {row[1] for row in cols}
+    if "resolved_manufacturer" not in col_names:
+        log.info("Adding resolved_manufacturer column to client_summary")
+        await conn.execute("ALTER TABLE client_summary ADD COLUMN resolved_manufacturer TEXT")
+    await conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_summary_resolved_mfg "
+        "ON client_summary(resolved_manufacturer)"
+    )
+    await conn.commit()
+
+
 async def _init_schema(conn: aiosqlite.Connection):
     """Create tables and indexes if they don't exist."""
     await _migrate_clients_to_org_scope(conn)
@@ -297,6 +331,7 @@ async def _init_schema(conn: aiosqlite.Connection):
     await _migrate_clients_add_last_username(conn)
     await _migrate_client_summary_split_disassoc(conn)
     await _migrate_client_summary_add_device_os(conn)
+    await _migrate_client_summary_add_resolved_manufacturer(conn)
     await conn.commit()
 
 
@@ -446,6 +481,39 @@ async def get_event_counts_by_site_wlan() -> dict[tuple[str, str], int]:
     )
     rows = await conn.execute_fetchall(query, [cutoff])
     return {(sid, wlan): int(cnt) for sid, wlan, cnt in rows}
+
+
+async def get_mfg_inputs_by_wlan(
+) -> dict[str, list[tuple[str, str, str]]]:
+    """Return {wlan -> list of distinct (mac, device_family, device_manufacturer)}
+    across the detection window.
+
+    Used by the Phase 2 pre-pass to compute per-WLAN org-wide manufacturer
+    MAC counts (the -MFG rollup threshold gate). Caller normalizes each
+    row through ``client_cache.resolve_manufacturer_from_family`` and counts
+    distinct MACs per resolved manufacturer.
+
+    Scoping is org-wide per WLAN (not per (site, wlan)) because a single
+    manufacturer's population is typically spread across sites, so the
+    threshold decision has to look at the full org cohort — this matches
+    where Centroid actually runs on -MFG families.
+
+    Returns an empty dict on failure.
+    """
+    conn = await get_connection()
+    cutoff = get_detection_cutoff()
+    query = (
+        "SELECT COALESCE(wlan, '') AS w, mac, "
+        "COALESCE(device_family, '') AS fam, "
+        "COALESCE(device_manufacturer, '') AS mfg "
+        "FROM events WHERE timestamp >= ? "
+        "GROUP BY w, mac, fam, mfg"
+    )
+    rows = await conn.execute_fetchall(query, [cutoff])
+    out: dict[str, list[tuple[str, str, str]]] = {}
+    for w, mac, fam, mfg in rows:
+        out.setdefault(w, []).append((mac, fam, mfg))
+    return out
 
 
 async def get_events_category_rollup(
@@ -1070,6 +1138,7 @@ async def delete_clients_for_org(org_id: str) -> int:
 _CLIENT_SUMMARY_COLS: tuple[str, ...] = (
     "mac", "site_id", "wlan", "org_id",
     "device_family", "device_model", "device_manufacturer", "device_os",
+    "resolved_manufacturer",
     "last_username", "service_account_family", "random_mac",
     "health_score", "if_score", "centroid_dist_score", "dbscan_label",
     "is_if_outlier", "is_dbscan_outlier", "is_family_outlier",
@@ -1271,7 +1340,12 @@ def _summary_where(
         conditions.append("service_account_family = ?")
         params.append(service_account_family)
     if manufacturer_exact is not None:
-        conditions.append("device_manufacturer = ?")
+        # Match the detection-normalized resolved_manufacturer (the same value
+        # feature_engineer uses to populate -MFG virtual families). The raw
+        # device_manufacturer column carries the Mist display string
+        # ("Microsoft Corporation") which does not aggregate cleanly; the
+        # resolved column collapses it to "Microsoft" for the -MFG filter.
+        conditions.append("resolved_manufacturer = ?")
         params.append(manufacturer_exact)
     if last_username is not None:
         conditions.append("last_username = ?")

@@ -25,6 +25,7 @@ import httpx
 import redis.asyncio as aioredis
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
+from . import config
 from .anomaly_detector import score, score_org_wide
 from .client_cache import get_client_cache, refresh_client_cache_org
 from .event_collector import collect_org, ensure_event_type_index, get_wlans, reenrich_stale_events
@@ -379,6 +380,37 @@ async def _run_org_pipeline_body(
             log.exception("[org pipeline] event count pre-scan failed; falling back to no-skip")
             scope_event_counts = {}
 
+        # Pre-compute the per-WLAN org-wide qualifying manufacturer set.
+        # `-MFG` virtual families should fire when a manufacturer has
+        # mfg_rollup_min_macs MACs across the *entire org*, not per site —
+        # otherwise an Amazon population of 3 per site × 30 sites never
+        # crosses the threshold at any single site and the rollup stays
+        # silent. The per-WLAN scope matches where Centroid actually runs.
+        # Compute once, thread into every build_features() call.
+        mfg_rollup_min = int(config.get("general", "mfg_rollup_min_macs"))
+        qualifying_mfgs_by_wlan: dict[str, set[str]] = {}
+        try:
+            from .client_cache import resolve_manufacturer_from_family
+            mfg_inputs = await db.get_mfg_inputs_by_wlan()
+            for wlan_key, rows in mfg_inputs.items():
+                mfg_to_macs: dict[str, set[str]] = {}
+                for mac, fam, mfg_raw in rows:
+                    resolved = resolve_manufacturer_from_family(fam, mfg_raw)
+                    if resolved:
+                        mfg_to_macs.setdefault(resolved, set()).add(mac)
+                qualifying_mfgs_by_wlan[wlan_key] = {
+                    m for m, macs in mfg_to_macs.items()
+                    if len(macs) >= mfg_rollup_min
+                }
+            total_qualifying = sum(len(s) for s in qualifying_mfgs_by_wlan.values())
+            log.info(
+                "[org pipeline] mfg-rollup pre-pass: %d WLANs, %d total qualifying mfgs (>= %d MACs org-wide)",
+                len(qualifying_mfgs_by_wlan), total_qualifying, mfg_rollup_min,
+            )
+        except Exception:
+            log.exception("[org pipeline] mfg-rollup pre-pass failed; falling back to per-site threshold")
+            qualifying_mfgs_by_wlan = {}
+
         # Markov baseline build remains a sequential per-site step. It only
         # fires when a baseline is missing (48hr TTL — usually a no-op on a
         # warm system) and we don't want N parallel rebuilds hammering a cold
@@ -424,7 +456,10 @@ async def _run_org_pipeline_body(
         async def _build_one(sid: str, wlan: str) -> None:
             async with phase2_sem:
                 try:
-                    await build_features(sid, wlan)
+                    await build_features(
+                        sid, wlan,
+                        qualifying_mfgs=qualifying_mfgs_by_wlan.get(wlan),
+                    )
                     await score_health(sid, wlan)
                 except Exception:
                     log.exception(

@@ -3241,9 +3241,17 @@ async def get_family_if_outliers(site_id: str, family: str, wlan: str = Query(..
     client_cache = await get_client_cache() or {}
 
     is_sa_family = family.endswith(".service_account")
-    family_kind = "service_account" if is_sa_family else "device_family"
+    is_mfg_family = family.endswith("-MFG")
+    if is_sa_family:
+        family_kind = "service_account"
+    elif is_mfg_family:
+        family_kind = "mfg_rollup"
+    else:
+        family_kind = "device_family"
     sa_label = family[: -len(".service_account")] if is_sa_family else ""
+    mfg_label = family[: -len("-MFG")] if is_mfg_family else ""
     sa_member_families: set[str] = set()
+    mfg_member_families: set[str] = set()
 
     if is_sa_family:
         # sa records use composite keys; iterate over all and pick those whose
@@ -3310,10 +3318,80 @@ async def get_family_if_outliers(site_id: str, family: str, wlan: str = Query(..
             "top_features": family_top_features,
         }
 
+    if is_mfg_family:
+        # MFG rollup records also use composite keys ("#mfg" suffix); their
+        # `device_family` is e.g. "Microsoft-MFG". Resolve each to its real
+        # primary MAC + primary per-fingerprint family for drilldown display.
+        family_keys = [
+            ck for ck, data in anomalies.items()
+            if data.get("device_family") == family
+            and data.get("is_mfg_rollup_record")
+        ]
+        if not family_keys:
+            raise HTTPException(status_code=404, detail=f"No clients found for family '{family}'.")
+
+        all_clients = []
+        for ck in family_keys:
+            data = anomalies[ck]
+            primary_mac = data.get("primary_mac") or ck.replace("#mfg", "")
+            primary_device_family = (
+                data.get("primary_device_family")
+                or client_cache.get(primary_mac, {}).get("family", "Unknown")
+            )
+            if primary_device_family:
+                mfg_member_families.add(primary_device_family)
+            # For MFG rollup rows, DBSCAN/IF/Markov flags on the primary MAC
+            # are more meaningful than the MFG-record copies. Prefer the
+            # primary's per-MAC anomaly record when present.
+            primary_data = anomalies.get(primary_mac) or data
+            all_clients.append({
+                "mac": primary_mac,
+                "if_score": primary_data.get("if_score"),
+                "is_if_outlier": primary_data.get("is_if_outlier", False),
+                "is_dbscan_outlier": primary_data.get("is_dbscan_outlier", False),
+                "is_markov_outlier": primary_data.get("is_markov_outlier", False),
+                "markov_episode_anomaly_ratio": primary_data.get("markov_episode_anomaly_ratio"),
+                "markov_reason": primary_data.get("markov_reason"),
+                "event_count": primary_data.get("event_count", 0),
+                "random_mac": primary_data.get("random_mac", False),
+                "client_metadata": client_cache.get(primary_mac, {}),
+                "primary_device_family": primary_device_family,
+                "last_username": primary_data.get("last_username", ""),
+                "is_mfg_rollup_record": True,
+            })
+
+        all_clients.sort(key=lambda x: (x["if_score"] is None, x["if_score"] or 0))
+        if_outlier_count = sum(1 for c in all_clients if c["is_if_outlier"])
+
+        centroid_dist_score = next(
+            (anomalies[k].get("family_centroid_dist_score")
+             for k in family_keys
+             if anomalies[k].get("family_centroid_dist_score") is not None),
+            None,
+        )
+        findings = await get_findings(site_id, wlan)
+        family_finding = next((f for f in findings if f.get("device_family") == family), None)
+        family_top_features = family_finding.get("top_features", []) if family_finding else []
+
+        return {
+            "site_id": site_id,
+            "family": family,
+            "family_kind": family_kind,
+            "mfg_rollup_label": mfg_label,
+            "mfg_rollup_member_families": sorted(mfg_member_families),
+            "wlan": wlan,
+            "total_family_count": len(family_keys),
+            "if_outlier_count": if_outlier_count,
+            "outliers": all_clients,
+            "centroid_dist_score": centroid_dist_score,
+            "top_features": family_top_features,
+        }
+
     family_macs = [
         mac for mac, data in anomalies.items()
         if data.get("device_family") == family
         and not data.get("is_service_account_record")
+        and not data.get("is_mfg_rollup_record")
     ]
     if not family_macs:
         raise HTTPException(status_code=404, detail=f"No clients found for family '{family}'.")
@@ -3418,25 +3496,31 @@ async def get_family_event_counts(site_id: str, family: str, wlan: str = Query(.
     client_cache = await get_client_cache() or {}
 
     is_sa_family = family.endswith(".service_account")
-    sa_member_macs: set[str] = set()
-    if is_sa_family:
+    is_mfg_family = family.endswith("-MFG")
+    member_macs: set[str] = set()
+    if is_sa_family or is_mfg_family:
         anomalies = await get_anomalies(site_id, wlan)
+        virtual_flag = (
+            "is_service_account_record" if is_sa_family else "is_mfg_rollup_record"
+        )
         for ck, data in (anomalies or {}).items():
             if data.get("device_family") != family:
                 continue
-            if not data.get("is_service_account_record"):
+            if not data.get(virtual_flag):
                 continue
-            primary_mac = data.get("primary_mac") or ck
-            sa_member_macs.add(primary_mac)
-        if not sa_member_macs:
+            primary_mac = data.get("primary_mac") or ck.replace(
+                "#sa" if is_sa_family else "#mfg", ""
+            )
+            member_macs.add(primary_mac)
+        if not member_macs:
             raise HTTPException(status_code=404, detail=f"No clients found for family '{family}'.")
 
     # Pushed down to SQL: previously this pulled every event for the (site, wlan)
     # over the 7-day retention window and JSON-decoded each one just to filter
     # to one family — the same anti-pattern that spiked CPU on MAC drilldown.
-    if is_sa_family:
+    if is_sa_family or is_mfg_family:
         mac_counts, mac_total = await db.get_per_mac_category_counts_for_family(
-            site_id, wlan, macs_filter=sa_member_macs,
+            site_id, wlan, macs_filter=member_macs,
         )
     else:
         mac_counts, mac_total = await db.get_per_mac_category_counts_for_family(

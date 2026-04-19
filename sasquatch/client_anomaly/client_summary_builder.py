@@ -42,6 +42,7 @@ from typing import Optional
 
 from . import config
 from . import db
+from .client_cache import resolve_manufacturer_from_family
 from .event_collector import _EVENT_TYPE_TO_CATEGORY  # event_type -> category
 from .feature_engineer import SERVICE_ACCOUNT_SUFFIX
 from .health_scorer import _health_redis_key
@@ -296,6 +297,12 @@ async def build_scope(
             "device_model": client_meta.get("model", ""),
             "device_manufacturer": client_meta.get("manufacturer", ""),
             "device_os": client_meta.get("os", ""),
+            # Detection-normalized manufacturer used by the <mfg>-MFG rollup
+            # drilldown filter. Runs the same resolver feature_engineer uses
+            # so the filter key matches the virtual-family membership.
+            "resolved_manufacturer": resolve_manufacturer_from_family(
+                device_family or "", client_meta.get("manufacturer", "")
+            ),
             "last_username": client_meta.get("last_username", ""),
             "service_account_family": sa_family,
             "random_mac": bool(client_meta.get("random_mac", False) or anom.get("random_mac", False)),
@@ -456,6 +463,9 @@ async def rebuild_summary_table(
                 "device_model": client_meta.get("model", ""),
                 "device_manufacturer": client_meta.get("manufacturer", ""),
                 "device_os": client_meta.get("os", ""),
+                "resolved_manufacturer": resolve_manufacturer_from_family(
+                    device_family or "", client_meta.get("manufacturer", "")
+                ),
                 "last_username": client_meta.get("last_username", ""),
                 "service_account_family": sa_family,
                 "random_mac": bool(client_meta.get("random_mac", False) or anom.get("random_mac", False)),

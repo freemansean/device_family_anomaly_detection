@@ -126,8 +126,15 @@ DEFAULTS = {
         "anomaly_dbscan_min_samples_pct": {"default": 3, "env": "ANOMALY_DBSCAN_MIN_SAMPLES_PCT", "cast": int},
         # DBSCAN family noise threshold
         "anomaly_dbscan_family_noise_threshold": {"default": 0.5, "env": "ANOMALY_DBSCAN_FAMILY_NOISE_THRESHOLD", "cast": float},
-        # Cosine distance threshold for family flagging (Stage 1b)
-        "anomaly_centroid_dist_threshold": {"default": 0.35, "env": "ANOMALY_CENTROID_DIST_THRESHOLD", "cast": float},
+        # Cosine distance threshold for family flagging (Stage 1b).
+        # Default tuned for the -MFG manufacturer rollup cohort. Per-manufacturer
+        # aggregates are coarser-grained than the old per-fingerprint Centroid
+        # population, which compresses distances — the legacy 0.35 tuning left
+        # unhealthy-but-modestly-distant rollups (e.g. Amazon-MFG at ~0.31
+        # with 20% health) stranded below the threshold. 0.25 restores the
+        # intended signal for the new cohort. Operators can still override
+        # via the GUI (Centroid Config) or env var.
+        "anomaly_centroid_dist_threshold": {"default": 0.25, "env": "ANOMALY_CENTROID_DIST_THRESHOLD", "cast": float},
         # Health threshold for healthy-only centroid reference
         "anomaly_centroid_healthy_ref_threshold": {"default": 0.75, "env": "ANOMALY_CENTROID_HEALTHY_REF_THRESHOLD", "cast": float},
         # Min healthy families for healthy-only reference mode
