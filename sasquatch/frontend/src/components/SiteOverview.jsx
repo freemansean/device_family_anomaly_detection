@@ -99,7 +99,7 @@ export default function SiteOverview({ siteId, apiBase, onMacSelect, onFamilySel
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [lastRefresh, setLastRefresh] = useState(null);
-  const [sortKey, setSortKey] = useState("anomaly");
+  const [sortKey, setSortKey] = useState("count");
   const [sortDir, setSortDir] = useState("desc");
   const [pcaFamilies, setPcaFamilies] = useState(null);
   const [pcaSeeded, setPcaSeeded] = useState(false);

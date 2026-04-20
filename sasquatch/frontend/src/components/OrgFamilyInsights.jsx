@@ -138,7 +138,7 @@ export default function OrgFamilyInsights({ apiBase, refreshToken, onMacSiteSele
   const [loading, setLoading]         = useState(true);
   const [error, setError]             = useState(null);
   const [selectedFamily, setSelectedFamily] = useState(null);
-  const [sortKey, setSortKey]         = useState("anomaly");
+  const [sortKey, setSortKey]         = useState("count");
   const [sortDir, setSortDir]         = useState("desc");
   const [pcaFamilies, setPcaFamilies] = useState(null); // null until seeded from data
   const [pcaSeeded, setPcaSeeded]     = useState(false);
