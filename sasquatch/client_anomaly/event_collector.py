@@ -225,6 +225,11 @@ EVENT_CATEGORIES: dict[str, list[str]] = {
     "AUTH_SUCCESS": [
         "CLIENT_AUTHENTICATED",
         "CLIENT_AUTH_ASSOCIATION",
+        # Standard (non-fast-roam) reassociations still round-trip to the
+        # authentication server, so they count as healthy AUTH activity. Only
+        # PMKC/OKC/11R variants below stay in ROAM_SUCCESS.
+        "CLIENT_AUTH_REASSOCIATION",
+        "CLIENT_REASSOCIATION",
     ],
     "AUTH_FAILURE": [
         "MARVIS_EVENT_CLIENT_AUTH_FAILURE",
@@ -236,10 +241,8 @@ EVENT_CATEGORIES: dict[str, list[str]] = {
     "ROAM_SUCCESS": [
         "CLIENT_AUTH_ASSOCIATION_OKC",
         "CLIENT_AUTH_ASSOCIATION_11R",
-        "CLIENT_AUTH_REASSOCIATION",
         "CLIENT_AUTH_REASSOCIATION_11R",
         "CLIENT_AUTH_REASSOCIATION_OKC",
-        "CLIENT_REASSOCIATION",
         "CLIENT_REASSOCIATION_PMKC",
         "CLIENT_ASSOCIATION_PMKC",
     ],
