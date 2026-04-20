@@ -4,7 +4,7 @@
 
 Client family anomaly detection for Juniper Mist wireless networks. Detects device misbehavior that aggregate metrics miss — clients stuck in DHCP loops, stale PMKIDs causing roam failures, issues with specific chipsets, device families with poor DNS performance, etc. Leverages multiple ML techniques on client event datalakes that have been enriched with device fingerprinting information.
 
-> **New to Sasquatch?** Start with the admin guide — [GUIDE_Unsupervised_Anomaly_Detection.pdf](GUIDE_Unsupervised_Anomaly_Detection.pdf). It walks through every view in the dashboard, the alert / finding lifecycle, and the Config panel knobs in plain language. This README is the operator / developer reference for deploying and extending the platform.
+> **New to Sasquatch?** Start with the admin guide — `GUIDE_Unsupervised_Anomaly_Detection.pdf`, published on OneDrive. It walks through every view in the dashboard, the alert / finding lifecycle, and the Config panel knobs in plain language. This README is the operator / developer reference for deploying and extending the platform.
 
 ---
 
@@ -140,23 +140,6 @@ The variables below are those that must be set in `.env` before starting.
 | Variable | Default | Description |
 |---|---|---|
 | `VITE_API_BASE_URL` | `http://localhost:8000` | Backend URL used by the React frontend at build time. Set via `sasquatch/frontend/.env.production.local` and rebuild the frontend container. |
-
-### Advanced ML Constants
-
-These variables have no GUI equivalent. Most deployments will not need to change them from their defaults.
-
-| Variable | Default | Description |
-|---|---|---|
-| `ANOMALY_IF_N_ESTIMATORS` | `100` | Number of trees in every IsolationForest. More trees = more stable scores at diminishing returns. Increase to 200–500 if scores are noisy across consecutive cycles. |
-| `ANOMALY_RANDOM_STATE` | `42` | Global random seed for all ML components. Fixed integer gives reproducible scores across cycles. Set to `-1` to use a random seed each run. |
-| `ANOMALY_DBSCAN_PCA_VARIANCE` | `0.95` | Fraction of variance PCA must retain when reducing dimensions before DBSCAN. DBSCAN consumes the ~15-dim category vector; PCA typically collapses it to a handful of components at 0.95. Does not affect IsolationForest or the family centroid distance pass — both consume the ~59-dim event vector directly. |
-| `ANOMALY_CENTROID_DIST_THRESHOLD` | `0.35` | Cosine distance (L2-normalized unit vectors) above which a family centroid is flagged as `is_family_outlier`. |
-| `ANOMALY_CENTROID_HEALTHY_REF_THRESHOLD` | `0.75` | Families below this health score are excluded from the centroid reference pool. |
-| `ANOMALY_RSSI_MIN_THRESHOLD` | `-87` | Drop events with RSSI below this floor (dBm), regardless of type. Set to `-120` to disable. |
-| `MARKOV_STUCK_LOOP_THRESHOLD` | `0.4` | Fraction of transitions dominated by one failure pair to flag stuck-loop. |
-| `MARKOV_STUCK_LOOP_MIN_EVENTS` | `20` | Minimum events before stuck-loop detection runs. |
-
-See `sasquatch/client_anomaly/config.py` for the full DEFAULTS map.
 
 ---
 
