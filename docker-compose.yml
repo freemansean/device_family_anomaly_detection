@@ -26,6 +26,9 @@ services:
       # keeps peak RSS well under the limit at a negligible throughput cost
       # for this largely single-threaded pipeline.
       - MALLOC_ARENA_MAX=2
+    mem_limit: 32g
+    mem_reservation: 8g
+    restart: unless-stopped
     volumes:
       - sqlite-data:/unsupervised_anomaly/sqlite
       - logs:/unsupervised_anomaly/logs
