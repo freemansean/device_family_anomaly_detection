@@ -908,6 +908,7 @@ export default function App() {
     setAnomalyConfigDraft(anomalyConfig ? { ...anomalyConfig } : {
       anomaly_if_contamination: 0.05,
       anomaly_dbscan_min_samples_pct: 3,
+      anomaly_org_dbscan_enabled: false,
       anomaly_min_peers: 3,
       anomaly_centroid_dist_threshold: 0.35,
       markov_family_outlier_ratio: 0.5,
@@ -1713,6 +1714,29 @@ export default function App() {
 
               {/* ── DBSCAN ── */}
               <div style={{ color: "#555", fontSize: "10px", letterSpacing: "0.08em", marginBottom: "12px", marginTop: "4px" }}>DBSCAN</div>
+
+              <div style={{ marginBottom: "18px" }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "5px" }}>
+                  <div style={{ color: "#888", fontSize: "11px" }}>ORG-WIDE DBSCAN</div>
+                  <label style={{ display: "inline-flex", alignItems: "center", gap: "8px", cursor: "pointer" }}>
+                    <input
+                      type="checkbox"
+                      checked={!!anomalyConfigDraft.anomaly_org_dbscan_enabled}
+                      onChange={(e) => setAnomalyConfigDraft(d => ({ ...d, anomaly_org_dbscan_enabled: e.target.checked }))}
+                      style={{ accentColor: "#7ec8e3", cursor: "pointer" }}
+                    />
+                    <span style={{ color: "#7ec8e3", fontSize: "13px", fontWeight: "bold" }}>
+                      {anomalyConfigDraft.anomaly_org_dbscan_enabled ? "ON" : "OFF"}
+                    </span>
+                  </label>
+                </div>
+                <div style={{ color: "#e8a53a", fontSize: "11px", marginTop: "4px", lineHeight: "1.5" }}>
+                  ⚠ Warning: org-wide DBSCAN can be memory intensive. On large WLAN populations (tens of thousands of MACs) the neighbor graph has caused out-of-memory crashes in the backend container. Default is <strong>OFF</strong>.
+                </div>
+                <div style={{ color: "#555", fontSize: "11px", marginTop: "4px", lineHeight: "1.5" }}>
+                  When OFF, site-level DBSCAN still runs on every site/WLAN scope — only the org-wide pass in Phase 4 is skipped. The org DBSCAN-or-Markov alarm path degrades to Markov-only at org scope; centroid (is_family_outlier) remains independently sufficient.
+                </div>
+              </div>
 
               <div style={{ marginBottom: "18px" }}>
                 <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: "5px" }}>

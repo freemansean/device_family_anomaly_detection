@@ -126,6 +126,13 @@ DEFAULTS = {
         "anomaly_dbscan_min_samples_pct": {"default": 3, "env": "ANOMALY_DBSCAN_MIN_SAMPLES_PCT", "cast": int},
         # DBSCAN family noise threshold
         "anomaly_dbscan_family_noise_threshold": {"default": 0.5, "env": "ANOMALY_DBSCAN_FAMILY_NOISE_THRESHOLD", "cast": float},
+        # Run DBSCAN during org-wide scoring. OFF by default: the neighbor-graph
+        # memory footprint at org scale (70k+ MACs per WLAN) is the dominant OOM
+        # risk in Phase 4 of detection. Site-level DBSCAN always runs regardless
+        # of this toggle — this controls only score_org_wide(). When OFF the org
+        # DBSCAN-or-Markov alarm path degrades to Markov-only at org scope; the
+        # centroid (is_family_outlier) path is independent and continues to fire.
+        "anomaly_org_dbscan_enabled": {"default": False, "env": "ANOMALY_ORG_DBSCAN_ENABLED", "cast": lambda v: str(v).lower() in ("1", "true", "yes", "on")},
         # Cosine distance threshold for family flagging (Stage 1b).
         # Default tuned for the -MFG manufacturer rollup cohort. Per-manufacturer
         # aggregates are coarser-grained than the old per-fingerprint Centroid

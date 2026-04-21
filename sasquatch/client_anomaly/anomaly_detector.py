@@ -83,7 +83,7 @@ FINDINGS_TTL = 24 * 3600
 HIDDEN_FAMILIES: frozenset[str] = frozenset({"Unknown", "IoT (Unknown)"})
 
 
-def _cfg(key: str) -> int | float:
+def _cfg(key: str) -> int | float | bool | str:
     """Shorthand to read an anomaly-section config value at runtime."""
     return config.get("anomaly", key)
 
@@ -1275,16 +1275,29 @@ async def score_org_wide(
         real_org_family_groups[family].append(key)
 
     # --- Stage 1: DBSCAN across all real org MACs ---
-    # All real composite MACs participate. min_samples + eps are auto-tuned per
-    # run from the population size (see _run_dbscan). The redundant
-    # min_family_size pre-filter has been removed — small-family suppression
-    # is the job of ALARM_MIN_FAMILY_SIZE downstream.
+    # Gated on anomaly_org_dbscan_enabled (default OFF). The neighbor-graph
+    # memory footprint at org scale (70k+ MACs per WLAN) is the dominant OOM
+    # risk in Phase 4 of detection. Site-level DBSCAN in score() is always on;
+    # this toggle controls only the org-wide path. When OFF, every eligible
+    # MAC gets a null DBSCAN result so the downstream merge and per-family
+    # noise-ratio math degrade cleanly to all-False without extra branching.
+    # min_samples + eps auto-tuned per run from population size (see _run_dbscan).
     # sa composite keys are filtered out — see real_org_family_groups comment.
     dbscan_eligible_keys = list(real_composite_macs)
-    dbscan_results_eligible = _run_dbscan(
-        dbscan_eligible_keys,
-        [composite_features[k] for k in dbscan_eligible_keys],
-    )
+    if _cfg("anomaly_org_dbscan_enabled"):
+        dbscan_results_eligible = _run_dbscan(
+            dbscan_eligible_keys,
+            [composite_features[k] for k in dbscan_eligible_keys],
+        )
+    else:
+        log.info(
+            "[org DBSCAN] wlan=%s: skipped (anomaly_org_dbscan_enabled=off); %d MACs would have been scored",
+            wlan, len(dbscan_eligible_keys),
+        )
+        dbscan_results_eligible = {
+            k: {"dbscan_label": None, "is_dbscan_outlier": False}
+            for k in dbscan_eligible_keys
+        }
 
     dbscan_results: dict[str, dict] = {**dbscan_results_eligible}
 

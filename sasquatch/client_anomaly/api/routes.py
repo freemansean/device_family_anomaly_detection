@@ -720,6 +720,11 @@ async def set_anomaly_config(body: dict):
         "markov_min_scoreable_episodes": (1, 100),
         "markov_stuck_loop_min_events": (1, 10000),
     }
+    bool_keys = {
+        # Gates org-wide DBSCAN in score_org_wide(); OFF by default because the
+        # neighbor-graph memory footprint at org scale drives Phase 4 OOM kills.
+        "anomaly_org_dbscan_enabled",
+    }
     for key, (lo, hi) in float_bounds.items():
         if key in body:
             try:
@@ -738,6 +743,17 @@ async def set_anomaly_config(body: dict):
             if not (lo <= v <= hi):
                 raise HTTPException(status_code=400, detail=f"{key} must be between {lo} and {hi}")
             config[key] = v
+    for key in bool_keys:
+        if key in body:
+            raw = body[key]
+            if isinstance(raw, bool):
+                config[key] = raw
+            elif isinstance(raw, str):
+                config[key] = raw.lower() in ("1", "true", "yes", "on")
+            elif isinstance(raw, (int, float)):
+                config[key] = bool(raw)
+            else:
+                raise HTTPException(status_code=400, detail=f"{key} must be a boolean")
 
     _save_config_section("anomaly", config)
     log.info("Anomaly configuration updated by administrator: %s", config)

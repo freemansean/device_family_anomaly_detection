@@ -1007,6 +1007,20 @@ MAC record. These values are stored on anomaly records and used by the
 frontend, but DBSCAN noise ratio no longer determines which families are
 flagged at the family level.
 
+**Org-wide DBSCAN is gated on `anomaly_org_dbscan_enabled` (default OFF).**
+Site-level DBSCAN in `score()` always runs; the toggle controls only the
+org-wide pass in `score_org_wide()`. The gate exists because the neighbor-graph
+memory footprint at org scale (70k+ MACs per WLAN) is the dominant OOM risk in
+Phase 4 of detection — `sklearn.cluster.DBSCAN.fit_predict` on a ~67k-sample
+PCA matrix has caused the backend container to be OOM-killed mid-cycle. When
+the toggle is OFF, every org-wide MAC gets a null DBSCAN result
+(`is_dbscan_outlier = False`, `dbscan_label = None`) so the downstream merge
+and per-family noise-ratio math degrade cleanly to all-False. The org
+DBSCAN-or-Markov alarm path degrades to Markov-only at org scope; the centroid
+(`is_family_outlier`) path is independent and continues to fire. Exposed in
+the GUI under Config → Anomaly Config → DBSCAN with an explicit warning about
+memory cost.
+
 **`is_family_outlier` is set by the inter-family cosine-distance detection step (separate from Stage 2):**
 
 After DBSCAN, a centroid detection pass runs across family-level centroids. For each device
@@ -1993,6 +2007,12 @@ ANOMALY_IF_CONTAMINATION=0.05
 # min_samples = max(3, int(n_clients * pct))
 # eps         = k-distance elbow per run (no env var)
 ANOMALY_DBSCAN_MIN_SAMPLES_PCT=3
+# Gate org-wide DBSCAN in score_org_wide(). Site-level DBSCAN in score()
+# is always on; this controls only the Phase 4 org-wide pass. OFF by default
+# because the neighbor-graph memory footprint at org scale (70k+ MACs per
+# WLAN) drives Phase 4 OOM kills. Expose via Config → Anomaly Config → DBSCAN
+# in the GUI. Accepts 1/true/yes/on (case-insensitive) to enable.
+ANOMALY_ORG_DBSCAN_ENABLED=false
 ANOMALY_MIN_PEERS=5
 # Two-tier per-MAC event-count threshold:
 #   FEATURE_MIN_MAC_EVENTS — floor for entering the feature pool at all
