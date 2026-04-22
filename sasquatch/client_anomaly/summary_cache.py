@@ -3,7 +3,7 @@ summary_cache.py — pre-computed dashboard aggregates.
 
 The hourly poll → detect cycle is the only thing that mutates the data these
 endpoints read from. Between cycles, every request to /org/summary,
-/org/alerts, /org/findings, /org/family-insights, /sites/{id}/findings,
+/org/alerts-full, /org/findings, /org/family-insights, /sites/{id}/findings,
 /sites/{id}/health, and /sites/{id}/events/summary recomputes the same
 aggregate. This module materializes those aggregates into Redis at the tail of
 the detection pipeline so request handlers become a single Redis GET.
@@ -50,10 +50,6 @@ def _org_summary_key(wlan: str) -> str:
 
 def _org_findings_key(wlan: str) -> str:
     return f"{_PREFIX}:org_findings:{sanitize_wlan_key(wlan)}"
-
-
-def _org_alerts_key(wlan: str) -> str:
-    return f"{_PREFIX}:org_alerts:{sanitize_wlan_key(wlan)}"
 
 
 def _org_alerts_full_key() -> str:
@@ -128,17 +124,16 @@ async def flush_org_summary_cache(redis_client: aioredis.Redis) -> int:
 async def flush_site_summary_cache(redis_client: aioredis.Redis, site_id: str) -> int:
     """Delete site-scoped summary cache keys for one site, plus org-level keys.
 
-    Org-level aggregates (org_summary, org_alerts, org_alerts_full,
-    org_family_insights) include this site's contribution, so a per-site flush
-    must invalidate them too — otherwise the org views show stale per-site
-    data until the next detection cycle.
+    Org-level aggregates (org_summary, org_alerts_full, org_family_insights)
+    include this site's contribution, so a per-site flush must invalidate them
+    too — otherwise the org views show stale per-site data until the next
+    detection cycle.
     """
     deleted = 0
     deleted += await _delete_pattern(redis_client, f"{_PREFIX}:site_findings:{site_id}:*")
     deleted += await _delete_pattern(redis_client, f"{_PREFIX}:site_health:{site_id}:*")
     deleted += await _delete_pattern(redis_client, f"{_PREFIX}:site_events_summary:{site_id}:*")
     deleted += await _delete_pattern(redis_client, f"{_PREFIX}:org_summary:*")
-    deleted += await _delete_pattern(redis_client, f"{_PREFIX}:org_alerts:*")
     deleted += await _delete_pattern(redis_client, f"{_PREFIX}:org_alerts_full")
     deleted += await _delete_pattern(redis_client, f"{_PREFIX}:org_family_insights:*")
     return deleted

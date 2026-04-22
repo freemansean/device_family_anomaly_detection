@@ -138,7 +138,6 @@ sasquatch/
 │   ├── markov_analyzer.py       # Markov Chain episode analysis (Stage 4)
 │   ├── health_scorer.py         # Per-family health score (separate from anomaly pipeline)
 │   ├── webhook_dispatcher.py    # Dual-gate alert dispatch (anomaly + health)
-│   ├── alert_tracker.py         # Persistent alert session history (7-day, per-site)
 │   ├── client_summary_builder.py # Materialised per-(mac, site, wlan) summary table builder (Phase 5b)
 │   ├── summary_cache.py         # Pre-computed dashboard aggregates (org/site overview, alerts, findings)
 │   ├── scheduler.py             # APScheduler job definitions
@@ -149,8 +148,8 @@ sasquatch/
 │   └── src/
 │       ├── components/
 │       │   ├── SiteOverview.jsx         # Heatmap: event categories × device types + health column
-│       │   ├── OrgOverview.jsx          # Org four-tab shell: Org Alerts (default), Org Overview, Org Family Insights, Findings
-│       │   ├── OrgAlerts.jsx            # Default org view: org-wide + per-site dual-gate alerts with family drilldown
+│       │   ├── OrgOverview.jsx          # Org four-tab shell: Full Alert Summary (default), Org Overview, Org Family Insights, Findings
+│       │   ├── OrgAlerts.jsx            # Full Alert Summary: cross-WLAN org-wide + per-site dual-gate alerts with family drilldown
 │       │   ├── OrgFamilyInsights.jsx    # Org-wide family heatmap + health column
 │       │   ├── FindingsFeed.jsx         # Site findings: IF CENTROID → DBSCAN % → MARKOV % → HEALTH sections
 │       │   ├── OrgFindingsFeed.jsx      # Org findings: same detector-section layout, family name drills down to OrgFamilyDrilldown
@@ -348,12 +347,8 @@ migrations idempotent and additive.
 | `sasquatch:findings:{site_id}:{wlan_key}` | 24hr | JSON array: rolled-up findings for GUI + webhook |
 | `sasquatch:org_anomalies:{site_id}:{wlan_key}` | 24hr | JSON dict: per-MAC org-wide scores (written by `score_org_wide`) |
 | `sasquatch:org_findings:{wlan_key}` | 24hr | JSON array: org-wide findings (one entry per device family across all sites) |
-| `sasquatch:alert_active:{site_id}:{wlan_key}` | none (managed explicitly) | Hash: family → `{first_seen, last_seen}` for currently-active alert sessions |
-| `sasquatch:alert_sessions` | none (pruned on write) | Sorted set: session keys scored by `first_seen` unix timestamp; entries older than 8 days are pruned each cycle |
-| `sasquatch:alert_session:{session_key}` | 8 days | JSON: `{site_id, family, wlan, first_seen, last_seen, resolved_at, status}` for one alert session |
 | `sasquatch:summary:org_summary:{wlan_key}` | 2hr | Pre-computed `/org/summary` response (see `summary_cache.py`) |
 | `sasquatch:summary:org_findings:{wlan_key}` | 2hr | Pre-computed `/org/findings` response |
-| `sasquatch:summary:org_alerts:{wlan_key}` | 2hr | Pre-computed `/org/alerts` response |
 | `sasquatch:summary:org_alerts_full` | 2hr | Pre-computed `/org/alerts-full` response (cross-WLAN, no wlan dimension) |
 | `sasquatch:summary:org_family_insights:{wlan_key}` | 2hr | Pre-computed `/org/family-insights` response |
 | `sasquatch:summary:site_findings:{site_id}:{wlan_key}` | 2hr | Pre-computed `/sites/{id}/findings` response |
@@ -1487,8 +1482,8 @@ key always matches the virtual-family membership).
 
    The shared helper `webhook_dispatcher.family_passes_dbscan_markov_gate(finding,
    ratio)` implements both branches and is imported by `routes.py` so
-   `get_org_alerts`, `get_org_summary`, and `get_org_alerts_full` use the exact
-   same gate as the webhook dispatcher.
+   `get_org_summary` and `get_org_alerts_full` use the exact same gate as
+   the webhook dispatcher.
 2. **Health gate** — `family health_score < ANOMALY_HEALTH_SCORE_THRESHOLD` **OR**
    the service-alarm device-percentage gate fires (`alarm_service_device_pct` of
    the family's MACs have individually tripped a service alarm). Confirms the
@@ -1624,41 +1619,6 @@ lookup — NO LLM (rule-based only, no network calls). Evaluated in priority ord
 **Retry logic:** 3 attempts with exponential backoff (1s, 2s, 4s). Log failures.
 Do not raise exceptions that would kill the scheduler job on webhook failure.
 
-**Alert history tracking:** After computing `qualifying`, `evaluate_and_dispatch` calls
-`alert_tracker.record_cycle(site_id, wlan, active_findings)` regardless of whether
-`ANOMALY_WEBHOOK_URL` is configured, so history is always recorded. An empty `active_findings`
-set resolves any previously-active sessions for that WLAN. Skipped for `org_scope=True`
-since org findings are composite cross-site records, not single-site events.
-
----
-
-### `alert_tracker.py`
-
-**Purpose:** Track contiguous alert sessions — periods where a device family at a site
-continuously passes the dual gate (is_family_outlier + health_score < threshold).
-
-**Called by:** `webhook_dispatcher.evaluate_and_dispatch()` after every successful
-detection cycle. Must not raise — failures are logged and swallowed.
-
-**Session lifecycle:**
-- A session opens when a family first appears in `qualifying` for a site.
-- Each subsequent cycle where the family is still qualifying extends `last_seen`.
-- A session closes (`resolved_at = now`) when a successful cycle completes with the
-  family absent from `qualifying`. Absence after a failed/skipped cycle does NOT close
-  the session — only a successful cycle with explicit absence does.
-
-**Key design notes:**
-- `last_seen` is updated every cycle; `resolved_at` is only written on explicit resolution.
-  This prevents a scheduler restart or missed cycle from falsely closing active sessions.
-- Sessions that span multiple UTC days appear in each day in the history API, with
-  `window_start`/`window_end` clipped to each day's boundaries.
-- Org-scope (`org_scope=True`) is not tracked — org findings are composites; per-site
-  tracking captures the same signal at the site level.
-
-**Key functions:**
-- `record_cycle(site_id, wlan, active_families, redis_client=None)` — write path, called each cycle
-- `get_recent_sessions(days, wlan, redis_client=None)` — read path, called by history API
-
 ---
 
 ### `summary_cache.py`
@@ -1669,9 +1629,9 @@ Redis GET between detection cycles. Polling cadence on those pages is 30–60s;
 detection runs hourly; without this layer the same expensive aggregation
 runs ~60–120 times per real data change.
 
-**Cached endpoints** (covered by 8 corresponding `build_*` functions in
+**Cached endpoints** (covered by 7 corresponding `build_*` functions in
 `api/routes.py`):
-- `/org/summary`, `/org/findings`, `/org/alerts`, `/org/alerts-full`,
+- `/org/summary`, `/org/findings`, `/org/alerts-full`,
   `/org/family-insights`
 - `/sites/{id}/findings`, `/sites/{id}/health`, `/sites/{id}/events/summary`
 
@@ -1846,12 +1806,9 @@ GET  /api/v1/org/clients/search-drilldown?mac_prefix= → cross-site / cross-WLA
                                                        backed by client_summary with a LIKE on idx_summary_mac. Mirrors
                                                        /org/families/search-drilldown — same response shape, rendered by
                                                        OrgFamilyDrilldown in macSearchQuery mode
-GET  /api/v1/org/alerts                              → org-wide alerts + per-site alerts in one response;
-                                                       org_alerts = org findings with health_score < 0.75;
-                                                       site_alerts = per-site findings × per-site health, grouped by site
-GET  /api/v1/org/alert-history?days=7&wlan={ssid}    → alert session history grouped by UTC day; sessions spanning
-                                                       multiple days appear in each day with window clipped to day
-                                                       boundaries; response: {days: [{date, label, alarms: [...]}]}
+GET  /api/v1/org/alerts-full                         → cross-WLAN org-wide + per-site alerts in one response;
+                                                       each alert carries a `wlan` tag so the UI disambiguates;
+                                                       backs the "Full Alert Summary" tab
 GET  /api/v1/org/findings                            → org-wide findings (cross-site scoring)
 GET  /api/v1/org/family-insights                     → per-family heatmap + health scores org-wide
 GET  /api/v1/org/families/{family}/drilldown         → per-MAC drilldown for a family across all sites
@@ -1935,15 +1892,14 @@ computed as a mac_count-weighted average of per-site health scores across all si
 - Health score is cross-referenced from the separately-fetched health endpoint by `device_family` — do NOT rely on `health_score` embedded on the finding object, as per-site findings in Redis may not carry it
 - Data source: `/api/v1/sites/{site_id}/findings` + `/api/v1/sites/{site_id}/health` (parallel fetch)
 
-**4. Org Alerts (`OrgAlerts.jsx`) — default org view**
+**4. Full Alert Summary (`OrgAlerts.jsx`) — default org view**
 - **Default tab** shown when the user selects Organization in the site picker.
+- Cross-WLAN aggregation: every alert across every WLAN in the retention window lands in one feed. Each card carries a WLAN badge so the SSID is unambiguous.
 - Two sections rendered top-to-bottom: **ORG-WIDE ALERTS** → **SITE ALERTS**
-  - **ORG-WIDE ALERTS**: org findings (from `sasquatch:org_findings:{wlan}`, cross-site scoring) where `health_score < 0.75`. Each card shows severity, outlier ratio, device count, health score, failure category breakdown, pattern label, and top contributing features. Family name is a clickable link that opens `OrgFamilyDrilldown` in-place.
+  - **ORG-WIDE ALERTS**: org findings (from `sasquatch:org_findings:{wlan}` across all WLANs, cross-site scoring) that pass the dual alarm gate. Each card shows severity, outlier ratio, device count, health score, failure category breakdown, pattern label, and top contributing features. Family name is a clickable link that opens `OrgFamilyDrilldown` in-place.
   - **SITE ALERTS**: per-site findings cross-referenced with per-site health, grouped by site. Only sites with ≥ 1 alert are shown. Family name opens `FamilyDrilldown` (site-scoped) in-place.
-- Each alert card shows a **WLAN/SSID badge** (green pill) after the pattern label, sourced from `finding.wlan` (detection always runs scoped to a specific SSID).
-- WLAN dropdown scopes both sections via `?wlan=` query param.
 - No example MACs on cards — click the family name to drilldown instead.
-- Auto-refreshes every 30s. Data source: `GET /api/v1/org/alerts?wlan=`
+- Auto-refreshes every 30s. Data source: `GET /api/v1/org/alerts-full` (no `wlan=` query param — cross-WLAN).
 
 **5. Org Findings Feed (`OrgFindingsFeed.jsx`) — org context**
 - Same three-section layout as site Findings Feed (ALERT → HEALTH → ANOMALOUS)
@@ -1955,8 +1911,8 @@ computed as a mac_count-weighted average of per-site health scores across all si
 - Data source: `/api/v1/org/findings` + `/api/v1/org/family-insights` (parallel fetch)
 
 **6. Org Overview (`OrgOverview.jsx`)**
-- Four tabs, left-to-right: **Org Alerts** (default, red accent), **Org Overview**, **Org Family Insights**, **Findings**
-- "Org Alerts" tab styled with red border/background (`#e05555`) to distinguish it from the blue-accented tabs.
+- Four tabs, left-to-right: **Full Alert Summary** (default, red accent), **Org Overview**, **Org Family Insights**, **Findings**
+- "Full Alert Summary" tab styled with red border/background (`#e05555`) to distinguish it from the blue-accented tabs.
 - **Org Overview tab**: Site cards only — no embedded PCA. The org PCA lives
   inside the Org Family Insights tab where the table-driven family selection
   can control it. Cards sorted by `event_count` descending (highest-traffic sites first); sites with no data sort to the bottom. Site card alert state uses the dual-gate: a site is "Alert" (red) only when `alert_count > 0`.
@@ -2046,7 +2002,7 @@ ANOMALY_HEALTH_SCORE_THRESHOLD=0.20
 ALARM_SERVICE_DEVICE_PCT=0.70
 
 # Alarm suppression — skip findings whose total family MAC count is below this floor.
-# Applies to webhook dispatch AND UI alert feeds (/org/alerts, /org/summary).
+# Applies to webhook dispatch AND UI alert feeds (/org/alerts-full, /org/summary).
 # Default 10 suppresses families smaller than 10 MACs; set to 1 to disable
 # suppression and let every family through. Findings below the floor still
 # appear in the main findings UI — only alerting is muted.
@@ -2247,7 +2203,6 @@ Tracked so future edits don't accidentally regress these. Full context in [TODO.
 - Both Mist paginators ([event_collector.iter_events_org](sasquatch/client_anomaly/event_collector.py), [client_cache.fetch_all_clients_org](sasquatch/client_anomaly/client_cache.py)) enforce a hard `_MAX_PAGES` ceiling (20k / 10k) and wrap `resp.json()` in an explicit `JSONDecodeError` branch. Protects against circular `next` cursors and HTML error pages.
 - `db.get_events` decodes `raw_json` row-by-row with a `(JSONDecodeError, TypeError)` guard. A single corrupt row logs and is skipped rather than crashing every downstream consumer.
 - Webhook dispatch is crash-isolated from its auxiliary steps:
-  - `alert_tracker.record_cycle()` is wrapped in `try/except Exception` ([webhook_dispatcher.py:483-495](sasquatch/client_anomaly/webhook_dispatcher.py#L483-L495)). Alert history is best-effort; the outbound POST is load-bearing.
   - TSHOOT enrichment uses `asyncio.gather(..., return_exceptions=True)` ([webhook_dispatcher.py:515-530](sasquatch/client_anomaly/webhook_dispatcher.py#L515-L530)) and converts per-MAC failures to empty `tshoot_results`. One bad MAC cannot crash the dispatch.
 - `_GLOBAL_LOCK_TTL_SECONDS` is 6h ([scheduler.py:46](sasquatch/client_anomaly/scheduler.py#L46)) — long enough to cover a full 12hr multi-million-event collect. `clear_stale_global_lock()` at startup handles the crash-before-release case; the TTL is the backstop.
 

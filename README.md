@@ -229,9 +229,7 @@ GET  /api/v1/sites/{site_id}/anomalies/{mac}
 GET  /api/v1/sites/{site_id}/families/{family}/if-outliers
 GET  /api/v1/org/sites
 GET  /api/v1/org/summary
-GET  /api/v1/org/alerts
 GET  /api/v1/org/alerts-full
-GET  /api/v1/org/alert-history
 GET  /api/v1/org/findings
 GET  /api/v1/org/family-insights
 GET  /api/v1/org/families/{family}/drilldown
@@ -305,7 +303,6 @@ unsupervised_anomaly/
 │   │   ├── markov_analyzer.py        # Markov Chain episode + stuck-loop analysis
 │   │   ├── health_scorer.py          # Per-family failure rate scoring (independent)
 │   │   ├── webhook_dispatcher.py     # Composite-gate alert dispatch + TSHOOT enrichment
-│   │   ├── alert_tracker.py          # Persistent alert-session history
 │   │   ├── client_summary_builder.py # Materialized per-(mac, site, wlan) rollup
 │   │   ├── summary_cache.py          # Pre-computed dashboard aggregates
 │   │   ├── scheduler.py              # APScheduler jobs + global mutex

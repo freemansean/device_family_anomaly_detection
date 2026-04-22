@@ -66,7 +66,6 @@ from ..scheduler import (
     run_org_pipeline,
     set_auto_detect_enabled,
 )
-from .. import alert_tracker
 from ..webhook_dispatcher import evaluate_and_dispatch, run_family_tshoot
 
 log = logging.getLogger(__name__)
@@ -1481,149 +1480,6 @@ async def get_org_findings_endpoint(wlan: str = Query(..., min_length=1, descrip
         await redis_client.aclose()
 
 
-async def build_org_alerts(redis_client, site_map: dict[str, str], wlan: str) -> dict:
-    """
-    Build the /org/alerts response from Redis state. Pure aggregator — no
-    Mist API calls. Called by the route handler (cache miss path) and the
-    pipeline writer (post-detection cache fill).
-    """
-    from ..webhook_dispatcher import (
-        family_passes_dbscan_markov_gate,
-        get_alarm_dbscan_markov_ratio,
-        get_alarm_min_family_size,
-        get_alarm_service_device_pct,
-        get_alarm_health_combine,
-        get_health_score_threshold,
-        health_gate_passes,
-    )
-    _ALERT_HEALTH_THRESHOLD = get_health_score_threshold()
-    _ALARM_MIN_FAMILY_SIZE = int(get_alarm_min_family_size())
-    _ALARM_SERVICE_DEVICE_PCT = float(get_alarm_service_device_pct())
-    _ALARM_DBSCAN_MARKOV_RATIO = float(get_alarm_dbscan_markov_ratio())
-    _ALARM_HEALTH_COMBINE = get_alarm_health_combine()
-
-    sites_sorted = sorted(site_map.items(), key=lambda x: x[1].lower())
-    pipe = redis_client.pipeline()
-    for sid, _ in sites_sorted:
-        pipe.get(_findings_redis_key(sid, wlan))
-        pipe.get(_health_redis_key(sid, wlan))
-    pipe.get(_org_findings_redis_key(wlan))
-    pipeline_results = await pipe.execute()
-
-    n = len(sites_sorted)
-    findings_by_site = {
-        sid: (json.loads(pipeline_results[i * 2]) if pipeline_results[i * 2] else [])
-        for i, (sid, _) in enumerate(sites_sorted)
-    }
-    health_by_site = {
-        sid: (json.loads(pipeline_results[i * 2 + 1]) if pipeline_results[i * 2 + 1] else {})
-        for i, (sid, _) in enumerate(sites_sorted)
-    }
-    raw_org = pipeline_results[n * 2]
-    org_findings = json.loads(raw_org) if raw_org else []
-
-    # Org-wide alerts: family must qualify via the centroid OR the
-    # DBSCAN-or-Markov rollup gate, AND be unhealthy by health score or
-    # service-alarm device-pct, AND meet the alarm_min_family_size floor.
-    # Mirrors webhook_dispatcher.evaluate_and_dispatch.
-    org_alerts = [
-        f for f in org_findings
-        if family_passes_dbscan_markov_gate(f, _ALARM_DBSCAN_MARKOV_RATIO)
-        and health_gate_passes(
-            f.get("health_score", 1.0) < _ALERT_HEALTH_THRESHOLD,
-            (
-                len(f.get("service_alarms") or []) > 0
-                and float(f.get("mac_alarm_ratio", 0.0) or 0.0) >= _ALARM_SERVICE_DEVICE_PCT
-            ),
-            _ALARM_HEALTH_COMBINE,
-        )
-        and (f.get("total_mac_count", 0) or 0) >= _ALARM_MIN_FAMILY_SIZE
-    ]
-    for f in org_alerts:
-        for sa in f.get("sites_affected", []):
-            sa["site_name"] = site_map.get(sa["site_id"], sa["site_id"])
-
-    # Per-site alerts: per-site findings cross-referenced with per-site health.
-    # Same gate as org_alerts above.
-    site_alerts = []
-    for sid, site_name in sites_sorted:
-        findings = findings_by_site[sid]
-        health = health_by_site[sid]
-        alerts = []
-        for f in findings:
-            if not family_passes_dbscan_markov_gate(f, _ALARM_DBSCAN_MARKOV_RATIO):
-                continue
-            family_health = health.get(f.get("device_family"), {})
-            fam_health_score = family_health.get("health_score", 1.0)
-            fam_service_alarms = family_health.get("service_alarms") or []
-            fam_mac_alarm_ratio = float(family_health.get("mac_alarm_ratio", 0.0) or 0.0)
-            unhealthy_by_score = fam_health_score < _ALERT_HEALTH_THRESHOLD
-            unhealthy_by_service = (
-                len(fam_service_alarms) > 0
-                and fam_mac_alarm_ratio >= _ALARM_SERVICE_DEVICE_PCT
-            )
-            if (
-                health_gate_passes(unhealthy_by_score, unhealthy_by_service, _ALARM_HEALTH_COMBINE)
-                and (f.get("total_mac_count", 0) or 0) >= _ALARM_MIN_FAMILY_SIZE
-            ):
-                alerts.append({
-                    **f,
-                    "health_score": fam_health_score,
-                    "health_components": family_health.get("components"),
-                    "service_alarms": fam_service_alarms,
-                    "service_health": family_health.get("service_health") or {},
-                    "mac_alarm_ratio": fam_mac_alarm_ratio,
-                })
-        if alerts:
-            site_alerts.append({
-                "site_id": sid,
-                "site_name": site_name,
-                "alerts": alerts,
-            })
-
-    return {
-        "org_alerts": org_alerts,
-        "site_alerts": site_alerts,
-        "wlan": wlan,
-    }
-
-
-@router.get("/org/alerts")
-async def get_org_alerts(wlan: str = Query(..., min_length=1, description="WLAN (SSID) name to scope results to. Required.")):
-    """
-    Return org-wide alerts AND per-site alerts in a single response.
-
-    Org-wide alerts: org findings (cross-site scoring) where health_score < 0.75.
-    Site alerts: per-site findings where the family health_score < 0.75, grouped by site.
-    Only sites with at least one alert are included in site_alerts.
-
-    All data is read from Redis — no real-time Mist API calls.
-
-    Cache-first: pre-computed by the detection pipeline tail. On miss, the
-    response is built live and the cache is opportunistically populated.
-    """
-    if not MIST_ORG_ID or not MIST_API_TOKEN:
-        raise HTTPException(status_code=500, detail="MIST_ORG_ID or MIST_API_TOKEN not configured.")
-
-    redis_client = _get_redis()
-    try:
-        cache_key = summary_cache._org_alerts_key(wlan)
-        cached = await summary_cache.cache_get(redis_client, cache_key)
-        if cached is not None:
-            return cached
-
-        try:
-            site_map = await _get_org_site_map(redis_client)
-        except Exception:
-            raise HTTPException(status_code=502, detail="Could not reach Mist API")
-
-        response = await build_org_alerts(redis_client, site_map, wlan)
-        await summary_cache.cache_set(redis_client, cache_key, response)
-        return response
-    finally:
-        await redis_client.aclose()
-
-
 async def build_org_alerts_full(redis_client, site_map: dict[str, str]) -> dict:
     """
     Build the /org/alerts-full response from Redis state. Pure aggregator —
@@ -1787,160 +1643,6 @@ async def get_org_alerts_full():
         await redis_client.aclose()
 
 
-@router.get("/org/alert-history")
-async def get_org_alert_history(
-    wlan: str = Query(..., min_length=1, description="WLAN (SSID) name to scope results to. Required."),
-    days: int = Query(7, ge=1, le=30),
-    tz_offset: int = Query(0, description="Browser timezone offset in minutes (JS getTimezoneOffset())"),
-):
-    """
-    Return alert session history for the past N days (default 7), grouped by UTC day.
-
-    Each session represents a contiguous period where a device family at a specific site
-    passed the dual alert gate (is_family_outlier + health_score < threshold).
-
-    Sessions that span multiple days appear in each day they were active, with
-    window_start/window_end clipped to that day's UTC boundaries.
-
-    Response shape:
-      {
-        "days": [
-          {
-            "date": "2026-04-06",
-            "label": "Today" | "Yesterday" | "Mon Apr 5",
-            "alarms": [
-              {
-                "family": str,
-                "site_id": str,
-                "site_name": str,
-                "wlan": str,
-                "window_start": ISO8601,  // clipped to this day's UTC boundaries
-                "window_end":   ISO8601,  // last_seen if active, resolved_at if resolved
-                "status": "active" | "resolved",
-                "session_first_seen": ISO8601,  // actual alarm start (may be earlier day)
-                "total_duration_seconds": int   // full session length so far
-              }
-            ]
-          }
-        ],
-        "total_sessions": int
-      }
-    """
-    from datetime import timedelta
-
-    if not MIST_ORG_ID or not MIST_API_TOKEN:
-        raise HTTPException(status_code=500, detail="MIST_ORG_ID or MIST_API_TOKEN not configured.")
-
-    redis_client = _get_redis()
-    try:
-        try:
-            site_map = await _get_org_site_map(redis_client)
-        except Exception:
-            raise HTTPException(status_code=502, detail="Could not reach Mist API")
-
-        sessions = await alert_tracker.get_recent_sessions(days=days, wlan=wlan, redis_client=redis_client)
-    finally:
-        await redis_client.aclose()
-
-    now_ts = _time.time()
-
-    # Build day buckets for the past `days` days in the browser's local timezone, newest first.
-    # tz_offset is JS getTimezoneOffset(): minutes *behind* UTC (EDT=+240, UTC+5:30=-330).
-    local_offset_sec = -tz_offset * 60  # convert to seconds ahead of UTC
-    local_tz = timezone(timedelta(seconds=local_offset_sec))
-    today_local = datetime.now(local_tz).replace(hour=0, minute=0, second=0, microsecond=0)
-    day_buckets: list[dict] = []
-    for offset in range(days):
-        day_start_dt = today_local - timedelta(days=offset)
-        day_end_dt   = day_start_dt + timedelta(days=1)
-        day_start_ts = day_start_dt.timestamp()
-        day_end_ts   = day_end_dt.timestamp()
-
-        if offset == 0:
-            label = "Today"
-        elif offset == 1:
-            label = "Yesterday"
-        else:
-            label = day_start_dt.strftime("%a %b") + " " + str(day_start_dt.day)
-
-        day_buckets.append({
-            "date":  day_start_dt.strftime("%Y-%m-%d"),  # local date
-            "label": label,
-            "day_start_ts": day_start_ts,
-            "day_end_ts":   day_end_ts,
-            "alarms": [],
-        })
-
-    # Expand each session across the days it spans.
-    for session in sessions:
-        s_start = session.get("first_seen", 0)
-        s_end   = session.get("resolved_at") or session.get("last_seen") or now_ts
-        status  = session.get("status", "resolved")
-        family  = session.get("family", "")
-        site_id = session.get("site_id", "")
-        site_name = site_map.get(site_id, site_id)
-        total_duration = int(s_end - s_start)
-
-        for bucket in day_buckets:
-            d_start = bucket["day_start_ts"]
-            d_end   = bucket["day_end_ts"]
-
-            # Session overlaps with this day
-            if s_start >= d_end or s_end <= d_start:
-                continue
-
-            window_start = max(s_start, d_start)
-            window_end   = min(s_end, d_end)
-
-            # For today's active alarms, extend window_end to now so it reflects
-            # the live duration rather than the last detection cycle timestamp.
-            if status == "active" and d_start <= now_ts < d_end:
-                window_end = min(now_ts, d_end)
-
-            bucket["alarms"].append({
-                "family": family,
-                "site_id": site_id,
-                "site_name": site_name,
-                "wlan": session.get("wlan", wlan),
-                "window_start": datetime.fromtimestamp(window_start, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                "window_end":   datetime.fromtimestamp(window_end,   tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                "status": status,
-                "session_first_seen": datetime.fromtimestamp(s_start, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                "total_duration_seconds": total_duration,
-                # Finding snapshot fields — populated from the last detection cycle
-                "severity":           session.get("severity"),
-                "outlier_ratio":      session.get("outlier_ratio"),
-                "affected_mac_count": session.get("affected_mac_count"),
-                "total_mac_count":    session.get("total_mac_count"),
-                "health_score":       session.get("health_score"),
-                "health_components":  session.get("health_components") or {},
-                "probable_pattern":   session.get("probable_pattern"),
-                "top_features":       session.get("top_features") or [],
-                "predominant_wlan":   session.get("predominant_wlan"),
-            })
-
-    # Sort alarms within each day: active first, then by window_start ascending.
-    for bucket in day_buckets:
-        bucket["alarms"].sort(key=lambda a: (a["status"] != "active", a["window_start"]))
-
-    # Drop the internal timestamp fields before returning; drop empty days.
-    result_days = []
-    for bucket in day_buckets:
-        if not bucket["alarms"]:
-            continue
-        result_days.append({
-            "date":   bucket["date"],
-            "label":  bucket["label"],
-            "alarms": bucket["alarms"],
-        })
-
-    return {
-        "days": result_days,
-        "total_sessions": len(sessions),
-        "wlan": wlan,
-    }
-
-
 async def build_org_family_insights(redis_client, site_map: dict[str, str], wlan: str) -> dict:
     """
     Build the /org/family-insights response from Redis state. Pure aggregator —
@@ -2008,6 +1710,14 @@ async def build_org_family_insights(redis_client, site_map: dict[str, str], wlan
         if cnt is not None:
             org_family_dbscan_site_count[fam] = cnt
 
+    # Distinct-MAC rollup across device_family / SA / MFG for this WLAN, pulled
+    # from client_summary. Overrides the roaming-inflated per-site sums below
+    # for the operator-visible `client_count` and top-level `health_score`.
+    distinct_rollup = await db.distinct_mac_family_rollup(wlan)
+    family_distinct: dict[str, dict] = {}
+    for bucket in distinct_rollup.values():
+        family_distinct.update(bucket)
+
     family_event_counts: dict[str, Counter] = defaultdict(Counter)
     family_total_events: Counter = Counter()
     family_worst_severity: dict[str, str] = {}
@@ -2016,6 +1726,8 @@ async def build_org_family_insights(redis_client, site_map: dict[str, str], wlan
     family_worst_markov_ratio: dict[str, float] = {}
     family_site_count: Counter = Counter()
     # mac_count is summed across sites (same device at multiple sites counted once per site).
+    # Retained for the per-service alarm rollup below; the user-facing client_count
+    # switches to the distinct-MAC rollup loaded above.
     family_mac_count: Counter = Counter()
     # Health score aggregation: weighted sum and total weight per family for averaging
     family_health_weighted_sum: dict[str, float] = defaultdict(float)
@@ -2101,10 +1813,9 @@ async def build_org_family_insights(redis_client, site_map: dict[str, str], wlan
     for family, cat_counts in family_event_counts.items():
         total = family_total_events[family]
         health_weight = family_health_weight_total.get(family, 0.0)
-        health_score = (
-            round(family_health_weighted_sum[family] / health_weight, 4)
-            if health_weight > 0 else None
-        )
+        # Per-category health components stay on the per-site weighted average
+        # (health_components is a roaming-insensitive ratio of ratios). Only the
+        # top-level client_count and health_score swap to the distinct-MAC rollup.
         health_components = (
             {
                 comp: round(family_health_components_sum[family][comp] / health_weight, 4)
@@ -2112,6 +1823,19 @@ async def build_org_family_insights(redis_client, site_map: dict[str, str], wlan
             }
             if health_weight > 0 else None
         )
+        distinct_entry = family_distinct.get(family)
+        if distinct_entry is not None:
+            client_count = distinct_entry["client_count"]
+            health_score = distinct_entry["health_score"]
+        else:
+            # Family appears in per-site event counts but has no client_summary
+            # rows yet (summary not rebuilt or family dropped out). Fall back to
+            # the old per-site-sum so the row still renders with something.
+            client_count = family_mac_count[family]
+            health_score = (
+                round(family_health_weighted_sum[family] / health_weight, 4)
+                if health_weight > 0 else None
+            )
         # Org-wide service rollup: alarm fires when summed unhealthy/active > threshold.
         svc_active_map = family_svc_active.get(family, {})
         svc_unhealthy_map = family_svc_unhealthy.get(family, {})
@@ -2142,7 +1866,7 @@ async def build_org_family_insights(redis_client, site_map: dict[str, str], wlan
             "service_account_label": family[: -len(".service_account")] if is_sa else "",
             "mfg_rollup_label": family[: -len("-MFG")] if is_mfg else "",
             "total_events": total,
-            "client_count": family_mac_count[family],
+            "client_count": client_count,
             "site_count": family_site_count[family],
             "worst_severity": family_worst_severity.get(family),
             "worst_dbscan_severity": org_family_dbscan_severity.get(family),
@@ -2600,6 +2324,86 @@ async def get_org_family_drilldown_all_wlans(
     }
 
 
+async def _apply_org_overlay(rows: list[dict]) -> tuple[int, int]:
+    """
+    Overlay org-wide IF/DBSCAN/Centroid flags onto drilldown rows in place.
+
+    Reads ``sasquatch:org_anomalies:{site}:{wlan}`` for every (site, wlan)
+    pair referenced in ``rows``, then replaces ``is_if_outlier``,
+    ``is_dbscan_outlier``, ``if_score``, and ``is_family_outlier`` on each
+    row with the org-scored value. Rows whose (site, wlan) has no org
+    anomaly record, or whose MAC is absent from it, get the same fields
+    wiped to null/False so the UI doesn't mix site-scoped flags into an
+    org-scope view. Returns ``(if_outlier_count, dbscan_outlier_count)``
+    tallied from the overlaid rows.
+    """
+    if not rows:
+        return 0, 0
+    scope_pairs = sorted({(r["site_id"], r.get("wlan", "")) for r in rows if r.get("site_id")})
+    org_redis = _get_redis()
+    try:
+        pipe = org_redis.pipeline()
+        for sid, wl in scope_pairs:
+            pipe.get(_org_anomalies_redis_key(sid, wl))
+        raw_results = await pipe.execute()
+    finally:
+        await org_redis.aclose()
+
+    org_anom_by_scope: dict[tuple[str, str], dict] = {}
+    for (sid, wl), raw in zip(scope_pairs, raw_results):
+        if not raw:
+            continue
+        try:
+            org_anom_by_scope[(sid, wl)] = json.loads(raw)
+        except Exception:
+            continue
+
+    for r in rows:
+        scope_key = (r.get("site_id", ""), r.get("wlan", ""))
+        anom_map = org_anom_by_scope.get(scope_key)
+        rec = anom_map.get(r["mac"]) if anom_map else None
+        if not rec:
+            r["is_if_outlier"] = False
+            r["is_dbscan_outlier"] = False
+            r["if_score"] = None
+            r["is_family_outlier"] = False
+            continue
+        r["is_if_outlier"] = bool(rec.get("is_if_outlier", False))
+        r["is_dbscan_outlier"] = bool(rec.get("is_dbscan_outlier", False))
+        r["if_score"] = rec.get("if_score")
+        r["is_family_outlier"] = bool(rec.get("is_family_outlier", False))
+
+    if_outlier_count = sum(1 for r in rows if r.get("is_if_outlier"))
+    dbscan_outlier_count = sum(1 for r in rows if r.get("is_dbscan_outlier"))
+    return if_outlier_count, dbscan_outlier_count
+
+
+# Sort columns whose backing value changes when the org overlay replaces
+# site-scoped values with org-scored ones. When the user asks to sort by
+# one of these AND scope="org", the SQL ORDER BY (which runs against the
+# site-local SQLite column) would lock a row order that no longer matches
+# the values the UI displays after overlay. The fix is to fetch without
+# that ORDER BY, overlay, then sort the resulting row list in Python
+# before paginating. Today only ``if_score`` is both sortable and
+# overlaid; the boolean flag columns aren't exposed as sort keys.
+_ORG_OVERLAY_SORT_KEYS = frozenset({"if_score"})
+
+
+def _sort_rows_by_if_score(rows: list[dict], sort_dir: str | None) -> None:
+    """Stable in-place sort matching SQL ``ORDER BY if_score IS NULL, if_score``.
+
+    Nulls land last under ASC (same behavior as the SQL path); DESC flips
+    both the null position and the numeric order.
+    """
+    descending = sort_dir == "desc"
+    rows.sort(
+        key=lambda r: (
+            r.get("if_score") is None,
+            -(r.get("if_score") or 0.0) if descending else (r.get("if_score") or 0.0),
+        ),
+    )
+
+
 @router.get("/org/families/search-drilldown")
 async def search_families_drilldown(
     q: str = Query(..., description="Substring to match against device family names (case-insensitive)"),
@@ -2647,14 +2451,26 @@ async def search_families_drilldown(
         raise HTTPException(status_code=404, detail=f"No events found for families matching '{q}' across any site.")
 
     offset = (page - 1) * page_size
-    order = _resolve_drilldown_order(sort, sort_dir)
-    summary_rows = await db.query_client_summary(
-        family_substring=norm,
-        filter_tags=resolved_tags,
-        order_by=order,
-        limit=page_size,
-        offset=offset,
-    )
+    use_org_overlay_sort = scope == "org" and sort in _ORG_OVERLAY_SORT_KEYS
+    if use_org_overlay_sort:
+        # Sort is against an overlaid column: fetch the full match set without
+        # the (now-stale) SQL ORDER BY, overlay, sort the Python list, then
+        # paginate. Keeps the final row order consistent with the overlaid
+        # values the UI displays.
+        summary_rows = await db.query_client_summary(
+            family_substring=norm,
+            filter_tags=resolved_tags,
+            order_by="mac",  # deterministic tiebreaker; the real sort runs below
+        )
+    else:
+        order = _resolve_drilldown_order(sort, sort_dir)
+        summary_rows = await db.query_client_summary(
+            family_substring=norm,
+            filter_tags=resolved_tags,
+            order_by=order,
+            limit=page_size,
+            offset=offset,
+        )
 
     rows: list[dict] = []
     for sr in summary_rows:
@@ -2666,52 +2482,16 @@ async def search_families_drilldown(
     counts_scope = "total"
 
     if scope == "org" and rows:
-        scope_pairs = sorted({(r["site_id"], r.get("wlan", "")) for r in rows if r.get("site_id")})
-        org_redis = _get_redis()
-        try:
-            pipe = org_redis.pipeline()
-            for sid, wl in scope_pairs:
-                pipe.get(_org_anomalies_redis_key(sid, wl))
-            raw_results = await pipe.execute()
-        finally:
-            await org_redis.aclose()
-
-        org_anom_by_scope: dict[tuple[str, str], dict] = {}
-        for (sid, wl), raw in zip(scope_pairs, raw_results):
-            if not raw:
-                continue
-            try:
-                org_anom_by_scope[(sid, wl)] = json.loads(raw)
-            except Exception:
-                continue
-
-        for r in rows:
-            scope_key = (r.get("site_id", ""), r.get("wlan", ""))
-            anom_map = org_anom_by_scope.get(scope_key)
-            if not anom_map:
-                # No org-wide scoring for this (site, wlan) — wipe the IF/DBSCAN
-                # flags so the row doesn't misleadingly show site-scoped flags
-                # while the user is in org mode.
-                r["is_if_outlier"] = False
-                r["is_dbscan_outlier"] = False
-                r["if_score"] = None
-                r["is_family_outlier"] = False
-                continue
-            rec = anom_map.get(r["mac"])
-            if not rec:
-                r["is_if_outlier"] = False
-                r["is_dbscan_outlier"] = False
-                r["if_score"] = None
-                r["is_family_outlier"] = False
-                continue
-            r["is_if_outlier"] = bool(rec.get("is_if_outlier", False))
-            r["is_dbscan_outlier"] = bool(rec.get("is_dbscan_outlier", False))
-            r["if_score"] = rec.get("if_score")
-            r["is_family_outlier"] = bool(rec.get("is_family_outlier", False))
-
-        if_outlier_count = sum(1 for r in rows if r.get("is_if_outlier"))
-        dbscan_outlier_count = sum(1 for r in rows if r.get("is_dbscan_outlier"))
+        if_outlier_count, dbscan_outlier_count = await _apply_org_overlay(rows)
         counts_scope = "page"
+        if use_org_overlay_sort:
+            _sort_rows_by_if_score(rows, sort_dir)
+            # Tally across the full overlaid set before paginating so header
+            # counts reflect the real org totals, not just page 1.
+            if_outlier_count = sum(1 for r in rows if r.get("is_if_outlier"))
+            dbscan_outlier_count = sum(1 for r in rows if r.get("is_dbscan_outlier"))
+            counts_scope = "total"
+            rows = rows[offset : offset + page_size]
 
     total_pages = (counts["total"] + page_size - 1) // page_size
 
@@ -2796,14 +2576,22 @@ async def search_clients_drilldown(
         )
 
     offset = (page - 1) * page_size
-    order = _resolve_drilldown_order(sort, sort_dir)
-    summary_rows = await db.query_client_summary(
-        mac_prefix=norm,
-        filter_tags=resolved_tags,
-        order_by=order,
-        limit=page_size,
-        offset=offset,
-    )
+    use_org_overlay_sort = scope == "org" and sort in _ORG_OVERLAY_SORT_KEYS
+    if use_org_overlay_sort:
+        summary_rows = await db.query_client_summary(
+            mac_prefix=norm,
+            filter_tags=resolved_tags,
+            order_by="mac",
+        )
+    else:
+        order = _resolve_drilldown_order(sort, sort_dir)
+        summary_rows = await db.query_client_summary(
+            mac_prefix=norm,
+            filter_tags=resolved_tags,
+            order_by=order,
+            limit=page_size,
+            offset=offset,
+        )
 
     rows: list[dict] = []
     for sr in summary_rows:
@@ -2815,49 +2603,14 @@ async def search_clients_drilldown(
     counts_scope = "total"
 
     if scope == "org" and rows:
-        scope_pairs = sorted({(r["site_id"], r.get("wlan", "")) for r in rows if r.get("site_id")})
-        org_redis = _get_redis()
-        try:
-            pipe = org_redis.pipeline()
-            for sid, wl in scope_pairs:
-                pipe.get(_org_anomalies_redis_key(sid, wl))
-            raw_results = await pipe.execute()
-        finally:
-            await org_redis.aclose()
-
-        org_anom_by_scope: dict[tuple[str, str], dict] = {}
-        for (sid, wl), raw in zip(scope_pairs, raw_results):
-            if not raw:
-                continue
-            try:
-                org_anom_by_scope[(sid, wl)] = json.loads(raw)
-            except Exception:
-                continue
-
-        for r in rows:
-            scope_key = (r.get("site_id", ""), r.get("wlan", ""))
-            anom_map = org_anom_by_scope.get(scope_key)
-            if not anom_map:
-                r["is_if_outlier"] = False
-                r["is_dbscan_outlier"] = False
-                r["if_score"] = None
-                r["is_family_outlier"] = False
-                continue
-            rec = anom_map.get(r["mac"])
-            if not rec:
-                r["is_if_outlier"] = False
-                r["is_dbscan_outlier"] = False
-                r["if_score"] = None
-                r["is_family_outlier"] = False
-                continue
-            r["is_if_outlier"] = bool(rec.get("is_if_outlier", False))
-            r["is_dbscan_outlier"] = bool(rec.get("is_dbscan_outlier", False))
-            r["if_score"] = rec.get("if_score")
-            r["is_family_outlier"] = bool(rec.get("is_family_outlier", False))
-
-        if_outlier_count = sum(1 for r in rows if r.get("is_if_outlier"))
-        dbscan_outlier_count = sum(1 for r in rows if r.get("is_dbscan_outlier"))
+        if_outlier_count, dbscan_outlier_count = await _apply_org_overlay(rows)
         counts_scope = "page"
+        if use_org_overlay_sort:
+            _sort_rows_by_if_score(rows, sort_dir)
+            if_outlier_count = sum(1 for r in rows if r.get("is_if_outlier"))
+            dbscan_outlier_count = sum(1 for r in rows if r.get("is_dbscan_outlier"))
+            counts_scope = "total"
+            rows = rows[offset : offset + page_size]
 
     total_pages = (counts["total"] + page_size - 1) // page_size
 
@@ -2983,6 +2736,7 @@ async def get_org_cluster_viz(wlan: str = Query(..., min_length=1, description="
             "y": float(coords[i, 1]),
             "device_family": keyed_features[nk].get("device_family", "Unknown"),
             "is_outlier": anom.get("is_outlier", False),
+            "is_if_outlier": anom.get("is_if_outlier", False),
             "is_dbscan_outlier": anom.get("is_dbscan_outlier", False),
             "dbscan_label": anom.get("dbscan_label"),
         })

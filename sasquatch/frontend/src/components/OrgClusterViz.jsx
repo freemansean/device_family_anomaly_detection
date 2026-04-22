@@ -169,17 +169,17 @@ export default function OrgClusterViz({ apiBase, onMacSiteSelect, refreshToken, 
         {/* Normal points first, outliers on top */}
         {[false, true].map(outlierPass =>
           visiblePoints
-            .filter(p => p.is_outlier === outlierPass)
+            .filter(p => !!p.is_if_outlier === outlierPass)
             .map((p, i) => {
               const color = pointColor(p);
-              const r = p.is_outlier ? 5 : 3;
+              const r = p.is_if_outlier ? 5 : 3;
               return (
                 <g
                   key={`${outlierPass}-${i}`}
                   style={{ cursor: onMacSiteSelect ? "pointer" : "default" }}
                   onClick={() => onMacSiteSelect && onMacSiteSelect(p.mac, p.site_id)}
                 >
-                  {p.is_outlier && (
+                  {p.is_if_outlier && (
                     <circle cx={p.sx} cy={p.sy} r={r + 3} fill="none" stroke={color} strokeWidth={1} opacity={0.45} />
                   )}
                   <circle
@@ -187,7 +187,7 @@ export default function OrgClusterViz({ apiBase, onMacSiteSelect, refreshToken, 
                     cy={p.sy}
                     r={r}
                     fill={color}
-                    opacity={p.is_outlier ? 1.0 : 0.6}
+                    opacity={p.is_if_outlier ? 1.0 : 0.6}
                     onMouseEnter={e => {
                       const rect = svgRef.current?.getBoundingClientRect();
                       setTooltip({ x: e.clientX - (rect?.left ?? 0), y: e.clientY - (rect?.top ?? 0), point: p });
@@ -203,7 +203,7 @@ export default function OrgClusterViz({ apiBase, onMacSiteSelect, refreshToken, 
         {tooltip && (() => {
           const { x, y, point } = tooltip;
           const tipW = 180;
-          const tipH = point.is_outlier ? 72 : 60;
+          const tipH = point.is_if_outlier ? 72 : 60;
           const bx = Math.min(x + 10, W - tipW - 4);
           const by = Math.min(y - 10, H - tipH - 4);
           return (
@@ -212,11 +212,11 @@ export default function OrgClusterViz({ apiBase, onMacSiteSelect, refreshToken, 
               <text x={bx + 8} y={by + 15} fontSize={10} fill="#aaa">{point.device_family}</text>
               <text x={bx + 8} y={by + 28} fontSize={9}  fill="#666">{point.site_name}</text>
               <text x={bx + 8} y={by + 40} fontSize={9}  fill="#444" fontFamily="monospace">{point.mac}</text>
-              {point.is_outlier && (
-                <text x={bx + 8} y={by + 53} fontSize={9} fill="#e05555">⚠ outlier</text>
+              {point.is_if_outlier && (
+                <text x={bx + 8} y={by + 53} fontSize={9} fill="#e05555">⚠ IF outlier</text>
               )}
               {onMacSiteSelect && (
-                <text x={bx + 8} y={by + (point.is_outlier ? 66 : 53)} fontSize={9} fill="#4a90c4">click to open →</text>
+                <text x={bx + 8} y={by + (point.is_if_outlier ? 66 : 53)} fontSize={9} fill="#4a90c4">click to open →</text>
               )}
             </g>
           );
@@ -236,7 +236,7 @@ export default function OrgClusterViz({ apiBase, onMacSiteSelect, refreshToken, 
         ))}
         <div style={{ display: "flex", alignItems: "center", gap: "4px", fontSize: "10px", color: "#888" }}>
           <div style={{ width: 7, height: 7, borderRadius: "50%", border: "1.5px solid #e05555", flexShrink: 0 }} />
-          outlier
+          IF outlier
         </div>
       </div>
     </div>

@@ -34,7 +34,7 @@ from datetime import datetime, timezone
 import httpx
 import redis.asyncio as aioredis
 
-from . import alert_tracker, config
+from . import config
 from .anomaly_detector import HIDDEN_FAMILIES, get_findings, get_org_findings
 from .client_cache import get_client_cache
 from .health_scorer import get_health
@@ -478,24 +478,6 @@ async def evaluate_and_dispatch(
             "service_health": service_health,
             "mac_alarm_ratio": mac_alarm_ratio,
         })
-
-    # Track alert history regardless of qualifying count or scope setting.
-    # Skip for org_scope — org findings are cross-site composites, not single-site events.
-    if not org_scope:
-        active_findings = {
-            f["device_family"]: f
-            for f in qualifying
-            if f.get("device_family")
-        }
-        # Best-effort: alert history is auxiliary to the webhook dispatch itself.
-        # A Redis hiccup here must not block or crash the outbound webhook.
-        try:
-            await alert_tracker.record_cycle(site_id, wlan, active_findings)
-        except Exception:
-            log.exception(
-                "[%s] alert_tracker.record_cycle failed — continuing with dispatch",
-                wlan,
-            )
 
     if not qualifying:
         log.info(

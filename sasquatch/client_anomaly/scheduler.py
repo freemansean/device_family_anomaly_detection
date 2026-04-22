@@ -664,12 +664,13 @@ async def _run_org_pipeline_body(
         _phase_done("phase4_org_score_and_webhooks")
 
         # ── Phase 5: Pre-compute dashboard summary cache ─────────────────
-        # Builds the aggregates that /org/summary, /org/alerts, /org/findings,
-        # /org/family-insights, /sites/{id}/findings, /sites/{id}/health, and
-        # /sites/{id}/events/summary serve out of cache between detection
-        # cycles. Best-effort: cache failures must never fail the pipeline,
-        # so each builder is wrapped in its own try/except. Lazy import to
-        # break the circular import (api.routes already imports scheduler).
+        # Builds the aggregates that /org/summary, /org/alerts-full,
+        # /org/findings, /org/family-insights, /sites/{id}/findings,
+        # /sites/{id}/health, and /sites/{id}/events/summary serve out of
+        # cache between detection cycles. Best-effort: cache failures must
+        # never fail the pipeline, so each builder is wrapped in its own
+        # try/except. Lazy import to break the circular import (api.routes
+        # already imports scheduler).
         try:
             from .api import routes as _routes
             from . import summary_cache as _summary_cache
@@ -685,7 +686,6 @@ async def _run_org_pipeline_body(
                     for build_fn, key_fn in (
                         (_routes.build_org_summary, _summary_cache._org_summary_key),
                         (_routes.build_org_findings, _summary_cache._org_findings_key),
-                        (_routes.build_org_alerts, _summary_cache._org_alerts_key),
                         (_routes.build_org_family_insights, _summary_cache._org_family_insights_key),
                     ):
                         try:

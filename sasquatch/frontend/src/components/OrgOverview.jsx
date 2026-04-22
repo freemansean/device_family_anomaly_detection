@@ -136,18 +136,17 @@ export default function OrgOverview({ apiBase, onSiteSelect, onMacSiteSelect, re
   return (
     <div>
       {/* View toggle. "full-alerts" aggregates across every WLAN in the
-          retention window and is the default landing tab. The other four tabs
-          are WLAN-scoped and reflect the selection in the WLAN dropdown. */}
+          retention window and is the default landing tab. The other three
+          tabs are WLAN-scoped and reflect the selection in the WLAN dropdown. */}
       <div style={{ display: "flex", gap: "8px", marginBottom: "18px", flexWrap: "wrap" }}>
-        {["full-alerts", "alerts", "overview", "insights", "findings"].map(view => {
+        {["full-alerts", "overview", "insights", "findings"].map(view => {
           const label =
             view === "full-alerts" ? "Full Alert Summary" :
-            view === "alerts"      ? "Org WLAN Alerts" :
             view === "overview"    ? "Org WLAN Overview" :
             view === "insights"    ? "Org WLAN Family Insights" :
                                      "Org WLAN Findings";
           const active = activeView === view;
-          const isAlertTab = view === "alerts" || view === "full-alerts";
+          const isAlertTab = view === "full-alerts";
           const activeColor  = isAlertTab ? "#e05555" : "#7ec8e3";
           const activeBg     = isAlertTab ? "#2a1515" : "#0d2a38";
           return (
@@ -172,10 +171,6 @@ export default function OrgOverview({ apiBase, onSiteSelect, onMacSiteSelect, re
       </div>
 
       {activeView === "full-alerts" && (
-        <OrgAlerts apiBase={apiBase} onMacSiteSelect={onMacSiteSelect} refreshToken={refreshToken} wlan={wlan} detectionInProgress={detectionInProgress} fullScope={true} />
-      )}
-
-      {activeView === "alerts" && (
         <OrgAlerts apiBase={apiBase} onMacSiteSelect={onMacSiteSelect} refreshToken={refreshToken} wlan={wlan} detectionInProgress={detectionInProgress} />
       )}
 
