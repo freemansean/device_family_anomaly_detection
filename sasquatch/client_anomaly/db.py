@@ -1485,6 +1485,68 @@ async def count_client_summary(
     }
 
 
+async def distinct_mac_family_rollup(wlan: str) -> dict:
+    """
+    Return distinct-MAC counts and mean health per family for one WLAN,
+    across device_family, service_account_family, and MFG rollup dimensions.
+
+    A roaming MAC (same MAC seen at multiple sites) is counted once per family
+    at the WLAN level regardless of how many sites it visited. Mean health is
+    the simple average of the MAC's per-site family-health values — one vote
+    per distinct MAC.
+
+    Returns a dict of three maps keyed by family name:
+
+        {
+          "device_family":     {family: {client_count, health_score}, ...},
+          "service_account":   {"<label>.service_account": {...}, ...},
+          "mfg_rollup":        {"<mfg>-MFG": {...}, ...},
+        }
+
+    ``health_score`` is ``None`` when no MAC in the family has a health_score.
+    """
+    conn = await get_connection()
+    out: dict[str, dict[str, dict]] = {
+        "device_family": {},
+        "service_account": {},
+        "mfg_rollup": {},
+    }
+
+    # (column, filter_sql, result_key, name_transform)
+    #
+    # Per-MAC mean health first (AVG across the MAC's rows for this WLAN),
+    # then family-level aggregation of distinct MACs so every device gets
+    # one vote regardless of how many sites it roamed through.
+    dims = [
+        ("device_family", "device_family IS NOT NULL AND device_family <> ''", "device_family", None),
+        ("service_account_family", "service_account_family IS NOT NULL AND service_account_family <> ''", "service_account", None),
+        ("resolved_manufacturer", "resolved_manufacturer IS NOT NULL AND resolved_manufacturer <> ''", "mfg_rollup", lambda m: f"{m}-MFG"),
+    ]
+
+    for col, filter_sql, result_key, transform in dims:
+        sql = f"""
+            SELECT fam, COUNT(*) AS client_count, AVG(mac_health) AS mean_health
+            FROM (
+                SELECT {col} AS fam, mac, AVG(health_score) AS mac_health
+                FROM client_summary
+                WHERE wlan = ? AND {filter_sql}
+                GROUP BY {col}, mac
+            )
+            GROUP BY fam
+        """
+        rows = await conn.execute_fetchall(sql, (wlan,))
+        for fam, count, mean_health in rows:
+            if not fam:
+                continue
+            name = transform(fam) if transform else fam
+            out[result_key][name] = {
+                "client_count": int(count or 0),
+                "health_score": round(float(mean_health), 4) if mean_health is not None else None,
+            }
+
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Misc org helpers
 # ---------------------------------------------------------------------------
