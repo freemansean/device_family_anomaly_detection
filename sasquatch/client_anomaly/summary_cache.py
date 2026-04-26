@@ -43,6 +43,17 @@ SUMMARY_CACHE_TTL = 7200
 
 _PREFIX = "sasquatch:summary"
 
+# WLAN-list cache. Populated by the detection pipeline tail (hourly) from data
+# already in scope, so the dropdown becomes a single Redis GET on page load.
+# Long TTL because detection rewrites the keys 24× per day; the TTL is a
+# multi-day backstop in case detection stops running, not a freshness control.
+WLAN_CACHE_TTL = 86400  # 24 hours
+_WLAN_ORG_KEY = "sasquatch:wlans"
+
+
+def _wlan_site_key(site_id: str) -> str:
+    return f"sasquatch:wlans:{site_id}"
+
 
 def _org_summary_key(wlan: str) -> str:
     return f"{_PREFIX}:org_summary:{sanitize_wlan_key(wlan)}"
@@ -103,6 +114,40 @@ async def cache_set(redis_client: aioredis.Redis, key: str, payload: dict) -> No
         log.exception("summary_cache set failed for %s", key)
 
 
+async def get_wlan_cache(redis_client: aioredis.Redis, site_id: str | None) -> list[str] | None:
+    """Read the cached WLAN list for org-wide (site_id=None) or a specific site."""
+    key = _WLAN_ORG_KEY if site_id is None else _wlan_site_key(site_id)
+    payload = await cache_get(redis_client, key)
+    if not payload:
+        return None
+    wlans = payload.get("wlans")
+    return wlans if isinstance(wlans, list) else None
+
+
+async def set_wlan_cache(
+    redis_client: aioredis.Redis, site_id: str | None, wlans: list[str]
+) -> None:
+    """Write the WLAN list cache with the WLAN-specific (longer) TTL."""
+    key = _WLAN_ORG_KEY if site_id is None else _wlan_site_key(site_id)
+    try:
+        await redis_client.set(
+            key, json.dumps(_stamp({"wlans": wlans})), ex=WLAN_CACHE_TTL,
+        )
+    except Exception:
+        log.exception("summary_cache wlan set failed for %s", key)
+
+
+async def write_wlan_lists(
+    redis_client: aioredis.Redis,
+    all_wlans: list[str] | set[str],
+    wlans_by_site: dict[str, list[str] | set[str]],
+) -> None:
+    """Pipeline-tail writer: populate org-wide and per-site WLAN dropdowns."""
+    await set_wlan_cache(redis_client, None, sorted(all_wlans))
+    for sid, wlans in wlans_by_site.items():
+        await set_wlan_cache(redis_client, sid, sorted(wlans))
+
+
 async def _delete_pattern(redis_client: aioredis.Redis, pattern: str) -> int:
     """SCAN+DEL helper for wildcard invalidation."""
     deleted = 0
@@ -118,7 +163,9 @@ async def _delete_pattern(redis_client: aioredis.Redis, pattern: str) -> int:
 
 async def flush_org_summary_cache(redis_client: aioredis.Redis) -> int:
     """Delete every summary cache key — used by /org/flush."""
-    return await _delete_pattern(redis_client, f"{_PREFIX}:*")
+    deleted = await _delete_pattern(redis_client, f"{_PREFIX}:*")
+    deleted += await _delete_pattern(redis_client, "sasquatch:wlans*")
+    return deleted
 
 
 async def flush_site_summary_cache(redis_client: aioredis.Redis, site_id: str) -> int:
@@ -136,4 +183,8 @@ async def flush_site_summary_cache(redis_client: aioredis.Redis, site_id: str) -
     deleted += await _delete_pattern(redis_client, f"{_PREFIX}:org_summary:*")
     deleted += await _delete_pattern(redis_client, f"{_PREFIX}:org_alerts_full")
     deleted += await _delete_pattern(redis_client, f"{_PREFIX}:org_family_insights:*")
+    # WLAN-list caches: the per-site list goes stale, and the org-wide list
+    # may also change if this site contributed a unique SSID.
+    deleted += await redis_client.delete(_wlan_site_key(site_id))
+    deleted += await redis_client.delete(_WLAN_ORG_KEY)
     return deleted

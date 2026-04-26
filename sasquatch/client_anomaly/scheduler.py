@@ -710,6 +710,16 @@ async def _run_org_pipeline_body(
 
                 _phase_done("phase5a_org_builders")
 
+                # WLAN-list dropdowns: rewrite from data already in scope.
+                # Avoids a multi-second SELECT DISTINCT scan over the events
+                # table on every page load between detection cycles.
+                try:
+                    await _summary_cache.write_wlan_lists(
+                        cache_redis, all_wlans, wlans_by_site,
+                    )
+                except Exception:
+                    log.exception("[org pipeline] wlan-list cache write failed")
+
                 # Site-level entries are per (site, wlan). Trim glibc arenas
                 # every N sites so fragmentation from the per-site builders
                 # (each pulls anomaly/health blobs from Redis, JSON-decodes

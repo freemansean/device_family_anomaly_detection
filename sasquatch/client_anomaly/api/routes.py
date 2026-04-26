@@ -774,8 +774,18 @@ async def list_wlans(site_id: Optional[str] = Query(None)):
     """
     Return unique WLAN (SSID) names derived from the global event store.
     Optionally scoped to a single site via ?site_id=. Returns sorted list.
+
+    Reads the WLAN-list cache populated by the detection pipeline tail.
+    Falls through to a live SQLite SELECT DISTINCT on cache miss (cold start
+    before the first detection cycle, or after a flush) and self-heals the
+    cache so the next caller is fast.
     """
+    redis_client = _get_redis()
+    cached = await summary_cache.get_wlan_cache(redis_client, site_id)
+    if cached is not None:
+        return {"wlans": cached, "site_id": site_id}
     wlans = await get_wlans(site_id=site_id)
+    await summary_cache.set_wlan_cache(redis_client, site_id, wlans)
     return {"wlans": wlans, "site_id": site_id}
 
 
