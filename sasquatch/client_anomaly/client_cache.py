@@ -364,6 +364,14 @@ def _build_client_record(client: dict, mac: str = "") -> dict:
     }
 
 
+# Page-1 zero-result retry. The Mist clients/search endpoint occasionally
+# returns `{total: 0, results: []}` for an org that actually has hundreds of
+# thousands of clients — the next call seconds later returns the real data.
+# We retry page 1 only; once any page is non-empty we trust the stream.
+_EMPTY_PAGE1_RETRIES = 4
+_EMPTY_PAGE1_BACKOFFS = (5.0, 10.0, 20.0, 40.0)  # len must equal _EMPTY_PAGE1_RETRIES
+
+
 async def fetch_all_clients_org(org_id: str, on_page=None) -> list[dict]:
     """Fetch all clients across the entire org via a single API call.
 
@@ -377,7 +385,8 @@ async def fetch_all_clients_org(org_id: str, on_page=None) -> list[dict]:
     pages remain and drive a progress bar off concrete work rather than a
     heuristic.
     """
-    url = f"https://{MIST_CLOUD_HOST}/api/v1/orgs/{org_id}/clients/search?limit=1000"
+    base_url = f"https://{MIST_CLOUD_HOST}/api/v1/orgs/{org_id}/clients/search?limit=1000"
+    url = base_url
     all_clients: list[dict] = []
     page = 0
     total_hint: int | None = None
@@ -407,6 +416,46 @@ async def fetch_all_clients_org(org_id: str, on_page=None) -> list[dict]:
             # first value we see and keep using it.
             if total_hint is None and "total" in data:
                 total_hint = data["total"]
+
+            # Retry on the empty-page-1 failure mode (see _EMPTY_PAGE1_RETRIES
+            # comment). Only triggers on the very first request — once any page
+            # has yielded data, subsequent empty pages mean end-of-stream.
+            if page == 0 and not batch and (total_hint or 0) == 0:
+                retried = False
+                for attempt, backoff in enumerate(_EMPTY_PAGE1_BACKOFFS, start=1):
+                    log.warning(
+                        "Org clients page 1 returned empty (total=0, results=0) — "
+                        "retrying in %.1fs [attempt %d/%d]",
+                        backoff, attempt, _EMPTY_PAGE1_RETRIES,
+                    )
+                    await asyncio.sleep(backoff)
+                    resp = await client.get(base_url, headers=_auth_headers())
+                    resp.raise_for_status()
+                    try:
+                        data = resp.json()
+                    except json.JSONDecodeError as exc:
+                        snippet = resp.text[:200] if resp.text else "<empty>"
+                        raise RuntimeError(
+                            f"Org client fetch: non-JSON response on retry "
+                            f"{attempt}: {exc}. Body prefix: {snippet}"
+                        ) from exc
+                    batch = data.get("results", [])
+                    if total_hint in (None, 0) and "total" in data:
+                        total_hint = data["total"]
+                    if batch or (total_hint or 0) > 0:
+                        log.info(
+                            "Org clients page 1 retry %d succeeded: %d records, total=%s",
+                            attempt, len(batch), total_hint,
+                        )
+                        retried = True
+                        break
+                if not retried:
+                    log.error(
+                        "Org clients page 1 still empty after %d retries — "
+                        "giving up. Caller should refuse to overwrite cache.",
+                        _EMPTY_PAGE1_RETRIES,
+                    )
+
             all_clients.extend(batch)
             page += 1
             log.info(
@@ -425,6 +474,19 @@ async def fetch_all_clients_org(org_id: str, on_page=None) -> list[dict]:
     return all_clients
 
 
+# Safety guard: refuse to overwrite a populated cache with a much smaller
+# fetch result. Mist's clients/search has been observed to occasionally
+# return `{total: 0, results: []}` for a 200k+ client org; without this guard
+# the daily refresh wipes the cache and every event enriches via OUI only.
+# Threshold is intentionally generous — real org churn is well under 50%
+# day-over-day, so a fetch carrying < 50% of the previous count is treated
+# as a regression.
+_CACHE_REGRESSION_RATIO = 0.5
+# Below this floor we don't apply the ratio guard at all — small orgs
+# legitimately fluctuate and a 4-MAC org dropping to 1 isn't a regression.
+_CACHE_REGRESSION_FLOOR = 100
+
+
 async def refresh_client_cache_org(org_id: str, on_page=None) -> int:
     """Fetch all clients org-wide in one API call, classify, and store per-org.
 
@@ -434,11 +496,14 @@ async def refresh_client_cache_org(org_id: str, on_page=None) -> int:
     a different site later in the day overwrites the previous record on the
     next refresh.
 
-    Always writes to SQLite — even when the API returns zero clients — so that
-    subsequent ``get_client_cache`` calls can distinguish "cache populated but
-    empty" from "cache never written".
+    Refuses to overwrite a populated cache with a much smaller fetch result —
+    see ``_CACHE_REGRESSION_RATIO``. When the guard trips, the existing rows
+    are left in place and the function returns the previous count so callers
+    cannot distinguish a no-op refresh from a successful one. The refusal is
+    logged at ERROR.
 
-    Returns the total number of client rows stored.
+    Returns the total number of client rows stored after the refresh (which
+    may be the previous count if the guard refused).
     """
     clients = await fetch_all_clients_org(org_id, on_page=on_page)
 
@@ -448,6 +513,24 @@ async def refresh_client_cache_org(org_id: str, on_page=None) -> int:
         if not mac:
             continue
         lookup[mac] = _build_client_record(c, mac)
+
+    new_count = len(lookup)
+    previous = await db.get_previous_client_count(org_id)
+    # Only guard when a previous refresh wrote a non-trivial cache. First-ever
+    # refresh, or recovery from a previously-empty state, still proceeds.
+    if (
+        previous is not None
+        and previous >= _CACHE_REGRESSION_FLOOR
+        and new_count < previous * _CACHE_REGRESSION_RATIO
+    ):
+        log.error(
+            "Refusing to overwrite client cache for org %s: fetched %d clients "
+            "but previous refresh stored %d (< %.0f%% threshold). "
+            "Leaving existing rows in place. Mist API likely returned a "
+            "transient empty response — check logs for retry behavior.",
+            org_id, new_count, previous, _CACHE_REGRESSION_RATIO * 100,
+        )
+        return previous
 
     count = await db.upsert_clients_org(org_id, lookup)
     if lookup:

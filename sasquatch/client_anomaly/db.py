@@ -762,6 +762,23 @@ def normalize_username(raw: str | None) -> str:
     return raw.strip().lower()
 
 
+async def get_previous_client_count(org_id: str) -> int | None:
+    """
+    Return the most recent ``client_count`` from ``client_refresh_log`` for the
+    org, or ``None`` when no refresh has ever run. Used by the cache-refresh
+    safety guard to detect a Mist API regression that would otherwise
+    overwrite a populated cache with zero rows.
+    """
+    conn = await get_connection()
+    rows = await conn.execute_fetchall(
+        "SELECT client_count FROM client_refresh_log WHERE org_id = ? LIMIT 1",
+        (org_id,),
+    )
+    if not rows:
+        return None
+    return int(rows[0][0] or 0)
+
+
 async def upsert_clients_org(org_id: str, client_map: dict[str, dict]) -> int:
     """
     Upsert client records for the org. ``client_map`` is MAC -> metadata dict
