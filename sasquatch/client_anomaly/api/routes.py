@@ -45,6 +45,7 @@ from ..event_collector import (
     get_event_type_index,
     get_events,
     get_wlans,
+    reenrich_stale_events,
 )
 from ..feature_engineer import _family_event_counts_redis_key, _features_redis_key, build_features, get_features
 from ..health_scorer import get_health, score_health, _health_redis_key
@@ -1091,23 +1092,57 @@ async def flush_org_redis():
 @router.post("/org/refresh")
 async def trigger_org_client_refresh():
     """
-    Manually trigger an org-wide client cache refresh from the Mist API.
-    The cache is org-scoped (MAC unique across the org), so a single API call
-    populates the entire cache.
+    Manually trigger an org-wide client cache refresh from the Mist API,
+    then re-enrich stored events against the freshly written cache.
+
+    Mirrors the daily ``client_refresh_job`` so the manual button is a
+    complete recovery action — without re-enrichment, every event already
+    in SQLite still carries the family it had at ingest time, which means
+    a wiped-then-restored cache leaves the heatmap stuck on
+    ``Unknown/<vendor>`` rows until the next nightly cron.
+
+    Re-enrichment failures for individual sites are logged but do not fail
+    the request — the cache write is the load-bearing step.
     """
     if not MIST_ORG_ID or not MIST_API_TOKEN:
         raise HTTPException(status_code=500, detail="MIST_ORG_ID or MIST_API_TOKEN not configured.")
 
     try:
         total_cached = await refresh_client_cache_org(MIST_ORG_ID)
-    except Exception as exc:
+    except Exception:
         log.exception("Org client refresh failed")
         raise HTTPException(status_code=502, detail="Org client refresh failed")
+
+    # Re-enrich stored events. The cache must already be in SQLite (the
+    # refresh above just wrote it) before we read it back here.
+    sites_reenriched = 0
+    events_reenriched = 0
+    try:
+        cache = await get_client_cache()
+    except Exception:
+        log.exception("Failed to load freshly written cache for re-enrichment")
+        cache = None
+    if cache is None:
+        log.error("Cache missing immediately after refresh — skipping re-enrichment")
+    else:
+        site_ids = await db.get_site_ids_with_events()
+        for sid in site_ids:
+            try:
+                n = await reenrich_stale_events(sid, cache)
+            except Exception:
+                log.exception("Re-enrichment failed for site %s", sid)
+                continue
+            if n:
+                events_reenriched += n
+                sites_reenriched += 1
+                log.info("Re-enriched %d events for site %s", n, sid)
 
     return {
         "status": "ok",
         "org_id": MIST_ORG_ID,
         "total_clients_cached": total_cached,
+        "sites_reenriched": sites_reenriched,
+        "events_reenriched": events_reenriched,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
