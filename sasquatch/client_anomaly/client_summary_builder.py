@@ -120,9 +120,14 @@ async def _load_event_aggregates(
     Retained for callers that need a single-scope aggregate (tests, ad-hoc
     queries). The rebuild path uses ``_load_event_aggregates_all`` which
     does one org-wide groupby and partitions the result.
+
+    Scoped to the detection window (24h). client_summary backs the family
+    drilldown / MAC-prefix search UI, which sits alongside anomaly records
+    that are themselves 24h-scoped. A wider window would surface MACs the
+    detector never saw this cycle.
     """
     conn = await db.get_connection()
-    cutoff = time.time() - db.EVENTS_RETENTION_SECONDS
+    cutoff = db.get_detection_cutoff()
 
     rows = await conn.execute_fetchall(
         """SELECT mac, event_type, event_category, device_family,
@@ -171,9 +176,13 @@ async def _load_event_aggregates_all(
     Scopes not present in ``keep_scopes`` are discarded (the caller has
     already decided which WLANs the pipeline scored). Empty scopes simply
     don't appear in the result.
+
+    Scoped to the detection window (24h) so the rebuilt summary table only
+    contains MACs that were active in the same window the detector scored
+    against. See _load_event_aggregates for the rationale.
     """
     conn = await db.get_connection()
-    cutoff = time.time() - db.EVENTS_RETENTION_SECONDS
+    cutoff = db.get_detection_cutoff()
 
     rows = await conn.execute_fetchall(
         """SELECT site_id, wlan, mac, event_type, event_category, device_family,

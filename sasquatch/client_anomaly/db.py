@@ -534,9 +534,15 @@ async def get_events_category_rollup(
 
     `macs_filter`, if provided, restricts the rollup to events whose mac is
     in the set — used by the service-account synthetic-row pass.
+
+    Scoped to the detection window (24h), not the full 7-day retention. The
+    heatmap row this backs sits next to the family drilldown, which reads
+    anomaly records also scoped to 24h. Using a wider window here would
+    surface MACs the detector never scored and mislead operators into
+    expecting alarms / cluster membership for inactive devices.
     """
     conn = await get_connection()
-    cutoff = time.time() - EVENTS_RETENTION_SECONDS
+    cutoff = get_detection_cutoff()
 
     query = (
         "SELECT COALESCE(device_family, 'Unknown') AS fam, "
